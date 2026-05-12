@@ -1,0 +1,145 @@
+.query-editor {
+  display: flex;
+  flex-direction: column;
+  height: 250px;
+  min-height: 150px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.editor-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.toolbar-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.sample-queries {
+  display: flex;
+  gap: 6px;
+}
+
+.sample-query-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+.sample-query-btn:hover:not(:disabled) {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
+}
+
+.toolbar-right {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-clear {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+.btn-clear:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.btn-execute {
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  font-weight: 500;
+}
+
+.btn-execute:hover:not(:disabled) {
+  background: var(--accent-secondary);
+}
+
+.editor-container {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+.query-textarea {
+  flex: 1;
+  padding: 12px 12px 12px 50px;
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  background: var(--bg-primary);
+  border: none;
+  border-radius: 0;
+  resize: none;
+  color: var(--text-primary);
+  outline: none;
+}
+
+.query-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.query-textarea:disabled {
+  background: var(--bg-tertiary);
+  cursor: not-allowed;
+}
+
+.line-numbers {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 40px;
+  padding: 12px 8px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  text-align: right;
+  user-select: none;
+  overflow: hidden;
+}
+
+.line-number {
+  height: 20.8px;
+}
+
+.editor-footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.hint {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+}
+
+.history-info {
+  color: var(--accent-secondary);
+}

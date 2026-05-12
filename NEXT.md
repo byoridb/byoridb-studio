@@ -5,7 +5,7 @@
 
 장기 계획은 [ROADMAP.md](./ROADMAP.md), 작업 컨텍스트는 [CLAUDE.md](./CLAUDE.md) 참고.
 
-마지막 업데이트: 2026-05-11 — Phase 1 마무리 완료 (헬스체크 폴링, 자동 USE 정리, DESCRIBE TAG/EDGE). cah-graph 스펙 변경(세션 i64, argon2/env 기반 root 비밀번호, 구조화된 에러, DESCRIBE TAG/EDGE/SPACE) 대응도 함께 완료.
+마지막 업데이트: 2026-05-11 — Phase 1 마무리 완료 (헬스체크 폴링, 자동 USE 정리, DESCRIBE TAG/EDGE). ByoriDB 스펙 변경(세션 i64, argon2/env 기반 root 비밀번호, 구조화된 에러, DESCRIBE TAG/EDGE/SPACE) 대응도 함께 완료.
 
 ---
 
@@ -28,7 +28,7 @@
 
 ### 4. `DESCRIBE TAG/EDGE`로 스키마 상세 조회 ✅ 완료 (2026-05-11)
 
-- **완료 내용**: cah-graph 커밋 `c1151ad`가 `DESCRIBE TAG|EDGE|SPACE`를 추가함. 사이드바 각 태그/엣지 항목에 expand 화살표를 추가, 첫 expand 시 `DESCRIBE TAG <name>` 호출, 결과는 `(kind, space, name)` 단위로 캐시. 이름 클릭은 기존대로 `MATCH` 쿼리 실행, expand 버튼은 별도 affordance. Space 변경 또는 수동 refresh 시 캐시 무효화.
+- **완료 내용**: ByoriDB 서버 커밋 `c1151ad`가 `DESCRIBE TAG|EDGE|SPACE`를 추가함. 사이드바 각 태그/엣지 항목에 expand 화살표를 추가, 첫 expand 시 `DESCRIBE TAG <name>` 호출, 결과는 `(kind, space, name)` 단위로 캐시. 이름 클릭은 기존대로 `MATCH` 쿼리 실행, expand 버튼은 별도 affordance. Space 변경 또는 수동 refresh 시 캐시 무효화.
 - 참고: `src/components/Sidebar.tsx::describe/toggleDescribe/refreshSchema`, `src/styles/Sidebar.css` 하단 describe-panel 블록.
 - 테스트: `Sidebar.test.tsx`의 `lazy-loads DESCRIBE TAG on expand and caches the result` + `surfaces DESCRIBE errors inline without affecting name-click behavior`.
 
@@ -83,4 +83,4 @@ DX 가장 큰 개선 포인트. 1주 분량.
 
 - `coverage/` 디렉터리는 gitignore됨. 커버리지 리포트는 `npm run coverage` 후 `coverage/index.html` 확인.
 - Rust 단위 테스트는 `client.rs`의 순수 함수 위주. 통합 테스트(실제 HTTP)는 미작성 — 서버 띄우고 수동으로만 검증.
-- 서버 root 비밀번호는 `CAH_ROOT_PASSWORD` env 기반. 로컬에서 기본값 `"cah"` 쓰려면 서버 기동 시 `CAH_ROOT_PASSWORD=cah` 지정. `CLAUDE.md` 참조.
+- 서버 root 비밀번호는 `BYORIDB_ROOT_PASSWORD` env 기반 (서버 측 기본값 없음 — 미지정 시 무작위 생성). 로컬에서는 서버 기동 시 `BYORIDB_ROOT_PASSWORD=byoridb-dev`처럼 임의 값을 지정하고 Studio 비밀번호 필드에 동일한 값을 입력. `CLAUDE.md` 참조.

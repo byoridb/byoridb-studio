@@ -1,10 +1,10 @@
-# CahGraph Studio
+# ByoriDB Studio
 
-Desktop management tool for CahGraph - a distributed graph database.
+Desktop management tool for ByoriDB - a distributed graph database.
 
 ## Features
 
-- **Connection Management**: Connect to multiple CahGraph servers with saved connection profiles
+- **Connection Management**: Connect to multiple ByoriDB servers with saved connection profiles
 - **Server Settings**: Manage saved servers with built-in connection testing
 - **Schema Browser**: Browse spaces, tags, and edges in a tree view
 - **Query Editor**: Write and execute nGQL queries with syntax highlighting
@@ -48,7 +48,7 @@ cd src-tauri && cargo test
 ### Project Structure
 
 ```
-cah-studio/
+byori-studio/
 ├── src/                    # React frontend
 │   ├── components/         # UI components (+ co-located *.test.tsx)
 │   ├── styles/             # CSS styles
@@ -59,7 +59,7 @@ cah-studio/
 ├── src-tauri/              # Tauri/Rust backend
 │   ├── src/
 │   │   ├── main.rs         # Tauri commands
-│   │   └── client.rs       # CahGraph client (+ unit tests)
+│   │   └── client.rs       # ByoriDB client (+ unit tests)
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 ├── package.json

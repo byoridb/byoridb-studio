@@ -1,6 +1,6 @@
-# CahGraph Studio Roadmap
+# ByoriDB Studio Roadmap
 
-CahGraph Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정리합니다.
+ByoriDB Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정리합니다.
 
 ## 현재 상태
 
@@ -29,7 +29,7 @@ CahGraph Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정�
 
 ## Phase 1: 서버 연동 완성
 
-**목표**: CahGraph 서버와 실제 통신 구현
+**목표**: ByoriDB 서버와 실제 통신 구현
 
 ### 1.1 API 클라이언트 수정
 - [x] HTTP REST API 엔드포인트 수정

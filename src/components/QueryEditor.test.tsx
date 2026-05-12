@@ -27,7 +27,7 @@ describe("QueryEditor", () => {
     await user.click(screen.getByRole("button", { name: /Execute/ }));
 
     expect(onExecute).toHaveBeenCalledWith("SHOW SPACES");
-    expect(localStorage.getItem("cah-studio-query-history")).toBe('["SHOW SPACES"]');
+    expect(localStorage.getItem("byoridb-studio-query-history")).toBe('["SHOW SPACES"]');
   });
 
   it("executes with keyboard shortcut and deduplicates history", async () => {
@@ -41,7 +41,7 @@ describe("QueryEditor", () => {
     await user.keyboard("{Meta>}{Enter}{/Meta}");
 
     expect(onExecute).toHaveBeenCalledTimes(2);
-    expect(localStorage.getItem("cah-studio-query-history")).toBe(
+    expect(localStorage.getItem("byoridb-studio-query-history")).toBe(
       '["MATCH (v) RETURN v"]',
     );
   });
@@ -49,7 +49,7 @@ describe("QueryEditor", () => {
   it("navigates saved query history", async () => {
     const user = userEvent.setup();
     localStorage.setItem(
-      "cah-studio-query-history",
+      "byoridb-studio-query-history",
       JSON.stringify(["SHOW TAGS", "SHOW EDGES"]),
     );
 
@@ -97,7 +97,7 @@ describe("QueryEditor", () => {
 
   it("navigates back past the newest history entry to an empty query", async () => {
     const user = userEvent.setup();
-    localStorage.setItem("cah-studio-query-history", JSON.stringify(["SHOW TAGS"]));
+    localStorage.setItem("byoridb-studio-query-history", JSON.stringify(["SHOW TAGS"]));
 
     render(<QueryEditor onExecute={vi.fn()} isExecuting={false} isConnected />);
 
@@ -113,7 +113,7 @@ describe("QueryEditor", () => {
   it("keeps only the 50 newest unique history entries", async () => {
     const user = userEvent.setup();
     localStorage.setItem(
-      "cah-studio-query-history",
+      "byoridb-studio-query-history",
       JSON.stringify(Array.from({ length: 50 }, (_, i) => `QUERY ${i}`)),
     );
 
@@ -123,7 +123,7 @@ describe("QueryEditor", () => {
     await user.click(screen.getByRole("button", { name: /Execute/ }));
 
     const history = JSON.parse(
-      localStorage.getItem("cah-studio-query-history") ?? "[]",
+      localStorage.getItem("byoridb-studio-query-history") ?? "[]",
     ) as string[];
     expect(history).toHaveLength(50);
     expect(history[0]).toBe("NEW QUERY");

@@ -38,7 +38,7 @@ describe("ServerSettings", () => {
       host: "127.0.0.1",
       port: 19669,
       username: "root",
-      password: "cah",
+      password: "",
     });
 
     await user.click(screen.getByRole("button", { name: "Edit" }));
@@ -63,7 +63,7 @@ describe("ServerSettings", () => {
           host: "127.0.0.1",
           port: 19669,
           username: "root",
-          password: "cah",
+          password: "test-password",
         },
       },
     ]);
@@ -88,7 +88,7 @@ describe("ServerSettings", () => {
           host: "127.0.0.1",
           port: 19669,
           username: "root",
-          password: "cah",
+          password: "test-password",
         },
       },
     ]);
@@ -147,7 +147,7 @@ describe("ServerSettings", () => {
           host: "127.0.0.1",
           port: 19669,
           username: "root",
-          password: "cah",
+          password: "test-password",
         },
       },
     ]);

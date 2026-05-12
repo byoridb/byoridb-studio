@@ -33,8 +33,8 @@ interface QueryResult {
 }
 
 /**
- * Field row shape returned by `DESCRIBE TAG` / `DESCRIBE EDGE` (cah-graph
- * `cah-executor/src/executor.rs::schema_fields_to_result`).
+ * Field row shape returned by `DESCRIBE TAG` / `DESCRIBE EDGE` (byoridb
+ * `byoridb-executor/src/executor.rs::schema_fields_to_result`).
  *
  * `Default` is JSON null when the field has no default.
  */

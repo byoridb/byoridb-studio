@@ -21,7 +21,7 @@ describe("ServerSettings storage helpers", () => {
           host: "127.0.0.1",
           port: 19669,
           username: "root",
-          password: "cah",
+          password: "test-password",
         },
       },
     ];

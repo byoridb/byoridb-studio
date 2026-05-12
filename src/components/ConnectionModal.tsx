@@ -11,7 +11,7 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   host: "127.0.0.1",
   port: 19669,
   username: "root",
-  password: "cah",
+  password: "",
 };
 
 function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
@@ -47,7 +47,7 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
     <div className="modal-overlay">
       <div className="connection-modal">
         <div className="modal-header">
-          <h2>Connect to CahGraph</h2>
+          <h2>Connect to ByoriDB</h2>
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
 

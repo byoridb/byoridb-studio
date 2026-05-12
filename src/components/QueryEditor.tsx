@@ -15,6 +15,8 @@ const SAMPLE_QUERIES = [
   { label: "Show Hosts", query: "SHOW HOSTS" },
 ];
 
+const HISTORY_STORAGE_KEY = "byoridb-studio-query-history";
+
 function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) {
   const [query, setQuery] = useState("");
   const [history, setHistory] = useState<string[]>([]);
@@ -22,8 +24,7 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    // Load history from localStorage
-    const savedHistory = localStorage.getItem("cah-studio-query-history");
+    const savedHistory = localStorage.getItem(HISTORY_STORAGE_KEY);
     if (savedHistory) {
       setHistory(JSON.parse(savedHistory));
     }
@@ -38,7 +39,7 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
     const newHistory = [query, ...history.filter((h) => h !== query)].slice(0, 50);
     setHistory(newHistory);
     setHistoryIndex(-1);
-    localStorage.setItem("cah-studio-query-history", JSON.stringify(newHistory));
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(newHistory));
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

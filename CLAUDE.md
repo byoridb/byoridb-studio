@@ -36,7 +36,7 @@ cd src-tauri && cargo test     # Run Rust unit tests
 
 ## Architecture
 
-CahGraph Studio is a Tauri 2 desktop application for managing CahGraph (a distributed graph database).
+ByoriDB Studio is a Tauri 2 desktop application for managing ByoriDB (a distributed graph database).
 
 **Frontend (React/TypeScript)**
 - `src/App.tsx` - Main component managing connection state, query execution, and space selection
@@ -45,8 +45,8 @@ CahGraph Studio is a Tauri 2 desktop application for managing CahGraph (a distri
 
 **Backend (Rust/Tauri)**
 - `src-tauri/src/main.rs` - Tauri commands exposed to frontend: `connect`, `disconnect`, `execute_query`, `get_spaces`, `get_schema`
-- `src-tauri/src/client.rs` - CahGraph HTTP API client. Pure parsing helpers (`parse_query_response`, `parse_names`, `parse_spaces`) are extracted for unit testing.
-- State management via `AppState` with `Arc<Mutex<Option<CahClient>>>`
+- `src-tauri/src/client.rs` - ByoriDB HTTP API client. Pure parsing helpers (`parse_query_response`, `parse_names`, `parse_spaces`) are extracted for unit testing.
+- State management via `AppState` with `Arc<Mutex<Option<ByoriDBClient>>>`
 
 **Communication Pattern**
 Frontend calls backend via `invoke("command_name", { params })` which maps to `#[tauri::command]` functions.
@@ -55,25 +55,27 @@ Frontend calls backend via `invoke("command_name", { params })` which maps to `#
 - Frontend: Vitest + Testing Library + jsdom. Setup at `src/test/setup.ts`. Tests are co-located next to components (`*.test.tsx`).
 - Backend: `cargo test` runs `#[cfg(test)] mod tests` in `client.rs`. Async tests use `#[tokio::test]`.
 
-## CahGraph Server (../cah-graph)
+## ByoriDB Server (../byoridb)
 
-The CahGraph database server that this studio connects to. The HTTP API
-surface this studio depends on lives in `../cah-graph/cah-graph/src/server.rs`
-(request/response types) and `auth.rs` (root password policy). Update these
-references along with client code when the server changes.
+The ByoriDB database server that this studio connects to. The HTTP API
+surface this studio depends on lives in `../byoridb/byoridb-graph/src/server.rs`
+(request/response types) and `../byoridb/byoridb-graph/src/auth.rs` (root
+password policy). Update these references along with client code when the
+server changes.
 
 **Default Ports**
-- gRPC: `9669` (used by cah-client library)
+- gRPC: `9669` (used by byoridb-client library)
 - HTTP REST: `19669` (used by this studio)
 
 **Root Credentials**
 - Username: `root` (fixed).
-- Password: read from the `CAH_ROOT_PASSWORD` env var at server startup.
+- Password: read from the `BYORIDB_ROOT_PASSWORD` env var at server startup.
   If the var is unset, the server generates a cryptographically random
-  password and logs it once as a warning. The previous hard-coded default
-  `"cah"` no longer applies.
-- For local development, export `CAH_ROOT_PASSWORD=cah` before launching
-  the server to keep the studio's default password field working.
+  48-char hex password and logs it once as a warning. There is no
+  hard-coded default.
+- For local development, choose any value and set it on both sides — e.g.
+  export `BYORIDB_ROOT_PASSWORD=byoridb-dev` before launching the server,
+  then enter the same value in the studio's password field.
 
 **HTTP REST API Endpoints**
 ```
@@ -82,7 +84,8 @@ DELETE /api/v1/session/{id}   - Sign out (id as i64 in path)
 POST /api/v1/query            - Execute query ({ session_id: i64, query }) -> results
 POST /api/v1/query/json       - Execute query (raw JSON response)
 GET /health                   - Health check ("OK" text)
-GET /metrics                  - Prometheus metrics
+GET /metrics                  - Prometheus metrics (text exposition)
+GET /api/v1/metrics           - JSON metrics envelope (currently a status stub)
 ```
 
 `session_id` is a JSON **number** on both request and response bodies.
@@ -108,8 +111,8 @@ react (see `SESSION_EXPIRED` handling in `src/App.tsx`).
 
 **Running the Server**
 ```bash
-cd ../cah-graph
-CAH_ROOT_PASSWORD=cah cargo run --release --bin cah-server
+cd ../byoridb
+BYORIDB_ROOT_PASSWORD=byoridb-dev cargo run --release --bin byoridb-server
 ```
 
 ## nGQL Query Language Reference

@@ -1,4 +1,4 @@
-//! CahGraph client for communicating with the graph database server
+//! ByoriDB client for communicating with the graph database server
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -61,7 +61,7 @@ impl From<reqwest::Error> for ClientError {
     }
 }
 
-/// Parse cah-graph's structured `{error, code}` error body. Falls back to
+/// Parse byoridb's structured `{error, code}` error body. Falls back to
 /// the raw text if the body isn't valid JSON or is missing fields.
 ///
 /// Returns `(code, message)` where `code` is `None` if the server didn't
@@ -86,9 +86,9 @@ fn parse_error_response(raw: &str) -> (Option<String>, String) {
 
 /// Heuristic: does this server error message indicate the session is gone?
 ///
-/// cah-graph currently bundles "Session not found" and "Session expired"
-/// under the generic `QUERY_ERROR` code (see `cah-graph/src/error.rs` and
-/// `server.rs`), so we match on the message text.
+/// byoridb currently bundles "Session not found" and "Session expired"
+/// under the generic `QUERY_ERROR` code (see `byoridb-graph/src/error.rs`
+/// and `byoridb-graph/src/server.rs`), so we match on the message text.
 fn is_session_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("session not found") || lower.contains("session expired")
@@ -108,7 +108,7 @@ pub struct QueryResult {
     pub rows: Vec<HashMap<String, serde_json::Value>>,
     #[serde(rename = "executionTime")]
     pub execution_time: f64,
-    /// Server-reported row count (see cah-graph `QueryResponse.row_count`).
+    /// Server-reported row count (see byoridb `QueryResponse.row_count`).
     /// `None` when the response didn't include it; frontends should fall
     /// back to `rows.len()` in that case.
     #[serde(rename = "rowCount", skip_serializing_if = "Option::is_none")]
@@ -147,16 +147,16 @@ pub async fn test_connection(host: &str, port: u32) -> Result<bool> {
     Ok(resp.status().is_success())
 }
 
-/// CahGraph client
+/// ByoriDB client
 pub struct ByoriDBClient {
     config: ConnectionConfig,
     session_id: Option<i64>,
 }
 
 impl ByoriDBClient {
-    /// Connect to CahGraph server
+    /// Connect to ByoriDB server
     pub async fn connect(config: ConnectionConfig) -> Result<Self, ClientError> {
-        info!("Connecting to CahGraph at {}:{}", config.host, config.port);
+        info!("Connecting to ByoriDB at {}:{}", config.host, config.port);
 
         let mut client = Self {
             config: config.clone(),
@@ -173,8 +173,8 @@ impl ByoriDBClient {
 
     /// Authenticate with the server using `POST /api/v1/session`.
     ///
-    /// The cah-graph HTTP API returns `session_id` as a JSON number (i64);
-    /// see cah-graph `src/server.rs::SessionResponse`.
+    /// The byoridb HTTP API returns `session_id` as a JSON number (i64);
+    /// see `byoridb-graph/src/server.rs::SessionResponse`.
     async fn authenticate(&self) -> Result<i64, ClientError> {
         let url = format!(
             "http://{}:{}/api/v1/session",
@@ -286,7 +286,7 @@ impl ByoriDBClient {
 
 /// Extract `session_id` from a `POST /api/v1/session` response body.
 ///
-/// The cah-graph server always returns `session_id` as a JSON number (i64);
+/// The byoridb server always returns `session_id` as a JSON number (i64);
 /// any other shape is a protocol violation and should fail loudly rather
 /// than be silently coerced.
 fn parse_session_id(body: &serde_json::Value) -> Result<i64> {
@@ -350,8 +350,8 @@ fn parse_names(result: &QueryResult) -> Vec<String> {
 
 /// Parse a `SHOW SPACES` response into `SpaceInfo` entries.
 ///
-/// The cah-graph server returns columns `["Name", "Replica Factor", "Partition Num"]`
-/// (see cah-graph `cah-executor/src/executor.rs` `ShowPlan::Spaces`). Missing
+/// The byoridb server returns columns `["Name", "Replica Factor", "Partition Num"]`
+/// (see `byoridb-executor/src/executor.rs` `ShowPlan::Spaces`). Missing
 /// numeric columns default to `0` — the sidebar still renders sensibly and
 /// flags the space as "not yet described".
 fn parse_spaces(result: &QueryResult) -> Vec<SpaceInfo> {
@@ -560,7 +560,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 19669,
                 username: "root".to_string(),
-                password: "cah".to_string(),
+                password: "test-password".to_string(),
             },
             session_id: None,
         };
@@ -578,7 +578,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 19669,
                 username: "root".to_string(),
-                password: "cah".to_string(),
+                password: "test-password".to_string(),
             },
             session_id: None,
         };

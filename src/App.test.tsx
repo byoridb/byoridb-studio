@@ -49,7 +49,7 @@ describe("App", () => {
         host: "127.0.0.1",
         port: 19669,
         username: "root",
-        password: "cah",
+        password: "",
       },
     });
 
@@ -76,7 +76,7 @@ describe("App", () => {
     });
   });
 
-  it("hints at CAH_ROOT_PASSWORD when the server reports AUTH_FAILED", async () => {
+  it("hints at BYORIDB_ROOT_PASSWORD when the server reports AUTH_FAILED", async () => {
     const user = userEvent.setup();
     invokeMock.mockRejectedValueOnce({
       code: "AUTH_FAILED",
@@ -91,7 +91,7 @@ describe("App", () => {
       const alertCall = (window.alert as unknown as ReturnType<typeof vi.fn>).mock
         .calls[0][0] as string;
       expect(alertCall).toContain("Authentication failed: Invalid password");
-      expect(alertCall).toContain("CAH_ROOT_PASSWORD");
+      expect(alertCall).toContain("BYORIDB_ROOT_PASSWORD");
     });
   });
 
@@ -155,7 +155,7 @@ describe("App", () => {
       expect(screen.getByText("Not connected")).toBeInTheDocument()
     );
     // …the connection modal reopens…
-    expect(screen.getByText("Connect to CahGraph")).toBeInTheDocument();
+    expect(screen.getByText("Connect to ByoriDB")).toBeInTheDocument();
     // …and the result panel shows the friendly expiry message.
     expect(
       screen.getByText("Session expired. Please reconnect.")
@@ -169,7 +169,7 @@ describe("App", () => {
 
     await user.click(screen.getByRole("button", { name: "×" }));
 
-    expect(screen.getByText("Connect to CahGraph")).toBeInTheDocument();
+    expect(screen.getByText("Connect to ByoriDB")).toBeInTheDocument();
   });
 
   it("selects a space silently without overwriting the result panel", async () => {

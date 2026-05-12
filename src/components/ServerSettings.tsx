@@ -22,10 +22,10 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   host: "127.0.0.1",
   port: 19669,
   username: "root",
-  password: "cah",
+  password: "",
 };
 
-const STORAGE_KEY = "cah-studio-connections";
+const STORAGE_KEY = "byoridb-studio-connections";
 
 export function loadSavedConnections(): SavedConnection[] {
   const saved = localStorage.getItem(STORAGE_KEY);

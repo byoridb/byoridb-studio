@@ -114,7 +114,7 @@ function App() {
       console.error("Connection failed:", e);
       const hint =
         e.code === "AUTH_FAILED"
-          ? "\n\nHint: the cah-graph server reads the root password from the CAH_ROOT_PASSWORD env var. If unset, the server generates a random one at startup and logs it."
+          ? "\n\nHint: the ByoriDB server reads the root password from the BYORIDB_ROOT_PASSWORD env var. If unset, the server generates a random one at startup and logs it."
           : "";
       alert(`Connection failed: ${e.message}${hint}`);
     }
@@ -207,7 +207,7 @@ function App() {
       <div className="app-header">
         <div className="app-title">
           <span className="logo">◆</span>
-          CahGraph Studio
+          ByoriDB Studio
         </div>
         <div className="connection-status">
           {isConnected ? (

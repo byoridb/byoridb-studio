@@ -5,7 +5,7 @@ interface QueryResult {
   columns: string[];
   rows: Record<string, unknown>[];
   executionTime: number;
-  /** Server-reported row count (cah-graph `QueryResponse.row_count`); falls back to `rows.length` if absent. */
+  /** Server-reported row count (byoridb `QueryResponse.row_count`); falls back to `rows.length` if absent. */
   rowCount?: number;
   error?: string;
 }

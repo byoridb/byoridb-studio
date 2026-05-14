@@ -152,10 +152,18 @@ FETCH PROP ON person 1;
 FETCH PROP ON * 1;  -- all tags
 
 -- Graph traversal
-GO FROM 1 OVER follows YIELD $$.person.name;
-GO 2 STEPS FROM 1 OVER follows;
+GO FROM 1 OVER follows YIELD follows._dst AS friend_id;
+GO 2 STEPS FROM 1 OVER follows YIELD vertex AS v;
+GO 1..3 STEPS FROM 1 OVER follows YIELD follows._dst;
+GO FROM 1 OVER follows WHERE follows.since > 2020 YIELD follows.since, follows._dst;
 
--- Pattern matching
+-- To project destination-vertex properties, use a compound statement:
+$f = GO FROM 1 OVER follows YIELD follows._dst AS dst;
+FETCH PROP ON person $f.dst;
+-- or use MATCH (single statement):
+MATCH (a:person)-[:follows]->(b:person) WHERE a.name == 'Alice' RETURN b.name;
+
+-- Pattern matching (start node MUST have a variable; end node may be anonymous)
 MATCH (n:person) WHERE n.age > 25 RETURN n;
 MATCH (a:person)-[e:follows]->(b:person) RETURN a.name, b.name;
 
@@ -166,7 +174,19 @@ LOOKUP ON person WHERE person.age > 25 YIELD person.name;
 FIND SHORTEST PATH FROM 1 TO 5 OVER follows;
 ```
 
-**Special Variables in GO**
-- `$^` - Source vertex
-- `$$` - Destination vertex
-- `follows._src`, `follows._dst` - Edge endpoints
+**GO YIELD column references** (what byoridb actually accepts — see
+`byoridb-parser/src/parser/dql.rs::parse_go` and the executor's GO tests):
+- `<edge>._src`, `<edge>._dst` — edge endpoint VIDs
+- `<edge>.<prop>` — edge property
+- `vertex` — destination vertex object (multi-step traversals)
+- `$var` / `$var.col` — reference to a previous compound-statement result
+
+The nGQL-standard placeholders `$^` (source vertex) and `$$` (destination
+vertex) are **not implemented** in byoridb; the parser rejects them at
+the `Dollar` token. Use the workarounds above (compound `$var = GO ...;
+FETCH PROP ...`, or `MATCH`) when you need vertex properties.
+
+**MATCH constraint**: byoridb requires the *start node* of a `MATCH`
+pattern to bind a variable (see `byoridb-executor/src/match.rs`).
+`MATCH ()-[e:follows]->()` is rejected; use `MATCH (s)-[e:follows]->()`
+instead. The end node may stay anonymous.

@@ -41,9 +41,7 @@ describe("QueryEditor", () => {
     await user.keyboard("{Meta>}{Enter}{/Meta}");
 
     expect(onExecute).toHaveBeenCalledTimes(2);
-    expect(localStorage.getItem("byoridb-studio-query-history")).toBe(
-      '["MATCH (v) RETURN v"]',
-    );
+    expect(localStorage.getItem("byoridb-studio-query-history")).toBe('["MATCH (v) RETURN v"]');
   });
 
   it("navigates saved query history", async () => {

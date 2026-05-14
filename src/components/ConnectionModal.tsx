@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
-import { loadSavedConnections, SavedConnection, ConnectionConfig } from "./ServerSettings";
+import { loadSavedConnections } from "./ServerSettings";
+import type { ConnectionConfig, SavedConnection } from "../types";
+import { DEFAULT_CONNECTION_CONFIG } from "../types";
 import "../styles/ConnectionModal.css";
 
 interface ConnectionModalProps {
@@ -7,12 +9,7 @@ interface ConnectionModalProps {
   onClose: () => void;
 }
 
-const DEFAULT_CONFIG: ConnectionConfig = {
-  host: "127.0.0.1",
-  port: 19669,
-  username: "root",
-  password: "",
-};
+const DEFAULT_CONFIG = DEFAULT_CONNECTION_CONFIG;
 
 function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
   const [config, setConfig] = useState<ConnectionConfig>(DEFAULT_CONFIG);
@@ -48,7 +45,9 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
       <div className="connection-modal">
         <div className="modal-header">
           <h2>Connect to ByoriDB</h2>
-          <button className="close-btn" onClick={onClose}>×</button>
+          <button className="close-btn" onClick={onClose}>
+            ×
+          </button>
         </div>
 
         <div className="modal-body">
@@ -60,8 +59,7 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
                   <div
                     key={saved.name}
                     className={`saved-item ${
-                      config.host === saved.config.host &&
-                      config.port === saved.config.port
+                      config.host === saved.config.host && config.port === saved.config.port
                         ? "selected"
                         : ""
                     }`}
@@ -122,20 +120,14 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
             </div>
           </div>
 
-          <p className="settings-hint">
-            Manage saved connections in the Settings tab.
-          </p>
+          <p className="settings-hint">Manage saved connections in the Settings tab.</p>
         </div>
 
         <div className="modal-footer">
           <button className="cancel-btn" onClick={onClose}>
             Cancel
           </button>
-          <button
-            className="connect-btn"
-            onClick={handleConnect}
-            disabled={isConnecting}
-          >
+          <button className="connect-btn" onClick={handleConnect} disabled={isConnecting}>
             {isConnecting ? "Connecting..." : "Connect"}
           </button>
         </div>

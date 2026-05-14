@@ -4,28 +4,8 @@ import Sidebar from "./components/Sidebar";
 import QueryEditor from "./components/QueryEditor";
 import ResultPanel from "./components/ResultPanel";
 import ConnectionModal from "./components/ConnectionModal";
+import type { ConnectionConfig, QueryResult, TauriError } from "./types";
 import "./styles/App.css";
-
-interface ConnectionConfig {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-}
-
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  executionTime: number;
-  rowCount?: number;
-  error?: string;
-}
-
-/** Error shape returned by every Tauri command (see `src-tauri/src/main.rs::TauriError`). */
-interface TauriError {
-  code: string;
-  message: string;
-}
 
 /**
  * Normalize anything thrown from an `invoke` call into `{code, message}`.
@@ -213,7 +193,9 @@ function App() {
           {isConnected ? (
             <>
               <span className="status-indicator connected" />
-              <span>{connectionConfig?.host}:{connectionConfig?.port}</span>
+              <span>
+                {connectionConfig?.host}:{connectionConfig?.port}
+              </span>
               {currentSpace && <span className="current-space">/ {currentSpace}</span>}
               <button className="btn-disconnect" onClick={handleDisconnect}>
                 Disconnect

@@ -58,7 +58,8 @@
   font-weight: 500;
 }
 
-.btn-connect, .btn-disconnect {
+.btn-connect,
+.btn-disconnect {
   padding: 4px 12px;
   font-size: 12px;
   border-radius: 4px;

@@ -63,7 +63,7 @@ describe("Sidebar", () => {
     expect(onExecuteQuery).toHaveBeenCalledWith("MATCH (v:person) RETURN v LIMIT 100");
 
     await user.click(screen.getByText("likes"));
-    expect(onExecuteQuery).toHaveBeenCalledWith("MATCH ()-[e:likes]->() RETURN e LIMIT 100");
+    expect(onExecuteQuery).toHaveBeenCalledWith("MATCH (s)-[e:likes]->() RETURN e LIMIT 100");
   });
 
   it("switches to settings tab", async () => {
@@ -121,10 +121,7 @@ describe("Sidebar", () => {
     );
 
     await waitFor(() => {
-      expect(console.error).toHaveBeenCalledWith(
-        "Failed to load spaces:",
-        expect.any(Error),
-      );
+      expect(console.error).toHaveBeenCalledWith("Failed to load spaces:", expect.any(Error));
     });
     expect(screen.getByText("No spaces found")).toBeInTheDocument();
     expect(screen.getByText("No tags found")).toBeInTheDocument();
@@ -222,9 +219,7 @@ describe("Sidebar", () => {
 
     await user.click(screen.getByRole("button", { name: /Expand ghost/ }));
 
-    await waitFor(() =>
-      expect(screen.getByText("Error: Tag ghost not found")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("Error: Tag ghost not found")).toBeInTheDocument());
 
     // Name click is independent of the DESCRIBE panel and still fires the MATCH shortcut.
     await user.click(screen.getByText("ghost"));

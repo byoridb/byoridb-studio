@@ -86,9 +86,9 @@ async fn execute_query(
     info!("Executing query: {}", query);
 
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
     let result = client.execute(&query).await;
 
@@ -104,9 +104,9 @@ async fn execute_query(
 #[tauri::command]
 async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriError> {
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
     let result = client.get_spaces().await;
 
@@ -120,9 +120,9 @@ async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriE
 #[tauri::command]
 async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError> {
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
     let result = client.get_schema().await;
 
@@ -136,7 +136,9 @@ async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError
 #[tauri::command]
 async fn test_connection(host: String, port: u32) -> Result<bool, TauriError> {
     info!("Testing connection to {}:{}", host, port);
-    client_test_connection(&host, port).await.map_err(Into::into)
+    client_test_connection(&host, port)
+        .await
+        .map_err(Into::into)
 }
 
 fn main() {

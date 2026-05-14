@@ -24,9 +24,7 @@ describe("ResultPanel", () => {
 
   it("renders error results without table controls", () => {
     render(
-      <ResultPanel
-        result={{ columns: [], rows: [], executionTime: 0, error: "syntax error" }}
-      />,
+      <ResultPanel result={{ columns: [], rows: [], executionTime: 0, error: "syntax error" }} />,
     );
 
     expect(screen.getByText("Error")).toBeInTheDocument();

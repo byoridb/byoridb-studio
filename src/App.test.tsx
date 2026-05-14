@@ -151,15 +151,11 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: /Execute/ }));
 
     // Connection status reverts to disconnected…
-    await waitFor(() =>
-      expect(screen.getByText("Not connected")).toBeInTheDocument()
-    );
+    await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
     // …the connection modal reopens…
     expect(screen.getByText("Connect to ByoriDB")).toBeInTheDocument();
     // …and the result panel shows the friendly expiry message.
-    expect(
-      screen.getByText("Session expired. Please reconnect.")
-    ).toBeInTheDocument();
+    expect(screen.getByText("Session expired. Please reconnect.")).toBeInTheDocument();
   });
 
   it("keeps modal open when close is requested before connecting", async () => {
@@ -271,9 +267,7 @@ describe("App", () => {
         host: "127.0.0.1",
         port: 19669,
       });
-      expect(
-        screen.getByText("Lost connection to server. Please reconnect.")
-      ).toBeInTheDocument();
+      expect(screen.getByText("Lost connection to server. Please reconnect.")).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }

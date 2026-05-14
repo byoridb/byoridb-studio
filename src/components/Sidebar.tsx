@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import ServerSettings, { ConnectionConfig } from "./ServerSettings";
+import ServerSettings from "./ServerSettings";
+import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo } from "../types";
 import "../styles/Sidebar.css";
 
 type TabType = "schema" | "settings";
@@ -11,25 +12,6 @@ interface SidebarProps {
   onSelectSpace: (spaceName: string) => void;
   onExecuteQuery: (query: string) => void;
   onConnect: (config: ConnectionConfig) => void;
-}
-
-interface SpaceInfo {
-  name: string;
-  partitionNum: number;
-  replicaFactor: number;
-}
-
-interface SchemaInfo {
-  tags: string[];
-  edges: string[];
-}
-
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  executionTime: number;
-  rowCount?: number;
-  error?: string;
 }
 
 /**
@@ -52,7 +34,13 @@ type DescribeState =
 
 type DescribeKey = `tag:${string}` | `edge:${string}`;
 
-function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onConnect }: SidebarProps) {
+function Sidebar({
+  isConnected,
+  currentSpace,
+  onSelectSpace,
+  onExecuteQuery,
+  onConnect,
+}: SidebarProps) {
   const [activeTab, setActiveTab] = useState<TabType>("schema");
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
   const [schema, setSchema] = useState<SchemaInfo>({ tags: [], edges: [] });
@@ -166,7 +154,9 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
   };
 
   const handleEdgeClick = (edgeName: string) => {
-    onExecuteQuery(`MATCH ()-[e:${edgeName}]->() RETURN e LIMIT 100`);
+    // byoridb requires the start node to have a variable (see
+    // byoridb-executor/src/match.rs). End node can stay anonymous.
+    onExecuteQuery(`MATCH (s)-[e:${edgeName}]->() RETURN e LIMIT 100`);
   };
 
   const renderDescribePanel = (kind: "tag" | "edge", name: string) => {
@@ -241,10 +231,7 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
   const renderSchemaContent = () => (
     <>
       <div className="sidebar-section">
-        <div
-          className="section-header"
-          onClick={() => toggleSection("spaces")}
-        >
+        <div className="section-header" onClick={() => toggleSection("spaces")}>
           <span className={`arrow ${expandedSections.spaces ? "expanded" : ""}`}>▶</span>
           <span className="section-title">Spaces</span>
           <button
@@ -282,10 +269,7 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
       {currentSpace && (
         <>
           <div className="sidebar-section">
-            <div
-              className="section-header"
-              onClick={() => toggleSection("tags")}
-            >
+            <div className="section-header" onClick={() => toggleSection("tags")}>
               <span className={`arrow ${expandedSections.tags ? "expanded" : ""}`}>▶</span>
               <span className="section-title">Tags</span>
               <button
@@ -311,10 +295,7 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
           </div>
 
           <div className="sidebar-section">
-            <div
-              className="section-header"
-              onClick={() => toggleSection("edges")}
-            >
+            <div className="section-header" onClick={() => toggleSection("edges")}>
               <span className={`arrow ${expandedSections.edges ? "expanded" : ""}`}>▶</span>
               <span className="section-title">Edges</span>
             </div>

@@ -130,13 +130,9 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
       </div>
 
       <div className="editor-footer">
-        <span className="hint">
-          ⌘↵ Execute | ⌘↑/↓ History
-        </span>
+        <span className="hint">⌘↵ Execute | ⌘↑/↓ History</span>
         {history.length > 0 && (
-          <span className="history-info">
-            History: {history.length} queries
-          </span>
+          <span className="history-info">History: {history.length} queries</span>
         )}
       </div>
     </div>

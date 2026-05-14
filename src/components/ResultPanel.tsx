@@ -1,14 +1,6 @@
 import { useState } from "react";
+import type { QueryResult } from "../types";
 import "../styles/ResultPanel.css";
-
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  executionTime: number;
-  /** Server-reported row count (byoridb `QueryResponse.row_count`); falls back to `rows.length` if absent. */
-  rowCount?: number;
-  error?: string;
-}
 
 interface ResultPanelProps {
   result: QueryResult | null;
@@ -59,17 +51,13 @@ function ResultPanel({ result }: ResultPanelProps) {
             <tr key={i}>
               <td className="row-number">{i + 1}</td>
               {result.columns.map((col) => (
-                <td key={col}>
-                  {formatValue(row[col])}
-                </td>
+                <td key={col}>{formatValue(row[col])}</td>
               ))}
             </tr>
           ))}
         </tbody>
       </table>
-      {result.rows.length === 0 && (
-        <div className="no-data">No data returned</div>
-      )}
+      {result.rows.length === 0 && <div className="no-data">No data returned</div>}
     </div>
   );
 

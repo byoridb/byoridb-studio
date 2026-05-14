@@ -159,7 +159,9 @@
   border: none;
   border-radius: 2px;
   cursor: pointer;
-  transition: transform 0.15s ease, color 0.2s ease;
+  transition:
+    transform 0.15s ease,
+    color 0.2s ease;
 }
 
 .expand-btn:hover {

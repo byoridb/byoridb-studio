@@ -3,7 +3,19 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::info;
+
+/// Build a reqwest client with explicit timeouts. Without these, a stalled
+/// POST (dead proxy, dropped packets, server hung mid-handshake) waits on
+/// the OS TCP timeout — minutes — and the UI shows nothing at all.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("static reqwest builder settings are valid")
+}
 
 /// Errors returned by `ByoriDBClient` methods.
 ///
@@ -69,10 +81,7 @@ impl From<reqwest::Error> for ClientError {
 fn parse_error_response(raw: &str) -> (Option<String>, String) {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(body) => {
-            let code = body
-                .get("code")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let code = body.get("code").and_then(|v| v.as_str()).map(String::from);
             let message = body
                 .get("error")
                 .and_then(|v| v.as_str())
@@ -181,7 +190,7 @@ impl ByoriDBClient {
             self.config.host, self.config.port
         );
 
-        let http_client = reqwest::Client::new();
+        let http_client = build_http_client();
         let resp = http_client
             .post(&url)
             .json(&serde_json::json!({
@@ -191,6 +200,7 @@ impl ByoriDBClient {
             .send()
             .await?;
 
+        info!("POST {url} -> {}", resp.status());
         if resp.status().is_success() {
             let body: serde_json::Value = resp
                 .json()
@@ -215,7 +225,7 @@ impl ByoriDBClient {
                 self.config.host, self.config.port, session_id
             );
 
-            let http_client = reqwest::Client::new();
+            let http_client = build_http_client();
             let _ = http_client.delete(&url).send().await;
         }
         Ok(())
@@ -235,7 +245,7 @@ impl ByoriDBClient {
             self.config.host, self.config.port
         );
 
-        let http_client = reqwest::Client::new();
+        let http_client = build_http_client();
         let resp = http_client
             .post(&url)
             .json(&serde_json::json!({
@@ -245,6 +255,7 @@ impl ByoriDBClient {
             .send()
             .await?;
 
+        info!("POST {url} -> {}", resp.status());
         if resp.status().is_success() {
             let body: serde_json::Value = resp
                 .json()
@@ -315,11 +326,8 @@ fn parse_query_response(body: &serde_json::Value) -> QueryResult {
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| {
-                    v.as_object().map(|obj| {
-                        obj.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect()
-                    })
+                    v.as_object()
+                        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 })
                 .collect()
         })
@@ -327,9 +335,7 @@ fn parse_query_response(body: &serde_json::Value) -> QueryResult {
 
     let execution_time = body["latency_ms"].as_f64().unwrap_or(0.0);
 
-    let row_count = body["row_count"]
-        .as_u64()
-        .map(|n| n as usize);
+    let row_count = body["row_count"].as_u64().map(|n| n as usize);
 
     QueryResult {
         columns,
@@ -532,7 +538,9 @@ mod tests {
 
     #[test]
     fn is_session_error_matches_known_phrases_case_insensitively() {
-        assert!(is_session_error("Query execution failed: Session not found: 1"));
+        assert!(is_session_error(
+            "Query execution failed: Session not found: 1"
+        ));
         assert!(is_session_error("session expired"));
         assert!(is_session_error("Authentication failed: Session expired"));
     }

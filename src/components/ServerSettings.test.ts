@@ -1,8 +1,4 @@
-import {
-  loadSavedConnections,
-  saveSavedConnections,
-  SavedConnection,
-} from "./ServerSettings";
+import { loadSavedConnections, saveSavedConnections, SavedConnection } from "./ServerSettings";
 
 describe("ServerSettings storage helpers", () => {
   beforeEach(() => {

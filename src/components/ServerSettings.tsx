@@ -1,29 +1,14 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { ConnectionConfig, SavedConnection } from "../types";
+import { DEFAULT_CONNECTION_CONFIG } from "../types";
 import "../styles/ServerSettings.css";
 
-export interface ConnectionConfig {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-}
-
-export interface SavedConnection {
-  name: string;
-  config: ConnectionConfig;
-}
+export type { ConnectionConfig, SavedConnection };
 
 interface ServerSettingsProps {
   onConnect: (config: ConnectionConfig) => void;
 }
-
-const DEFAULT_CONFIG: ConnectionConfig = {
-  host: "127.0.0.1",
-  port: 19669,
-  username: "root",
-  password: "",
-};
 
 const STORAGE_KEY = "byoridb-studio-connections";
 
@@ -48,7 +33,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
   const [formData, setFormData] = useState<{ name: string } & ConnectionConfig>({
     name: "",
-    ...DEFAULT_CONFIG,
+    ...DEFAULT_CONNECTION_CONFIG,
   });
 
   useEffect(() => {
@@ -91,9 +76,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
     let updated: SavedConnection[];
     if (editingConnection) {
-      updated = connections.map((c) =>
-        c.name === editingConnection.name ? newConnection : c
-      );
+      updated = connections.map((c) => (c.name === editingConnection.name ? newConnection : c));
     } else {
       // Check for duplicate name
       if (connections.some((c) => c.name === formData.name)) {
@@ -126,7 +109,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
   };
 
   const resetForm = () => {
-    setFormData({ name: "", ...DEFAULT_CONFIG });
+    setFormData({ name: "", ...DEFAULT_CONNECTION_CONFIG });
     setEditingConnection(null);
     setIsAdding(false);
   };
@@ -241,11 +224,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
                   >
                     {testingHost === hostKey ? "..." : "Test"}
                   </button>
-                  <button
-                    className="action-btn edit"
-                    onClick={() => handleEdit(conn)}
-                    title="Edit"
-                  >
+                  <button className="action-btn edit" onClick={() => handleEdit(conn)} title="Edit">
                     Edit
                   </button>
                   <button

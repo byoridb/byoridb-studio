@@ -8,6 +8,75 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
 
+vi.mock("@monaco-editor/react", async () => {
+  const { useRef, useEffect } = await vi.importActual<typeof import("react")>("react");
+  interface MockProps {
+    value?: string;
+    onChange?: (v: string) => void;
+    onMount?: (editor: unknown, monaco: unknown) => void;
+    options?: { readOnly?: boolean };
+  }
+  function MockEditor({ value = "", onChange, onMount, options }: MockProps) {
+    const ref = useRef<HTMLTextAreaElement>(null);
+    const cmds = useRef<Map<number, () => void>>(new Map());
+    useEffect(() => {
+      if (!onMount) return;
+      const KeyMod = { CtrlCmd: 1 << 11, Shift: 1 << 10 };
+      const KeyCode = { Enter: 3, UpArrow: 16, DownArrow: 18 };
+      onMount(
+        {
+          getValue: () => ref.current?.value ?? "",
+          setValue: (v: string) => {
+            onChange?.(v);
+          },
+          focus: () => ref.current?.focus(),
+          getSelection: () => ({ isEmpty: () => true }),
+          getModel: () => ({ getValueInRange: () => "" }),
+          addCommand: (kb: number, h: () => void) => cmds.current.set(kb, h),
+        },
+        { KeyMod, KeyCode },
+      );
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+      let kb: number | null = null;
+      if (e.key === "Enter") kb = (1 << 11) | 3;
+      if (e.key === "ArrowUp") kb = (1 << 11) | 16;
+      if (e.key === "ArrowDown") kb = (1 << 11) | 18;
+      if (kb !== null) {
+        e.preventDefault();
+        cmds.current.get(kb)?.();
+      }
+    };
+    return (
+      <textarea
+        ref={ref}
+        data-testid="monaco-editor"
+        value={value}
+        disabled={options?.readOnly}
+        onChange={(e) => onChange?.(e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+  return { default: MockEditor };
+});
+
+vi.mock("./lib/ngql-language", () => ({ registerNgqlLanguage: vi.fn(), LANGUAGE_ID: "ngql" }));
+
+vi.mock("./components/TableView", () => ({
+  default: ({ result }: { result: { columns: string[]; rows: Record<string, unknown>[] } }) => (
+    <table>
+      <tbody>
+        {result.rows.map((row, i) =>
+          result.columns.map((col) => <td key={`${i}-${col}`}>{String(row[col] ?? "NULL")}</td>),
+        )}
+      </tbody>
+    </table>
+  ),
+}));
+
 describe("App", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -53,8 +122,9 @@ describe("App", () => {
       },
     });
 
-    await user.click(screen.getByRole("button", { name: "Show Spaces" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    // Type query directly into the Monaco mock textarea
+    await user.type(screen.getByRole("textbox"), "SHOW SPACES");
+    await user.click(screen.getByTestId("execute-button"));
 
     await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
     expect(invokeMock).toHaveBeenCalledWith("execute_query", { query: "SHOW SPACES" });
@@ -116,8 +186,8 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
     await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-    await user.click(screen.getByRole("button", { name: "Show Tags" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    await user.type(screen.getByRole("textbox"), "SHOW TAGS");
+    await user.click(screen.getByTestId("execute-button"));
 
     await waitFor(() => expect(screen.getByText("Error")).toBeInTheDocument());
     expect(screen.getByText("bad query")).toBeInTheDocument();
@@ -147,8 +217,8 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
     await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-    await user.click(screen.getByRole("button", { name: "Show Tags" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    await user.type(screen.getByRole("textbox"), "SHOW TAGS");
+    await user.click(screen.getByTestId("execute-button"));
 
     // Connection status reverts to disconnected…
     await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());

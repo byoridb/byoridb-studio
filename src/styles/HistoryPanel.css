@@ -1,0 +1,125 @@
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.history-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.history-search {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+}
+
+.history-search:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.history-filter-btn,
+.history-clear-btn {
+  padding: 4px 8px;
+  font-size: 13px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.history-filter-btn:hover,
+.history-clear-btn:hover {
+  color: var(--text-primary);
+  background: var(--hover-bg);
+}
+
+.history-filter-btn.active {
+  color: var(--accent-warning);
+  border-color: var(--accent-warning);
+}
+
+.history-clear-btn:hover {
+  color: var(--accent-error);
+  border-color: var(--accent-error);
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.history-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.history-entry {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+}
+
+.history-entry:hover {
+  background: var(--hover-bg);
+}
+
+.history-entry-query {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+
+.history-entry-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.history-time {
+  color: var(--accent-secondary);
+}
+
+.history-rows {
+  color: var(--accent-success);
+}
+
+.history-date {
+  flex: 1;
+}
+
+.history-fav-btn {
+  padding: 0 4px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+.history-fav-btn:hover {
+  color: var(--accent-warning);
+}
+
+.history-fav-btn.active {
+  color: var(--accent-warning);
+}

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ServerSettings from "./ServerSettings";
-import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo } from "../types";
+import HistoryPanel from "./HistoryPanel";
+import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
 import "../styles/Sidebar.css";
 
-type TabType = "schema" | "settings";
+type TabType = "schema" | "history" | "settings";
 
 interface SidebarProps {
   isConnected: boolean;
@@ -12,6 +13,9 @@ interface SidebarProps {
   onSelectSpace: (spaceName: string) => void;
   onExecuteQuery: (query: string) => void;
   onConnect: (config: ConnectionConfig) => void;
+  historyEntries: HistoryEntry[];
+  onToggleFavorite: (id: string) => void;
+  onClearHistory: () => void;
 }
 
 /**
@@ -40,6 +44,9 @@ function Sidebar({
   onSelectSpace,
   onExecuteQuery,
   onConnect,
+  historyEntries,
+  onToggleFavorite,
+  onClearHistory,
 }: SidebarProps) {
   const [activeTab, setActiveTab] = useState<TabType>("schema");
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
@@ -324,6 +331,12 @@ function Sidebar({
           Schema
         </button>
         <button
+          className={`sidebar-tab ${activeTab === "history" ? "active" : ""}`}
+          onClick={() => setActiveTab("history")}
+        >
+          History
+        </button>
+        <button
           className={`sidebar-tab ${activeTab === "settings" ? "active" : ""}`}
           onClick={() => setActiveTab("settings")}
         >
@@ -332,7 +345,16 @@ function Sidebar({
       </div>
 
       <div className="sidebar-content">
-        {activeTab === "schema" ? renderSchemaContent() : <ServerSettings onConnect={onConnect} />}
+        {activeTab === "schema" && renderSchemaContent()}
+        {activeTab === "history" && (
+          <HistoryPanel
+            entries={historyEntries}
+            onSelect={onExecuteQuery}
+            onToggleFavorite={onToggleFavorite}
+            onClear={onClearHistory}
+          />
+        )}
+        {activeTab === "settings" && <ServerSettings onConnect={onConnect} />}
       </div>
     </div>
   );

@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { QueryResult } from "../types";
+import TableView from "./TableView";
+import JsonTreeView from "./JsonTreeView";
 import "../styles/ResultPanel.css";
 
 interface ResultPanelProps {
@@ -8,8 +10,45 @@ interface ResultPanelProps {
 
 type ViewMode = "table" | "json" | "graph";
 
+export function formatValue(value: unknown): string {
+  if (value === null || value === undefined) return "NULL";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function exportCsv(result: QueryResult) {
+  const header = result.columns.join(",");
+  const rows = result.rows.map((row) =>
+    result.columns
+      .map((col) => {
+        const v = formatValue(row[col]);
+        return v.includes(",") || v.includes('"') || v.includes("\n")
+          ? `"${v.replace(/"/g, '""')}"`
+          : v;
+      })
+      .join(","),
+  );
+  const csv = [header, ...rows].join("\n");
+  downloadFile(csv, "result.csv", "text/csv");
+}
+
+function exportJson(result: QueryResult) {
+  downloadFile(JSON.stringify(result.rows, null, 2), "result.json", "application/json");
+}
+
+function downloadFile(content: string, filename: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function ResultPanel({ result }: ResultPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("table");
+  const [jsonSearch, setJsonSearch] = useState("");
 
   if (!result) {
     return (
@@ -35,47 +74,6 @@ function ResultPanel({ result }: ResultPanelProps) {
     );
   }
 
-  const renderTable = () => (
-    <div className="table-container">
-      <table className="result-table">
-        <thead>
-          <tr>
-            <th className="row-number">#</th>
-            {result.columns.map((col) => (
-              <th key={col}>{col}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {result.rows.map((row, i) => (
-            <tr key={i}>
-              <td className="row-number">{i + 1}</td>
-              {result.columns.map((col) => (
-                <td key={col}>{formatValue(row[col])}</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {result.rows.length === 0 && <div className="no-data">No data returned</div>}
-    </div>
-  );
-
-  const renderJson = () => (
-    <div className="json-container">
-      <pre>{JSON.stringify(result.rows, null, 2)}</pre>
-    </div>
-  );
-
-  const renderGraph = () => (
-    <div className="graph-container">
-      <div className="graph-placeholder">
-        <span className="placeholder-icon">🔜</span>
-        <span className="placeholder-text">Graph visualization coming soon...</span>
-      </div>
-    </div>
-  );
-
   return (
     <div className="result-panel">
       <div className="result-header">
@@ -84,45 +82,74 @@ function ResultPanel({ result }: ResultPanelProps) {
           <span className="result-count">{result.rowCount ?? result.rows.length} rows</span>
           <span className="result-time">{result.executionTime.toFixed(2)}ms</span>
         </div>
-        <div className="view-modes">
+        <div className="result-actions">
+          {viewMode === "json" && (
+            <input
+              className="json-search-input"
+              type="text"
+              placeholder="Search JSON..."
+              value={jsonSearch}
+              onChange={(e) => setJsonSearch(e.target.value)}
+              data-testid="json-search"
+            />
+          )}
           <button
-            className={`view-mode-btn ${viewMode === "table" ? "active" : ""}`}
-            onClick={() => setViewMode("table")}
+            className="export-btn"
+            onClick={() => exportCsv(result)}
+            title="Export CSV"
+            data-testid="export-csv"
           >
-            Table
+            ↓ CSV
           </button>
           <button
-            className={`view-mode-btn ${viewMode === "json" ? "active" : ""}`}
-            onClick={() => setViewMode("json")}
+            className="export-btn"
+            onClick={() => exportJson(result)}
+            title="Export JSON"
+            data-testid="export-json"
           >
-            JSON
+            ↓ JSON
           </button>
-          <button
-            className={`view-mode-btn ${viewMode === "graph" ? "active" : ""}`}
-            onClick={() => setViewMode("graph")}
-          >
-            Graph
-          </button>
+          <div className="view-modes">
+            <button
+              className={`view-mode-btn ${viewMode === "table" ? "active" : ""}`}
+              onClick={() => setViewMode("table")}
+            >
+              Table
+            </button>
+            <button
+              className={`view-mode-btn ${viewMode === "json" ? "active" : ""}`}
+              onClick={() => setViewMode("json")}
+            >
+              JSON
+            </button>
+            <button
+              className={`view-mode-btn ${viewMode === "graph" ? "active" : ""}`}
+              onClick={() => setViewMode("graph")}
+            >
+              Graph
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="result-content">
-        {viewMode === "table" && renderTable()}
-        {viewMode === "json" && renderJson()}
-        {viewMode === "graph" && renderGraph()}
+        {viewMode === "table" && <TableView result={result} />}
+        {viewMode === "json" && (
+          <div className="json-tree-container">
+            <JsonTreeView data={result.rows} search={jsonSearch} />
+          </div>
+        )}
+        {viewMode === "graph" && (
+          <div className="graph-container">
+            <div className="graph-placeholder">
+              <span className="placeholder-icon">🔜</span>
+              <span className="placeholder-text">Graph visualization coming soon...</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
-}
-
-export function formatValue(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "NULL";
-  }
-  if (typeof value === "object") {
-    return JSON.stringify(value);
-  }
-  return String(value);
 }
 
 export default ResultPanel;

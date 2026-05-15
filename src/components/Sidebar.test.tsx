@@ -41,6 +41,9 @@ describe("Sidebar", () => {
         onSelectSpace={onSelectSpace}
         onExecuteQuery={onExecuteQuery}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -55,6 +58,9 @@ describe("Sidebar", () => {
         onSelectSpace={onSelectSpace}
         onExecuteQuery={onExecuteQuery}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -76,6 +82,9 @@ describe("Sidebar", () => {
         onSelectSpace={vi.fn()}
         onExecuteQuery={vi.fn()}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -95,6 +104,9 @@ describe("Sidebar", () => {
         onSelectSpace={vi.fn()}
         onExecuteQuery={vi.fn()}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -117,6 +129,9 @@ describe("Sidebar", () => {
         onSelectSpace={vi.fn()}
         onExecuteQuery={vi.fn()}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -160,6 +175,9 @@ describe("Sidebar", () => {
         onSelectSpace={vi.fn()}
         onExecuteQuery={vi.fn()}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 
@@ -212,6 +230,9 @@ describe("Sidebar", () => {
         onSelectSpace={vi.fn()}
         onExecuteQuery={onExecuteQuery}
         onConnect={vi.fn()}
+        historyEntries={[]}
+        onToggleFavorite={vi.fn()}
+        onClearHistory={vi.fn()}
       />,
     );
 

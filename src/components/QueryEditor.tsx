@@ -1,7 +1,9 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { registerNgqlLanguage, LANGUAGE_ID } from "../lib/ngql-language";
+import { type QueryTab, SNIPPETS, newTab } from "../lib/query-tabs";
+import { HISTORY_STORAGE_KEY } from "../types";
 import "../styles/QueryEditor.css";
 
 interface QueryEditorProps {
@@ -10,32 +12,39 @@ interface QueryEditorProps {
   isConnected: boolean;
 }
 
-const SAMPLE_QUERIES = [
-  { label: "Show Spaces", query: "SHOW SPACES" },
-  { label: "Show Tags", query: "SHOW TAGS" },
-  { label: "Show Edges", query: "SHOW EDGES" },
-  { label: "Show Parts", query: "SHOW PARTS" },
-  { label: "Show Hosts", query: "SHOW HOSTS" },
-];
+const TABS_STORAGE_KEY = "byoridb-studio-tabs";
 
-const HISTORY_STORAGE_KEY = "byoridb-studio-query-history";
+function loadTabs(): QueryTab[] {
+  try {
+    const saved = localStorage.getItem(TABS_STORAGE_KEY);
+    if (saved) return JSON.parse(saved) as QueryTab[];
+  } catch {
+    // ignore
+  }
+  return [newTab("tab-1")];
+}
+
+function saveTabs(tabs: QueryTab[]) {
+  localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
+}
 
 function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) {
-  const [query, setQuery] = useState("");
+  const [tabs, setTabs] = useState<QueryTab[]>(loadTabs);
+  const [activeTabId, setActiveTabId] = useState<string>(() => loadTabs()[0].id);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [showSnippets, setShowSnippets] = useState(false);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
 
-  // Refs to keep keybinding callbacks up-to-date without re-registering
-  const queryRef = useRef(query);
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+
+  // Refs for keybinding callbacks
   const historyRef = useRef(history);
   const historyIndexRef = useRef(historyIndex);
   const isExecutingRef = useRef(isExecuting);
   const isConnectedRef = useRef(isConnected);
+  const activeTabRef = useRef(activeTab);
 
-  useEffect(() => {
-    queryRef.current = query;
-  }, [query]);
   useEffect(() => {
     historyRef.current = history;
   }, [history]);
@@ -48,91 +57,186 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
   useEffect(() => {
     isConnectedRef.current = isConnected;
   }, [isConnected]);
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
 
   useEffect(() => {
     const saved = localStorage.getItem(HISTORY_STORAGE_KEY);
     if (saved) setHistory(JSON.parse(saved));
   }, []);
 
-  const handleExecute = (currentQuery: string) => {
-    if (!currentQuery.trim() || isExecutingRef.current || !isConnectedRef.current) return;
-    onExecute(currentQuery);
-    const newHistory = [
-      currentQuery,
-      ...historyRef.current.filter((h) => h !== currentQuery),
-    ].slice(0, 50);
-    setHistory(newHistory);
-    setHistoryIndex(-1);
-    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(newHistory));
-  };
+  const updateTabQuery = useCallback((id: string, query: string) => {
+    setTabs((prev) => {
+      const next = prev.map((t) => (t.id === id ? { ...t, query } : t));
+      saveTabs(next);
+      return next;
+    });
+  }, []);
+
+  const handleExecute = useCallback(
+    (query: string) => {
+      if (!query.trim() || isExecutingRef.current || !isConnectedRef.current) return;
+      onExecute(query);
+      const newHistory = [query, ...historyRef.current.filter((h) => h !== query)].slice(0, 50);
+      setHistory(newHistory);
+      setHistoryIndex(-1);
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(newHistory));
+    },
+    [onExecute],
+  );
 
   const handleMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     registerNgqlLanguage(monaco);
 
-    // ⌘↵ / Ctrl+Enter — execute
+    // ⌘↵ — execute full query
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
       handleExecute(editor.getValue());
     });
 
-    // ⌘↑ / Ctrl+Up — older history
+    // ⌘⇧↵ — execute selected text (or full if no selection)
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => {
+      const selection = editor.getSelection();
+      const selected =
+        selection && !selection.isEmpty()
+          ? (editor.getModel()?.getValueInRange(selection) ?? "")
+          : editor.getValue();
+      handleExecute(selected);
+    });
+
+    // ⌘↑ — older history
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.UpArrow, () => {
       const hist = historyRef.current;
       if (!hist.length) return;
       const newIndex = Math.min(historyIndexRef.current + 1, hist.length - 1);
       setHistoryIndex(newIndex);
       const val = hist[newIndex];
-      setQuery(val);
+      updateTabQuery(activeTabRef.current.id, val);
       editor.setValue(val);
     });
 
-    // ⌘↓ / Ctrl+Down — newer history
+    // ⌘↓ — newer history
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.DownArrow, () => {
       const hist = historyRef.current;
       if (!hist.length) return;
       const newIndex = Math.max(historyIndexRef.current - 1, -1);
       setHistoryIndex(newIndex);
       const val = newIndex === -1 ? "" : hist[newIndex];
-      setQuery(val);
+      updateTabQuery(activeTabRef.current.id, val);
       editor.setValue(val);
     });
   };
 
-  const handleSampleQuery = (sampleQuery: string) => {
-    setQuery(sampleQuery);
-    setHistoryIndex(-1);
+  const setEditorValue = (val: string) => {
+    updateTabQuery(activeTab.id, val);
     if (editorRef.current) {
-      editorRef.current.setValue(sampleQuery);
+      editorRef.current.setValue(val);
       editorRef.current.focus();
     }
   };
 
   const handleClear = () => {
-    setQuery("");
     setHistoryIndex(-1);
-    if (editorRef.current) {
-      editorRef.current.setValue("");
-      editorRef.current.focus();
-    }
+    setEditorValue("");
+  };
+
+  // Tab management
+  const addTab = () => {
+    const tab = newTab();
+    setTabs((prev) => {
+      const next = [...prev, tab];
+      saveTabs(next);
+      return next;
+    });
+    setActiveTabId(tab.id);
+    setTimeout(() => editorRef.current?.setValue(""), 0);
+  };
+
+  const closeTab = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTabs((prev) => {
+      if (prev.length === 1) return prev; // keep at least one tab
+      const next = prev.filter((t) => t.id !== id);
+      saveTabs(next);
+      if (activeTabId === id) {
+        const idx = prev.findIndex((t) => t.id === id);
+        const newActive = next[Math.min(idx, next.length - 1)];
+        setActiveTabId(newActive.id);
+        setTimeout(() => editorRef.current?.setValue(newActive.query), 0);
+      }
+      return next;
+    });
+  };
+
+  const switchTab = (tab: QueryTab) => {
+    setActiveTabId(tab.id);
+    setHistoryIndex(-1);
+    setTimeout(() => editorRef.current?.setValue(tab.query), 0);
+  };
+
+  const insertSnippet = (body: string) => {
+    setShowSnippets(false);
+    // Strip snippet placeholders for simple insertion
+    const plain = body.replace(/\$\{\d+:([^}]+)\}/g, "$1").replace(/\$\d+/g, "");
+    setEditorValue(plain);
   };
 
   return (
     <div className="query-editor">
+      {/* Tab bar */}
+      <div className="tab-bar">
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            className={`tab ${tab.id === activeTabId ? "active" : ""}`}
+            onClick={() => switchTab(tab)}
+            data-testid={`tab-${tab.id}`}
+          >
+            <span className="tab-title">{tab.title}</span>
+            {tabs.length > 1 && (
+              <button
+                className="tab-close"
+                onClick={(e) => closeTab(tab.id, e)}
+                aria-label={`Close ${tab.title}`}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
+        <button className="tab-add" onClick={addTab} aria-label="New tab" data-testid="add-tab">
+          +
+        </button>
+      </div>
+
+      {/* Toolbar */}
       <div className="editor-toolbar">
         <div className="toolbar-left">
           <span className="toolbar-title">Query Editor</span>
-          <div className="sample-queries">
-            {SAMPLE_QUERIES.map((sample) => (
-              <button
-                key={sample.label}
-                className="sample-query-btn"
-                onClick={() => handleSampleQuery(sample.query)}
-                disabled={!isConnected}
-                data-testid={`sample-query-${sample.label.toLowerCase().replace(/\s+/g, "-")}`}
-              >
-                {sample.label}
-              </button>
-            ))}
+          <div className="snippet-wrapper">
+            <button
+              className="snippet-btn"
+              onClick={() => setShowSnippets((v) => !v)}
+              disabled={!isConnected}
+              data-testid="snippets-button"
+            >
+              Snippets ▾
+            </button>
+            {showSnippets && (
+              <div className="snippet-dropdown" data-testid="snippet-dropdown">
+                {SNIPPETS.map((s) => (
+                  <button
+                    key={s.label}
+                    className="snippet-item"
+                    onClick={() => insertSnippet(s.body)}
+                    title={s.description}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         <div className="toolbar-right">
@@ -140,9 +244,27 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
             Clear
           </button>
           <button
+            className="btn-execute-selection"
+            onClick={() => {
+              const editor = editorRef.current;
+              if (!editor) return;
+              const sel = editor.getSelection();
+              const text =
+                sel && !sel.isEmpty()
+                  ? (editor.getModel()?.getValueInRange(sel) ?? "")
+                  : editor.getValue();
+              handleExecute(text);
+            }}
+            disabled={!activeTab.query.trim() || isExecuting || !isConnected}
+            title="Execute selection (⌘⇧↵) or full query"
+            data-testid="execute-selection-button"
+          >
+            ▶ Selection
+          </button>
+          <button
             className="btn-execute"
-            onClick={() => handleExecute(query)}
-            disabled={!query.trim() || isExecuting || !isConnected}
+            onClick={() => handleExecute(activeTab.query)}
+            disabled={!activeTab.query.trim() || isExecuting || !isConnected}
             data-testid="execute-button"
           >
             {isExecuting ? "Executing..." : "Execute (⌘↵)"}
@@ -150,13 +272,14 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
         </div>
       </div>
 
+      {/* Editor */}
       <div className="editor-container" data-testid="editor-container">
         <Editor
           height="100%"
           language={LANGUAGE_ID}
           theme="catppuccin-mocha"
-          value={query}
-          onChange={(val) => setQuery(val ?? "")}
+          value={activeTab.query}
+          onChange={(val) => updateTabQuery(activeTab.id, val ?? "")}
           onMount={handleMount}
           options={{
             readOnly: !isConnected,
@@ -177,7 +300,7 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
       </div>
 
       <div className="editor-footer">
-        <span className="hint">⌘↵ Execute | ⌘↑/↓ History</span>
+        <span className="hint">⌘↵ Execute | ⌘⇧↵ Execute Selection | ⌘↑/↓ History</span>
         {history.length > 0 && (
           <span className="history-info">History: {history.length} queries</span>
         )}

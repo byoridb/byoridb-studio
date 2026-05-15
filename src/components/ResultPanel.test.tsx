@@ -2,6 +2,49 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ResultPanel, { formatValue } from "./ResultPanel";
 
+// Clipboard mock
+const writeTextMock = vi.fn().mockResolvedValue(undefined);
+Object.defineProperty(navigator, "clipboard", {
+  value: { writeText: writeTextMock },
+  configurable: true,
+});
+
+// Mock TableView to avoid virtualizer jsdom issues
+vi.mock("./TableView", () => ({
+  default: ({ result }: { result: { columns: string[]; rows: Record<string, unknown>[] } }) => (
+    <div data-testid="table-view">
+      {result.rows.length === 0 ? (
+        <div>No data returned</div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              {result.columns.map((col: string) => (
+                <th key={col} data-testid={`col-header-${col}`}>
+                  {col}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {result.rows.map((row: Record<string, unknown>, i: number) =>
+              result.columns.map((col: string) => (
+                <td
+                  key={`${i}-${col}`}
+                  data-testid={`cell-${i}-${col}`}
+                  onClick={() => navigator.clipboard.writeText(String(row[col] ?? "NULL"))}
+                >
+                  {String(row[col] ?? "NULL")}
+                </td>
+              )),
+            )}
+          </tbody>
+        </table>
+      )}
+    </div>
+  ),
+}));
+
 describe("formatValue", () => {
   it("formats empty values as NULL", () => {
     expect(formatValue(null)).toBe("NULL");
@@ -18,7 +61,6 @@ describe("formatValue", () => {
 describe("ResultPanel", () => {
   it("shows an empty state before a query runs", () => {
     render(<ResultPanel result={null} />);
-
     expect(screen.getByText("Execute a query to see results")).toBeInTheDocument();
   });
 
@@ -26,15 +68,12 @@ describe("ResultPanel", () => {
     render(
       <ResultPanel result={{ columns: [], rows: [], executionTime: 0, error: "syntax error" }} />,
     );
-
     expect(screen.getByText("Error")).toBeInTheDocument();
     expect(screen.getByText("syntax error")).toBeInTheDocument();
     expect(screen.queryByText("Table")).not.toBeInTheDocument();
   });
 
-  it("renders table rows and switches to JSON view", async () => {
-    const user = userEvent.setup();
-
+  it("renders table rows and shows row count and time", () => {
     render(
       <ResultPanel
         result={{
@@ -44,39 +83,49 @@ describe("ResultPanel", () => {
         }}
       />,
     );
-
     expect(screen.getByText("1 rows")).toBeInTheDocument();
     expect(screen.getByText("12.35ms")).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "name" })).toBeInTheDocument();
+    expect(screen.getByTestId("col-header-name")).toBeInTheDocument();
     expect(screen.getByText("alice")).toBeInTheDocument();
-    expect(screen.getByText('{"active":true}')).toBeInTheDocument();
+  });
 
+  it("switches to JSON tree view", async () => {
+    const user = userEvent.setup();
+    render(
+      <ResultPanel result={{ columns: ["name"], rows: [{ name: "alice" }], executionTime: 1 }} />,
+    );
     await user.click(screen.getByRole("button", { name: "JSON" }));
-
-    expect(screen.getByText(/"active": true/)).toBeInTheDocument();
+    expect(screen.getByTestId("json-search")).toBeInTheDocument();
+    // Single row renders as root object node
+    expect(screen.getByTestId("json-node-root")).toBeInTheDocument();
   });
 
-  it("shows no-data messaging for successful empty results", () => {
-    render(<ResultPanel result={{ columns: ["name"], rows: [], executionTime: 1 }} />);
-
-    expect(screen.getByText("No data returned")).toBeInTheDocument();
-  });
-
-  it("renders NULL for missing column values", () => {
+  it("collapses and expands JSON nodes", async () => {
+    const user = userEvent.setup();
     render(
       <ResultPanel
         result={{
-          columns: ["name", "missing"],
-          rows: [{ name: "alice" }],
+          columns: ["data"],
+          rows: [{ data: { x: 1 } }, { data: { y: 2 } }],
           executionTime: 1,
         }}
       />,
     );
-
-    expect(screen.getByText("NULL")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "JSON" }));
+    // Multiple rows → indexed nodes
+    const node = screen.getByTestId("json-node-0");
+    await user.click(node);
+    expect(node).toHaveTextContent("1 keys");
+    await user.click(node);
+    expect(node).not.toHaveTextContent("1 keys");
   });
 
-  it("prefers the server-reported rowCount over the local row array length", () => {
+  it("shows no-data messaging for successful empty results", () => {
+    render(<ResultPanel result={{ columns: ["name"], rows: [], executionTime: 1 }} />);
+    expect(screen.getByText("No data returned")).toBeInTheDocument();
+  });
+
+  it("prefers server-reported rowCount", () => {
     render(
       <ResultPanel
         result={{
@@ -87,17 +136,21 @@ describe("ResultPanel", () => {
         }}
       />,
     );
-
     expect(screen.getByText("42 rows")).toBeInTheDocument();
+  });
+
+  it("shows export buttons", () => {
+    render(
+      <ResultPanel result={{ columns: ["name"], rows: [{ name: "alice" }], executionTime: 1 }} />,
+    );
+    expect(screen.getByTestId("export-csv")).toBeInTheDocument();
+    expect(screen.getByTestId("export-json")).toBeInTheDocument();
   });
 
   it("switches to graph placeholder view", async () => {
     const user = userEvent.setup();
-
     render(<ResultPanel result={{ columns: [], rows: [], executionTime: 1 }} />);
-
     await user.click(screen.getByRole("button", { name: "Graph" }));
-
     expect(screen.getByText("Graph visualization coming soon...")).toBeInTheDocument();
   });
 });

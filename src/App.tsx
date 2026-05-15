@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./components/Sidebar";
 import QueryEditor from "./components/QueryEditor";
 import ResultPanel from "./components/ResultPanel";
 import ConnectionModal from "./components/ConnectionModal";
-import type { ConnectionConfig, QueryResult, TauriError } from "./types";
+import type { ConnectionConfig, QueryResult, TauriError, HistoryEntry } from "./types";
+import { HISTORY_STORAGE_KEY } from "./types";
 import "./styles/App.css";
 
 /**
@@ -31,6 +32,36 @@ function App() {
   const [currentSpace, setCurrentSpace] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem(HISTORY_STORAGE_KEY);
+      return saved ? (JSON.parse(saved) as HistoryEntry[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const addHistoryEntry = useCallback((entry: HistoryEntry) => {
+    setHistoryEntries((prev) => {
+      // Deduplicate by query text, keep newest
+      const next = [entry, ...prev.filter((e) => e.query !== entry.query)].slice(0, 200);
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  const toggleFavorite = useCallback((id: string) => {
+    setHistoryEntries((prev) => {
+      const next = prev.map((e) => (e.id === id ? { ...e, favorite: !e.favorite } : e));
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  const clearHistory = useCallback(() => {
+    setHistoryEntries([]);
+    localStorage.removeItem(HISTORY_STORAGE_KEY);
+  }, []);
 
   /** Called when we detect the server session or reachability is gone. */
   const handleConnectionLost = (reason: "session" | "health") => {
@@ -125,10 +156,16 @@ function App() {
       const startTime = performance.now();
       const result = await invoke<QueryResult>("execute_query", { query });
       const endTime = performance.now();
+      const executionTime = endTime - startTime;
 
-      setQueryResult({
-        ...result,
-        executionTime: endTime - startTime,
+      setQueryResult({ ...result, executionTime });
+      addHistoryEntry({
+        id: `h-${Date.now()}`,
+        query,
+        executedAt: Date.now(),
+        executionTime,
+        rowCount: result.rowCount ?? result.rows.length,
+        favorite: false,
       });
     } catch (error) {
       const e = normalizeError(error);
@@ -220,6 +257,9 @@ function App() {
           onSelectSpace={handleSelectSpace}
           onExecuteQuery={handleExecuteQuery}
           onConnect={handleConnect}
+          historyEntries={historyEntries}
+          onToggleFavorite={toggleFavorite}
+          onClearHistory={clearHistory}
         />
 
         <div className="main-content">

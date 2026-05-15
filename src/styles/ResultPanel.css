@@ -48,6 +48,43 @@
   padding: 8px 16px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.json-search-input {
+  padding: 3px 8px;
+  font-size: 12px;
+  width: 140px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+}
+
+.json-search-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.export-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.export-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
 }
 
 .result-info {
@@ -128,6 +165,37 @@
   position: sticky;
   top: 0;
   z-index: 1;
+  user-select: none;
+}
+
+.sortable-col {
+  cursor: pointer;
+}
+
+.sortable-col:hover {
+  color: var(--text-primary);
+  background: var(--hover-bg);
+}
+
+.sortable-col.sorted {
+  color: var(--accent-primary);
+}
+
+.sort-icon {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.copyable-cell {
+  cursor: pointer;
+}
+
+.copyable-cell:hover {
+  background: var(--hover-bg);
+}
+
+.copyable-cell.copied {
+  color: var(--accent-success);
 }
 
 .result-table td {
@@ -166,6 +234,78 @@
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* JSON Tree View */
+.json-tree-container {
+  padding: 8px;
+  overflow: auto;
+  height: 100%;
+}
+
+.json-tree {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.json-row {
+  white-space: nowrap;
+}
+
+.json-expandable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.json-expandable:hover {
+  background: var(--hover-bg);
+  border-radius: 2px;
+}
+
+.json-toggle {
+  display: inline-block;
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.json-key {
+  color: var(--accent-primary);
+}
+
+.json-string {
+  color: var(--accent-success);
+}
+
+.json-number {
+  color: var(--accent-warning);
+}
+
+.json-bool {
+  color: var(--accent-secondary);
+}
+
+.json-null {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.json-bracket {
+  color: var(--text-secondary);
+}
+
+.json-collapsed {
+  color: var(--text-muted);
+  font-style: italic;
+  margin: 0 4px;
+}
+
+.json-highlight {
+  background: var(--accent-warning);
+  color: var(--bg-primary);
+  border-radius: 2px;
+  padding: 0 1px;
 }
 
 .graph-container {

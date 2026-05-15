@@ -41,6 +41,18 @@ export interface SavedConnection {
   config: ConnectionConfig;
 }
 
+export interface HistoryEntry {
+  id: string;
+  query: string;
+  executedAt: number; // Date.now()
+  executionTime?: number; // ms
+  rowCount?: number;
+  favorite: boolean;
+}
+
+export const HISTORY_STORAGE_KEY = "byoridb-studio-query-history";
+export const FAVORITES_STORAGE_KEY = "byoridb-studio-favorites";
+
 export const DEFAULT_CONNECTION_CONFIG: ConnectionConfig = {
   host: "127.0.0.1",
   port: 19669,

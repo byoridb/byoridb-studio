@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import * as fc from "fast-check";
-import { isNgqlKeyword, NGQL_KEYWORDS, NGQL_DDL, NGQL_DML, NGQL_DQL } from "./ngql-language";
+import {
+  isNgqlKeyword,
+  NGQL_KEYWORDS,
+  NGQL_TYPES,
+  NGQL_DDL,
+  NGQL_DML,
+  NGQL_DQL,
+} from "./ngql-language";
 
 describe("isNgqlKeyword", () => {
   it("returns true for every keyword in NGQL_KEYWORDS (exact case)", () => {
@@ -71,5 +78,32 @@ describe("keyword sets", () => {
   it("NGQL_KEYWORDS has no duplicates", () => {
     const unique = new Set(NGQL_KEYWORDS);
     expect(unique.size).toBe(NGQL_KEYWORDS.length);
+  });
+});
+
+describe("completion candidates", () => {
+  it("NGQL_TYPES contains expected data types", () => {
+    expect(NGQL_TYPES).toContain("STRING");
+    expect(NGQL_TYPES).toContain("INT64");
+    expect(NGQL_TYPES).toContain("BOOL");
+    expect(NGQL_TYPES).toContain("DOUBLE");
+  });
+
+  it("NGQL_TYPES has no duplicates", () => {
+    const unique = new Set(NGQL_TYPES);
+    expect(unique.size).toBe(NGQL_TYPES.length);
+  });
+
+  it("PBT: all NGQL_TYPES are distinct from NGQL_KEYWORDS", () => {
+    // Types are separate completion candidates — no overlap with keywords
+    fc.assert(
+      fc.property(fc.constantFrom(...NGQL_TYPES), (type) => {
+        // Types like NULL/TRUE/FALSE may overlap; the rest should not
+        const overlapping = new Set(["NULL", "TRUE", "FALSE"]);
+        if (!overlapping.has(type)) {
+          expect(NGQL_KEYWORDS).not.toContain(type);
+        }
+      }),
+    );
   });
 });

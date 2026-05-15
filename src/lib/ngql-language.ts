@@ -259,4 +259,24 @@ export function registerNgqlLanguage(monaco: typeof Monaco): void {
   monaco.languages.register({ id: LANGUAGE_ID });
   monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, monarchTokens);
   monaco.editor.defineTheme("catppuccin-mocha", catppuccinMochaTheme);
+  monaco.languages.registerCompletionItemProvider(LANGUAGE_ID, {
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position);
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+
+      const keywordItems = [...NGQL_KEYWORDS, ...NGQL_TYPES].map((kw) => ({
+        label: kw,
+        kind: monaco.languages.CompletionItemKind.Keyword,
+        insertText: kw,
+        range,
+      }));
+
+      return { suggestions: keywordItems };
+    },
+  });
 }

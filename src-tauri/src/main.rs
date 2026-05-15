@@ -214,7 +214,6 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
             query_cancel: Arc::new(Mutex::new(None)),

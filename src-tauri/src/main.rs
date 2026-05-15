@@ -11,10 +11,13 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 struct AppState {
     client: Arc<Mutex<Option<ByoriDBClient>>>,
+    /// Replaced each time a query starts; cancelled when the user requests abort.
+    query_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 /// Structured error returned to the frontend from every Tauri command.
@@ -85,20 +88,38 @@ async fn execute_query(
 ) -> Result<QueryResult, TauriError> {
     info!("Executing query: {}", query);
 
+    // Create a fresh cancellation token for this query
+    let token = CancellationToken::new();
+    {
+        let mut cancel_guard = state.query_cancel.lock().await;
+        *cancel_guard = Some(token.clone());
+    }
+
     let mut guard = state.client.lock().await;
     let client = guard
         .as_mut()
         .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
-    let result = client.execute(&query).await;
+    // Race the query against the cancellation token
+    let result = tokio::select! {
+        r = client.execute(&query) => r,
+        _ = token.cancelled() => Err(ClientError::Query("Query cancelled by user".to_string())),
+    };
 
-    // If the server told us the session is gone, drop our local ByoriDBClient too
-    // so the UI connection state matches server state.
     if matches!(result, Err(ClientError::SessionExpired)) {
         *guard = None;
     }
 
     Ok(result?)
+}
+
+#[tauri::command]
+async fn cancel_query(state: State<'_, AppState>) -> Result<(), TauriError> {
+    let mut cancel_guard = state.query_cancel.lock().await;
+    if let Some(token) = cancel_guard.take() {
+        token.cancel();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -193,13 +214,16 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
+            query_cancel: Arc::new(Mutex::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
             connect,
             disconnect,
             execute_query,
+            cancel_query,
             get_spaces,
             get_schema,
             test_connection,

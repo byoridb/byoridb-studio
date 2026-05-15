@@ -28,6 +28,10 @@ function normalizeError(err: unknown): TauriError {
 
 /** How often to poll `GET /health` while connected. */
 const HEALTH_POLL_INTERVAL_MS = 30_000;
+/** Backoff: max retries before giving up and disconnecting. */
+const HEALTH_MAX_RETRIES = 3;
+/** Backoff base delay in ms (doubles each retry: 2s, 4s, 8s). */
+const HEALTH_BACKOFF_BASE_MS = 2_000;
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
@@ -84,30 +88,51 @@ function App() {
   };
 
   /**
-   * Poll `GET /health` (via the backend `test_connection` command) every
-   * 30s while connected. Surface a lost connection to the UI as soon as
-   * the check fails. The check itself is independent of any in-flight
-   * query, so a long query won't be interrupted.
+   * Poll `GET /health` every 30s while connected.
+   * On failure, retry up to HEALTH_MAX_RETRIES times with exponential backoff
+   * (2s, 4s, 8s) before giving up and disconnecting.
    */
   useEffect(() => {
     if (!isConnected || !connectionConfig) return undefined;
 
     let cancelled = false;
 
+    const attemptReconnect = async (host: string, port: number): Promise<boolean> => {
+      for (let i = 0; i < HEALTH_MAX_RETRIES; i++) {
+        if (cancelled) return false;
+        const delay = HEALTH_BACKOFF_BASE_MS * Math.pow(2, i);
+        await new Promise((r) => setTimeout(r, delay));
+        if (cancelled) return false;
+        try {
+          const ok = await invoke<boolean>("test_connection", { host, port });
+          if (ok) return true;
+        } catch {
+          // continue retrying
+        }
+      }
+      return false;
+    };
+
     const check = async () => {
+      if (cancelled) return;
       try {
         const ok = await invoke<boolean>("test_connection", {
           host: connectionConfig.host,
           port: connectionConfig.port,
         });
-        if (!ok && !cancelled) {
-          handleConnectionLost("health");
+        if (ok) {
+          return;
         }
-      } catch (error) {
-        if (!cancelled) {
-          console.error("Health check failed:", normalizeError(error));
-          handleConnectionLost("health");
-        }
+      } catch {
+        // fall through to retry logic
+      }
+
+      if (cancelled) return;
+
+      // Try to reconnect with backoff before giving up
+      const recovered = await attemptReconnect(connectionConfig.host, connectionConfig.port);
+      if (!cancelled && !recovered) {
+        handleConnectionLost("health");
       }
     };
 
@@ -148,6 +173,14 @@ function App() {
       console.error("Disconnect failed:", e);
     }
   };
+
+  const handleCancelQuery = useCallback(async () => {
+    try {
+      await invoke("cancel_query");
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const handleExecuteQuery = async (query: string) => {
     if (!isConnected) {
@@ -281,6 +314,7 @@ function App() {
         <div className="main-content">
           <QueryEditor
             onExecute={handleExecuteQuery}
+            onCancel={handleCancelQuery}
             isExecuting={isExecuting}
             isConnected={isConnected}
           />

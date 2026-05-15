@@ -122,6 +122,19 @@
   background: var(--hover-bg);
 }
 
+/* Cancel button */
+.btn-cancel {
+  background: transparent;
+  color: var(--accent-error);
+  border: 1px solid var(--accent-error);
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.btn-cancel:hover {
+  background: rgba(243, 139, 168, 0.15);
+}
+
 /* Execute selection button */
 .btn-execute-selection {
   background: transparent;

@@ -43,7 +43,12 @@ export function loadSavedConnections(): SavedConnection[] {
 }
 
 export function saveSavedConnections(connections: SavedConnection[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(connections));
+  // Strip passwords before persisting — passwords are never stored on disk.
+  const sanitized = connections.map((c) => ({
+    ...c,
+    config: { ...c.config, password: "" },
+  }));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
 }
 
 function ServerSettings({ onConnect }: ServerSettingsProps) {
@@ -285,7 +290,8 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
               type="password"
               value={formData.password}
               onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-              placeholder="Enter password"
+              placeholder="Enter password (not saved)"
+              autoComplete="current-password"
             />
           </div>
           <div className="form-actions">

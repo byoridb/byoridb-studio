@@ -8,6 +8,8 @@ export interface ConnectionConfig {
   port: number;
   username: string;
   password: string;
+  /** Transport protocol. Defaults to "http" (REST). "grpc" uses port 9669. */
+  protocol?: "http" | "grpc";
 }
 
 export interface QueryResult {

@@ -8,6 +8,7 @@ import "../styles/QueryEditor.css";
 
 interface QueryEditorProps {
   onExecute: (query: string) => void;
+  onCancel?: () => void;
   isExecuting: boolean;
   isConnected: boolean;
 }
@@ -28,7 +29,7 @@ function saveTabs(tabs: QueryTab[]) {
   localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
 }
 
-function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) {
+function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEditorProps) {
   const [tabs, setTabs] = useState<QueryTab[]>(loadTabs);
   const [activeTabId, setActiveTabId] = useState<string>(() => loadTabs()[0].id);
   const [history, setHistory] = useState<string[]>([]);
@@ -243,6 +244,16 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
           <button className="btn-clear" onClick={handleClear} data-testid="clear-button">
             Clear
           </button>
+          {isExecuting && onCancel && (
+            <button
+              className="btn-cancel"
+              onClick={onCancel}
+              data-testid="cancel-button"
+              aria-label="Cancel query"
+            >
+              ✕ Cancel
+            </button>
+          )}
           <button
             className="btn-execute-selection"
             onClick={() => {

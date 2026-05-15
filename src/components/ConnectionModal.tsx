@@ -100,6 +100,25 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
             </div>
 
             <div className="form-row">
+              <label>Protocol</label>
+              <select
+                value={config.protocol ?? "http"}
+                onChange={(e) => {
+                  const proto = e.target.value as "http" | "grpc";
+                  setConfig({
+                    ...config,
+                    protocol: proto,
+                    port: proto === "grpc" ? 9669 : 19669,
+                  });
+                }}
+                data-testid="protocol-select"
+              >
+                <option value="http">HTTP REST (:19669)</option>
+                <option value="grpc">gRPC (:9669)</option>
+              </select>
+            </div>
+
+            <div className="form-row">
               <label>Username</label>
               <input
                 type="text"
@@ -115,9 +134,13 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
                 type="password"
                 value={config.password}
                 onChange={(e) => setConfig({ ...config, password: e.target.value })}
-                placeholder="Enter password"
+                placeholder="Enter password (not saved)"
+                autoComplete="current-password"
               />
             </div>
+            <p className="settings-hint" style={{ fontSize: "11px", marginTop: 4 }}>
+              🔒 Passwords are never saved to disk.
+            </p>
           </div>
 
           <p className="settings-hint">Manage saved connections in the Settings tab.</p>

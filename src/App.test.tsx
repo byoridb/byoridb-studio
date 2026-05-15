@@ -326,10 +326,11 @@ describe("App", () => {
       await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
       await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-      // Next health tick returns false → App should flip to disconnected.
+      // Next health tick returns false → App retries with backoff then disconnects.
       healthOk = false;
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(30_000);
+        // 30s poll + 3 retries (2s + 4s + 8s = 14s) = 44s total
+        await vi.advanceTimersByTimeAsync(50_000);
       });
 
       await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());

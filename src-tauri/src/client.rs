@@ -109,6 +109,14 @@ pub struct ConnectionConfig {
     pub port: u32,
     pub username: String,
     pub password: String,
+    /// Transport protocol: "http" (default) or "grpc".
+    /// gRPC support requires the `grpc` feature and a running ByoriDB gRPC server.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+}
+
+fn default_protocol() -> String {
+    "http".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,7 +173,21 @@ pub struct ByoriDBClient {
 impl ByoriDBClient {
     /// Connect to ByoriDB server
     pub async fn connect(config: ConnectionConfig) -> Result<Self, ClientError> {
-        info!("Connecting to ByoriDB at {}:{}", config.host, config.port);
+        info!(
+            "Connecting to ByoriDB at {}:{} ({})",
+            config.host, config.port, config.protocol
+        );
+
+        // gRPC support is planned but requires proto definitions from the ByoriDB repo.
+        // Enable with `cargo build --features grpc` once proto files are available.
+        if config.protocol == "grpc" {
+            return Err(ClientError::Transport(
+                "gRPC transport is not yet implemented. \
+                 Please use HTTP REST (port 19669) or build with --features grpc \
+                 after adding ByoriDB proto definitions."
+                    .to_string(),
+            ));
+        }
 
         let mut client = Self {
             config: config.clone(),
@@ -569,6 +591,7 @@ mod tests {
                 port: 19669,
                 username: "root".to_string(),
                 password: "test-password".to_string(),
+                protocol: "http".to_string(),
             },
             session_id: None,
         };
@@ -587,6 +610,7 @@ mod tests {
                 port: 19669,
                 username: "root".to_string(),
                 password: "test-password".to_string(),
+                protocol: "http".to_string(),
             },
             session_id: None,
         };

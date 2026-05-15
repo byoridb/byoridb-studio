@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { QueryResult } from "../types";
 import TableView from "./TableView";
 import JsonTreeView from "./JsonTreeView";
+import GraphView from "./GraphView";
 import "../styles/ResultPanel.css";
 
 interface ResultPanelProps {
@@ -139,14 +140,7 @@ function ResultPanel({ result }: ResultPanelProps) {
             <JsonTreeView data={result.rows} search={jsonSearch} />
           </div>
         )}
-        {viewMode === "graph" && (
-          <div className="graph-container">
-            <div className="graph-placeholder">
-              <span className="placeholder-icon">🔜</span>
-              <span className="placeholder-text">Graph visualization coming soon...</span>
-            </div>
-          </div>
-        )}
+        {viewMode === "graph" && <GraphView result={result} />}
       </div>
     </div>
   );

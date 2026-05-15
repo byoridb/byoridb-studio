@@ -4,9 +4,13 @@ import Sidebar from "./components/Sidebar";
 import QueryEditor from "./components/QueryEditor";
 import ResultPanel from "./components/ResultPanel";
 import ConnectionModal from "./components/ConnectionModal";
+import { loadThemeSettings } from "./components/ServerSettings";
 import type { ConnectionConfig, QueryResult, TauriError, HistoryEntry } from "./types";
 import { HISTORY_STORAGE_KEY } from "./types";
 import "./styles/App.css";
+
+// Apply saved theme/font on startup
+loadThemeSettings();
 
 /**
  * Normalize anything thrown from an `invoke` call into `{code, message}`.
@@ -234,15 +238,23 @@ function App() {
                 {connectionConfig?.host}:{connectionConfig?.port}
               </span>
               {currentSpace && <span className="current-space">/ {currentSpace}</span>}
-              <button className="btn-disconnect" onClick={handleDisconnect}>
+              <button
+                className="btn-disconnect"
+                onClick={handleDisconnect}
+                aria-label="Disconnect from server"
+              >
                 Disconnect
               </button>
             </>
           ) : (
             <>
-              <span className="status-indicator disconnected" />
+              <span className="status-indicator disconnected" aria-hidden="true" />
               <span>Not connected</span>
-              <button className="btn-connect" onClick={() => setShowConnectionModal(true)}>
+              <button
+                className="btn-connect"
+                onClick={() => setShowConnectionModal(true)}
+                aria-label="Open connection dialog"
+              >
                 Connect
               </button>
             </>
@@ -260,6 +272,10 @@ function App() {
           historyEntries={historyEntries}
           onToggleFavorite={toggleFavorite}
           onClearHistory={clearHistory}
+          connectionHost={connectionConfig?.host}
+          connectionPort={connectionConfig?.port}
+          lastQueryTime={queryResult?.executionTime}
+          lastRowCount={queryResult?.rowCount ?? queryResult?.rows.length}
         />
 
         <div className="main-content">

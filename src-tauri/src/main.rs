@@ -141,6 +141,48 @@ async fn test_connection(host: String, port: u32) -> Result<bool, TauriError> {
         .map_err(Into::into)
 }
 
+/// Execute a DDL/DML statement that returns no rows (CREATE, DROP, ALTER, etc.)
+#[tauri::command]
+async fn execute_statement(
+    statement: String,
+    state: State<'_, AppState>,
+) -> Result<(), TauriError> {
+    info!("Executing statement: {}", statement);
+    let mut guard = state.client.lock().await;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
+    let result = client.execute(&statement).await;
+    if matches!(result, Err(ClientError::SessionExpired)) {
+        *guard = None;
+    }
+    result?;
+    Ok(())
+}
+
+/// Get index list for a tag or edge: SHOW TAG/EDGE INDEXES
+#[tauri::command]
+async fn get_indexes(
+    kind: String, // "tag" or "edge"
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<QueryResult, TauriError> {
+    let query = if kind == "tag" {
+        format!("SHOW TAG INDEXES ON {}", name)
+    } else {
+        format!("SHOW EDGE INDEXES ON {}", name)
+    };
+    let mut guard = state.client.lock().await;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
+    let result = client.execute(&query).await;
+    if matches!(result, Err(ClientError::SessionExpired)) {
+        *guard = None;
+    }
+    Ok(result?)
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -161,6 +203,8 @@ fn main() {
             get_spaces,
             get_schema,
             test_connection,
+            execute_statement,
+            get_indexes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

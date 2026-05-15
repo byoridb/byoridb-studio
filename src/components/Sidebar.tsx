@@ -2,10 +2,13 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ServerSettings from "./ServerSettings";
 import HistoryPanel from "./HistoryPanel";
+import SchemaManager from "./SchemaManager";
+import DataManager from "./DataManager";
+import MonitorPanel from "./MonitorPanel";
 import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
 import "../styles/Sidebar.css";
 
-type TabType = "schema" | "history" | "settings";
+type TabType = "schema" | "manage" | "data" | "monitor" | "history" | "settings";
 
 interface SidebarProps {
   isConnected: boolean;
@@ -16,6 +19,10 @@ interface SidebarProps {
   historyEntries: HistoryEntry[];
   onToggleFavorite: (id: string) => void;
   onClearHistory: () => void;
+  connectionHost?: string;
+  connectionPort?: number;
+  lastQueryTime?: number;
+  lastRowCount?: number;
 }
 
 /**
@@ -47,6 +54,10 @@ function Sidebar({
   historyEntries,
   onToggleFavorite,
   onClearHistory,
+  connectionHost = "",
+  connectionPort = 19669,
+  lastQueryTime,
+  lastRowCount,
 }: SidebarProps) {
   const [activeTab, setActiveTab] = useState<TabType>("schema");
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
@@ -331,6 +342,24 @@ function Sidebar({
           Schema
         </button>
         <button
+          className={`sidebar-tab ${activeTab === "manage" ? "active" : ""}`}
+          onClick={() => setActiveTab("manage")}
+        >
+          Manage
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "data" ? "active" : ""}`}
+          onClick={() => setActiveTab("data")}
+        >
+          Data
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "monitor" ? "active" : ""}`}
+          onClick={() => setActiveTab("monitor")}
+        >
+          Monitor
+        </button>
+        <button
           className={`sidebar-tab ${activeTab === "history" ? "active" : ""}`}
           onClick={() => setActiveTab("history")}
         >
@@ -346,6 +375,33 @@ function Sidebar({
 
       <div className="sidebar-content">
         {activeTab === "schema" && renderSchemaContent()}
+        {activeTab === "manage" && (
+          <SchemaManager
+            spaces={spaces}
+            currentSpace={currentSpace}
+            onRefresh={() => {
+              loadSpaces();
+              if (currentSpace) loadSchema();
+            }}
+            onSelectSpace={onSelectSpace}
+          />
+        )}
+        {activeTab === "data" && (
+          <DataManager
+            currentSpace={currentSpace}
+            schema={schema}
+            onExecuteQuery={onExecuteQuery}
+          />
+        )}
+        {activeTab === "monitor" && (
+          <MonitorPanel
+            isConnected={isConnected}
+            connectionHost={connectionHost}
+            connectionPort={connectionPort}
+            lastQueryTime={lastQueryTime}
+            lastRowCount={lastRowCount}
+          />
+        )}
         {activeTab === "history" && (
           <HistoryPanel
             entries={historyEntries}

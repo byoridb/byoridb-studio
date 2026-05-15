@@ -129,7 +129,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
     expect(invokeMock).toHaveBeenCalledWith("execute_query", { query: "SHOW SPACES" });
 
-    await user.click(screen.getByRole("button", { name: "Disconnect" }));
+    await user.click(screen.getByRole("button", { name: /Disconnect/ }));
     await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
   });
 

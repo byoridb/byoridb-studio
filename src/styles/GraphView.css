@@ -1,0 +1,152 @@
+.graph-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.graph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.graph-stats {
+  font-size: 12px;
+  color: var(--text-muted);
+  flex: 1;
+}
+
+.graph-fit-btn,
+.graph-reset-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.graph-fit-btn:hover,
+.graph-reset-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.graph-body {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.graph-canvas {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+}
+
+.graph-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.graph-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* Node detail panel */
+.graph-detail {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 220px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+  overflow: hidden;
+}
+
+.graph-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.graph-detail-id {
+  font-family: "SF Mono", monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-detail-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-radius: 10px;
+}
+
+.graph-detail-close {
+  padding: 0 4px;
+  font-size: 14px;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  line-height: 1;
+}
+
+.graph-detail-close:hover {
+  color: var(--accent-error);
+}
+
+.graph-detail-props {
+  padding: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.graph-detail-row {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.graph-detail-row:last-child {
+  border-bottom: none;
+}
+
+.graph-detail-key {
+  color: var(--accent-primary);
+  min-width: 60px;
+  flex-shrink: 0;
+}
+
+.graph-detail-val {
+  color: var(--text-primary);
+  font-family: "SF Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

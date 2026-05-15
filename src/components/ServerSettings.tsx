@@ -6,6 +6,27 @@ import "../styles/ServerSettings.css";
 
 export type { ConnectionConfig, SavedConnection };
 
+const THEME_KEY = "byoridb-studio-theme";
+const FONT_SIZE_KEY = "byoridb-studio-font-size";
+
+export function applyTheme(theme: "dark" | "light") {
+  document.documentElement.setAttribute("data-theme", theme === "light" ? "light" : "");
+  localStorage.setItem(THEME_KEY, theme);
+}
+
+export function applyFontSize(size: number) {
+  document.documentElement.style.setProperty("--font-size-base", `${size}px`);
+  localStorage.setItem(FONT_SIZE_KEY, String(size));
+}
+
+export function loadThemeSettings() {
+  const theme = (localStorage.getItem(THEME_KEY) ?? "dark") as "dark" | "light";
+  const fontSize = parseInt(localStorage.getItem(FONT_SIZE_KEY) ?? "14", 10);
+  applyTheme(theme);
+  applyFontSize(fontSize);
+  return { theme, fontSize };
+}
+
 interface ServerSettingsProps {
   onConnect: (config: ConnectionConfig) => void;
 }
@@ -30,6 +51,22 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
   const [isAdding, setIsAdding] = useState(false);
   const [testingHost, setTestingHost] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ host: string; success: boolean } | null>(null);
+  const [theme, setTheme] = useState<"dark" | "light">(
+    () => (localStorage.getItem(THEME_KEY) ?? "dark") as "dark" | "light",
+  );
+  const [fontSize, setFontSize] = useState<number>(() =>
+    parseInt(localStorage.getItem(FONT_SIZE_KEY) ?? "14", 10),
+  );
+
+  const handleThemeChange = (t: "dark" | "light") => {
+    setTheme(t);
+    applyTheme(t);
+  };
+
+  const handleFontSizeChange = (s: number) => {
+    setFontSize(s);
+    applyFontSize(s);
+  };
 
   const [formData, setFormData] = useState<{ name: string } & ConnectionConfig>({
     name: "",
@@ -120,6 +157,52 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
   return (
     <div className="server-settings">
+      {/* Appearance settings */}
+      <div className="settings-appearance">
+        <h3>Appearance</h3>
+        <div className="appearance-row">
+          <span className="appearance-label">Theme</span>
+          <div className="theme-toggle">
+            <button
+              className={`theme-btn ${theme === "dark" ? "active" : ""}`}
+              onClick={() => handleThemeChange("dark")}
+              aria-pressed={theme === "dark"}
+              data-testid="theme-dark"
+            >
+              🌙 Dark
+            </button>
+            <button
+              className={`theme-btn ${theme === "light" ? "active" : ""}`}
+              onClick={() => handleThemeChange("light")}
+              aria-pressed={theme === "light"}
+              data-testid="theme-light"
+            >
+              ☀️ Light
+            </button>
+          </div>
+        </div>
+        <div className="appearance-row">
+          <span className="appearance-label">Font size</span>
+          <div className="font-size-controls">
+            <button
+              onClick={() => handleFontSizeChange(Math.max(10, fontSize - 1))}
+              aria-label="Decrease font size"
+            >
+              A-
+            </button>
+            <span className="font-size-value" data-testid="font-size-value">
+              {fontSize}px
+            </span>
+            <button
+              onClick={() => handleFontSizeChange(Math.min(20, fontSize + 1))}
+              aria-label="Increase font size"
+            >
+              A+
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div className="settings-header">
         <h3>Server Connections</h3>
         {!isAdding && (

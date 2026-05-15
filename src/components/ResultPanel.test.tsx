@@ -10,6 +10,15 @@ Object.defineProperty(navigator, "clipboard", {
 });
 
 // Mock TableView to avoid virtualizer jsdom issues
+vi.mock("./GraphView", () => ({
+  default: ({ result }: { result: { rows: unknown[] } }) =>
+    result.rows.length === 0 ? (
+      <div>No graph data detected.</div>
+    ) : (
+      <div data-testid="graph-canvas" />
+    ),
+}));
+
 vi.mock("./TableView", () => ({
   default: ({ result }: { result: { columns: string[]; rows: Record<string, unknown>[] } }) => (
     <div data-testid="table-view">
@@ -147,10 +156,11 @@ describe("ResultPanel", () => {
     expect(screen.getByTestId("export-json")).toBeInTheDocument();
   });
 
-  it("switches to graph placeholder view", async () => {
+  it("switches to graph view", async () => {
     const user = userEvent.setup();
     render(<ResultPanel result={{ columns: [], rows: [], executionTime: 1 }} />);
     await user.click(screen.getByRole("button", { name: "Graph" }));
-    expect(screen.getByText("Graph visualization coming soon...")).toBeInTheDocument();
+    // GraphView renders empty state for no graph data
+    expect(screen.getByText("No graph data detected.")).toBeInTheDocument();
   });
 });

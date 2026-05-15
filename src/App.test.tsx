@@ -63,6 +63,29 @@ vi.mock("@monaco-editor/react", async () => {
   return { default: MockEditor };
 });
 
+vi.mock("./components/Sidebar", () => ({
+  default: ({
+    isConnected,
+    onSelectSpace,
+    onExecuteQuery,
+  }: {
+    isConnected: boolean;
+    onSelectSpace: (s: string) => void;
+    onExecuteQuery: (q: string) => void;
+    [key: string]: unknown;
+  }) => (
+    <div data-testid="sidebar">
+      {isConnected && (
+        <>
+          <div onClick={() => onSelectSpace("demo")}>demo</div>
+          <div onClick={() => onSelectSpace("restricted")}>restricted</div>
+          <button onClick={() => onExecuteQuery("SHOW SPACES")}>Show Spaces</button>
+        </>
+      )}
+    </div>
+  ),
+}));
+
 vi.mock("./lib/ngql-language", () => ({ registerNgqlLanguage: vi.fn(), LANGUAGE_ID: "ngql" }));
 
 vi.mock("./components/TableView", () => ({
@@ -81,6 +104,11 @@ describe("App", () => {
   beforeEach(() => {
     localStorage.clear();
     invokeMock.mockReset();
+    // Default: test_connection always succeeds (prevents backoff from interfering)
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "test_connection") return Promise.resolve(true);
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
     vi.spyOn(window, "alert").mockImplementation(() => undefined);
   });
 
@@ -105,6 +133,7 @@ describe("App", () => {
           executionTime: 4,
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -133,7 +162,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
   });
 
-  it("shows an alert when connecting fails", async () => {
+  it("shows a toast when connecting fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockRejectedValueOnce("offline");
 
@@ -142,8 +171,9 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
 
     await waitFor(() => {
-      expect(window.alert).toHaveBeenCalledWith("Connection failed: offline");
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("toast-error").textContent).toContain("Connection failed");
   });
 
   it("hints at BYORIDB_ROOT_PASSWORD when the server reports AUTH_FAILED", async () => {
@@ -158,11 +188,11 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
 
     await waitFor(() => {
-      const alertCall = (window.alert as unknown as ReturnType<typeof vi.fn>).mock
-        .calls[0][0] as string;
-      expect(alertCall).toContain("Authentication failed: Invalid password");
-      expect(alertCall).toContain("BYORIDB_ROOT_PASSWORD");
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    const toastText = screen.getByTestId("toast-error").textContent ?? "";
+    expect(toastText).toContain("Authentication failed: Invalid password");
+    expect(toastText).toContain("BYORIDB_ROOT_PASSWORD");
   });
 
   it("renders query execution failures as result errors", async () => {
@@ -178,6 +208,7 @@ describe("App", () => {
       if (command === "execute_query") {
         return Promise.reject("bad query");
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -209,6 +240,7 @@ describe("App", () => {
           message: "Session expired; please reconnect",
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -244,6 +276,7 @@ describe("App", () => {
     const executeCalls: string[] = [];
     invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "connect") return Promise.resolve();
+      if (command === "test_connection") return Promise.resolve(true);
       if (command === "get_spaces") {
         return Promise.resolve([{ name: "demo", partitionNum: 10, replicaFactor: 1 }]);
       }
@@ -259,13 +292,14 @@ describe("App", () => {
           rowCount: 0,
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
     render(<App />);
 
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
-    await waitFor(() => expect(screen.getByText("demo")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("demo")).toBeInTheDocument(), { timeout: 3000 });
 
     await user.click(screen.getByText("demo"));
 
@@ -280,6 +314,7 @@ describe("App", () => {
 
     invokeMock.mockImplementation((command: string) => {
       if (command === "connect") return Promise.resolve();
+      if (command === "test_connection") return Promise.resolve(true);
       if (command === "get_spaces") {
         return Promise.resolve([{ name: "restricted", partitionNum: 10, replicaFactor: 1 }]);
       }
@@ -289,21 +324,23 @@ describe("App", () => {
       if (command === "execute_query") {
         return Promise.reject({ code: "QUERY_ERROR", message: "Permission denied" });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
     render(<App />);
 
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
-    await waitFor(() => expect(screen.getByText("restricted")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("restricted")).toBeInTheDocument(), {
+      timeout: 3000,
+    });
 
     await user.click(screen.getByText("restricted"));
 
     await waitFor(() => {
-      expect(window.alert).toHaveBeenCalledWith(
-        'Failed to switch to space "restricted": Permission denied',
-      );
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("toast-error").textContent).toContain("Permission denied");
     expect(screen.queryByText("/ restricted")).not.toBeInTheDocument();
   });
 

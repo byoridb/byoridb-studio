@@ -161,3 +161,55 @@
   color: var(--accent-secondary);
   margin: 6px 0;
 }
+
+/* Property editor */
+.prop-editor {
+  margin-bottom: 8px;
+}
+
+.prop-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.prop-row input {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.prop-eq {
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.prop-remove {
+  padding: 2px 6px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  border-radius: 2px;
+}
+
+.prop-remove:hover {
+  color: var(--accent-error);
+}
+
+.prop-add {
+  padding: 4px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-color);
+  border-radius: 4px;
+  width: 100%;
+}
+
+.prop-add:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}

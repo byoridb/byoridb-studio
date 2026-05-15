@@ -5,6 +5,7 @@ import QueryEditor from "./components/QueryEditor";
 import ResultPanel from "./components/ResultPanel";
 import ConnectionModal from "./components/ConnectionModal";
 import { loadThemeSettings } from "./components/ServerSettings";
+import { useToast, ToastContainer } from "./hooks/useToast";
 import type { ConnectionConfig, QueryResult, TauriError, HistoryEntry } from "./types";
 import { HISTORY_STORAGE_KEY } from "./types";
 import "./styles/App.css";
@@ -37,6 +38,7 @@ function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [showConnectionModal, setShowConnectionModal] = useState(true);
   const [connectionConfig, setConnectionConfig] = useState<ConnectionConfig | null>(null);
+  const { toasts, addToast, removeToast } = useToast();
   const [currentSpace, setCurrentSpace] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
@@ -156,7 +158,7 @@ function App() {
         e.code === "AUTH_FAILED"
           ? "\n\nHint: the ByoriDB server reads the root password from the BYORIDB_ROOT_PASSWORD env var. If unset, the server generates a random one at startup and logs it."
           : "";
-      alert(`Connection failed: ${e.message}${hint}`);
+      addToast(`Connection failed: ${e.message}${hint}`, "error");
     }
   };
 
@@ -184,7 +186,7 @@ function App() {
 
   const handleExecuteQuery = async (query: string) => {
     if (!isConnected) {
-      alert("Not connected to server");
+      addToast("Not connected to server", "error");
       return;
     }
 
@@ -245,12 +247,13 @@ function App() {
         handleConnectionLost("session");
         return;
       }
-      alert(`Failed to switch to space "${spaceName}": ${e.message}`);
+      addToast(`Failed to switch to space "${spaceName}": ${e.message}`, "error");
     }
   };
 
   return (
     <div className="app">
+      <ToastContainer toasts={toasts} onRemove={removeToast} />
       {showConnectionModal && (
         <ConnectionModal
           onConnect={handleConnect}

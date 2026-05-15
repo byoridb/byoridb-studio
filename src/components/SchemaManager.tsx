@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SpaceInfo, SchemaInfo } from "../types";
 import ErdDiagram from "./ErdDiagram";
+import { ConfirmDialog } from "../hooks/useToast";
 import "../styles/SchemaManager.css";
 
 interface SchemaManagerProps {
@@ -83,6 +84,7 @@ function SchemaManager({
   const [tab, setTab] = useState<"spaces" | "tags" | "edges" | "indexes" | "erd">("spaces");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [confirmMsg, setConfirmMsg] = useState<{ msg: string; action: () => void } | null>(null);
   const [newSpaceName, setNewSpaceName] = useState("");
   const [vidType, setVidType] = useState("INT64");
   const [newName, setNewName] = useState("");
@@ -114,8 +116,13 @@ function SchemaManager({
   };
 
   const dropSpace = (name: string) => {
-    if (!confirm(`Drop space "${name}"? This cannot be undone.`)) return;
-    run(`DROP SPACE ${name}`);
+    setConfirmMsg({
+      msg: `Drop space "${name}"? This cannot be undone.`,
+      action: () => {
+        run(`DROP SPACE ${name}`);
+        setConfirmMsg(null);
+      },
+    });
   };
 
   const createTagEdge = (kind: "TAG" | "EDGE") => {
@@ -136,6 +143,13 @@ function SchemaManager({
 
   return (
     <div className="schema-manager">
+      {confirmMsg && (
+        <ConfirmDialog
+          message={confirmMsg.msg}
+          onConfirm={confirmMsg.action}
+          onCancel={() => setConfirmMsg(null)}
+        />
+      )}
       <div className="sm-tabs">
         {(["spaces", "tags", "edges", "indexes", "erd"] as const).map((t) => (
           <button

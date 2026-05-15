@@ -136,10 +136,10 @@ describe("Sidebar", () => {
     );
 
     await waitFor(() => {
-      expect(console.error).toHaveBeenCalledWith("Failed to load spaces:", expect.any(Error));
+      expect(screen.getAllByText(/⚠/).length).toBeGreaterThan(0);
     });
-    expect(screen.getByText("No spaces found")).toBeInTheDocument();
-    expect(screen.getByText("No tags found")).toBeInTheDocument();
+    // Error message is shown instead of empty state
+    expect(screen.queryByText("No spaces found")).not.toBeInTheDocument();
     expect(screen.getByText("No edges found")).toBeInTheDocument();
   });
 

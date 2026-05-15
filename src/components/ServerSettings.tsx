@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionConfig, SavedConnection } from "../types";
 import { DEFAULT_CONNECTION_CONFIG } from "../types";
 import { setLocale, getLocale } from "../lib/i18n";
+import { useToast, ToastContainer, ConfirmDialog } from "../hooks/useToast";
 import "../styles/ServerSettings.css";
 
 export type { ConnectionConfig, SavedConnection };
@@ -64,6 +65,8 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
     parseInt(localStorage.getItem(FONT_SIZE_KEY) ?? "14", 10),
   );
   const [locale, setLocaleState] = useState<"en" | "ko">(() => getLocale());
+  const { toasts, addToast, removeToast } = useToast();
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   const handleLocaleChange = (l: "en" | "ko") => {
     setLocaleState(l);
@@ -109,7 +112,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
   const handleSave = () => {
     if (!formData.name.trim()) {
-      alert("Please enter a connection name");
+      addToast("Please enter a connection name", "error");
       return;
     }
 
@@ -127,9 +130,8 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
     if (editingConnection) {
       updated = connections.map((c) => (c.name === editingConnection.name ? newConnection : c));
     } else {
-      // Check for duplicate name
       if (connections.some((c) => c.name === formData.name)) {
-        alert("A connection with this name already exists");
+        addToast("A connection with this name already exists", "error");
         return;
       }
       updated = [...connections, newConnection];
@@ -141,11 +143,14 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
   };
 
   const handleDelete = (name: string) => {
-    if (confirm(`Delete connection "${name}"?`)) {
-      const updated = connections.filter((c) => c.name !== name);
-      setConnections(updated);
-      saveSavedConnections(updated);
-    }
+    setConfirmDelete(name);
+  };
+
+  const doDelete = (name: string) => {
+    const updated = connections.filter((c) => c.name !== name);
+    setConnections(updated);
+    saveSavedConnections(updated);
+    setConfirmDelete(null);
   };
 
   const handleEdit = (connection: SavedConnection) => {
@@ -169,6 +174,14 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
   return (
     <div className="server-settings">
+      <ToastContainer toasts={toasts} onRemove={removeToast} />
+      {confirmDelete && (
+        <ConfirmDialog
+          message={`Delete connection "${confirmDelete}"?`}
+          onConfirm={() => doDelete(confirmDelete)}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
       {/* Appearance settings */}
       <div className="settings-appearance">
         <h3>Appearance</h3>

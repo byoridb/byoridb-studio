@@ -9,6 +9,77 @@ interface DataManagerProps {
   onExecuteQuery: (q: string) => void;
 }
 
+interface PropPair {
+  col: string;
+  val: string;
+}
+
+function PropEditor({ pairs, onChange }: { pairs: PropPair[]; onChange: (p: PropPair[]) => void }) {
+  const add = () => onChange([...pairs, { col: "", val: "" }]);
+  const remove = (i: number) => onChange(pairs.filter((_, idx) => idx !== i));
+  const update = (i: number, patch: Partial<PropPair>) =>
+    onChange(pairs.map((p, idx) => (idx === i ? { ...p, ...patch } : p)));
+
+  return (
+    <div className="prop-editor">
+      {pairs.map((p, i) => (
+        <div key={i} className="prop-row">
+          <input
+            placeholder="column"
+            value={p.col}
+            onChange={(e) => update(i, { col: e.target.value })}
+            data-testid={`prop-col-${i}`}
+          />
+          <span className="prop-eq">=</span>
+          <input
+            placeholder="value"
+            value={p.val}
+            onChange={(e) => update(i, { val: e.target.value })}
+            data-testid={`prop-val-${i}`}
+          />
+          <button className="prop-remove" onClick={() => remove(i)}>
+            ×
+          </button>
+        </div>
+      ))}
+      <button className="prop-add" onClick={add}>
+        + Add property
+      </button>
+    </div>
+  );
+}
+
+function buildInsertVertex(tag: string, vid: string, pairs: PropPair[]): string {
+  const valid = pairs.filter((p) => p.col.trim());
+  if (valid.length === 0) return `INSERT VERTEX ${tag} () VALUES ${vid}:()`;
+  const cols = valid.map((p) => p.col.trim()).join(", ");
+  const vals = valid
+    .map((p) => {
+      const v = p.val.trim();
+      // Wrap in quotes if not already quoted and not a number/bool
+      if (/^-?\d+(\.\d+)?$/.test(v) || v === "true" || v === "false" || v === "NULL") return v;
+      if (v.startsWith("'") || v.startsWith('"')) return v;
+      return `'${v.replace(/'/g, "\\'")}'`;
+    })
+    .join(", ");
+  return `INSERT VERTEX ${tag} (${cols}) VALUES ${vid}:(${vals})`;
+}
+
+function buildInsertEdge(type: string, src: string, dst: string, pairs: PropPair[]): string {
+  const valid = pairs.filter((p) => p.col.trim());
+  if (valid.length === 0) return `INSERT EDGE ${type} () VALUES ${src} -> ${dst}:()`;
+  const cols = valid.map((p) => p.col.trim()).join(", ");
+  const vals = valid
+    .map((p) => {
+      const v = p.val.trim();
+      if (/^-?\d+(\.\d+)?$/.test(v) || v === "true" || v === "false" || v === "NULL") return v;
+      if (v.startsWith("'") || v.startsWith('"')) return v;
+      return `'${v.replace(/'/g, "\\'")}'`;
+    })
+    .join(", ");
+  return `INSERT EDGE ${type} (${cols}) VALUES ${src} -> ${dst}:(${vals})`;
+}
+
 function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps) {
   const [tab, setTab] = useState<"vertex" | "edge" | "import">("vertex");
   const [error, setError] = useState("");
@@ -17,13 +88,13 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
   // Vertex form
   const [vid, setVid] = useState("");
   const [vTag, setVTag] = useState("");
-  const [vProps, setVProps] = useState("");
+  const [vPairs, setVPairs] = useState<PropPair[]>([]);
 
   // Edge form
   const [eSrc, setESrc] = useState("");
   const [eDst, setEDst] = useState("");
   const [eType, setEType] = useState("");
-  const [eProps, setEProps] = useState("");
+  const [ePairs, setEPairs] = useState<PropPair[]>([]);
 
   // CSV import
   const [csvKind, setCsvKind] = useState<"vertex" | "edge">("vertex");
@@ -37,7 +108,7 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
     setSuccess("");
     try {
       await invoke("execute_statement", { statement: stmt });
-      setSuccess("✓ Done");
+      setSuccess(`✓ Done`);
     } catch (e: unknown) {
       const msg =
         e && typeof e === "object" && "message" in e
@@ -49,17 +120,7 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
 
   const insertVertex = () => {
     if (!vid.trim() || !vTag.trim()) return;
-    const propStr = vProps.trim() ? `(${vProps})` : "()";
-    run(
-      `INSERT VERTEX ${vTag} ${propStr} VALUES ${vid}:(${
-        vProps.trim()
-          ? vProps
-              .split(",")
-              .map(() => "''")
-              .join(",")
-          : ""
-      })`,
-    );
+    run(buildInsertVertex(vTag, vid, vPairs));
   };
 
   const deleteVertex = () => {
@@ -69,17 +130,7 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
 
   const insertEdge = () => {
     if (!eSrc.trim() || !eDst.trim() || !eType.trim()) return;
-    const propStr = eProps.trim() ? `(${eProps})` : "()";
-    run(
-      `INSERT EDGE ${eType} ${propStr} VALUES ${eSrc} -> ${eDst}:(${
-        eProps.trim()
-          ? eProps
-              .split(",")
-              .map(() => "''")
-              .join(",")
-          : ""
-      })`,
-    );
+    run(buildInsertEdge(eType, eSrc, eDst, ePairs));
   };
 
   const deleteEdge = () => {
@@ -117,16 +168,14 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
 
     for (let i = 0; i < dataRows.length; i++) {
       const row = dataRows[i];
-      const vals = row.map((v) => `'${v.replace(/'/g, "\\'")}'`).join(", ");
-      const cols = header.join(", ");
+      const pairs: PropPair[] = header.map((col, j) => ({ col, val: row[j] ?? "" }));
       let stmt: string;
       if (csvKind === "vertex") {
         const id = row[0];
-        stmt = `INSERT VERTEX ${csvTag} (${cols}) VALUES ${id}:(${vals})`;
+        stmt = buildInsertVertex(csvTag, id, pairs.slice(1));
       } else {
-        const [src, dst, ...rest] = row;
-        const restVals = rest.map((v) => `'${v.replace(/'/g, "\\'")}'`).join(", ");
-        stmt = `INSERT EDGE ${csvTag} (${header.slice(2).join(", ")}) VALUES ${src} -> ${dst}:(${restVals})`;
+        const [src, dst] = row;
+        stmt = buildInsertEdge(csvTag, src, dst, pairs.slice(2));
       }
       try {
         await invoke("execute_statement", { statement: stmt });
@@ -186,13 +235,10 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
                 <option key={t}>{t}</option>
               ))}
             </select>
-            <label>Props (comma-separated values)</label>
-            <input
-              value={vProps}
-              onChange={(e) => setVProps(e.target.value)}
-              placeholder="'Alice', 30"
-            />
+            <label>Properties</label>
+            <div />
           </div>
+          <PropEditor pairs={vPairs} onChange={setVPairs} />
           <div className="dm-actions">
             <button
               className="dm-btn-primary"
@@ -233,9 +279,10 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
             <input value={eSrc} onChange={(e) => setESrc(e.target.value)} placeholder="1" />
             <label>Dst VID</label>
             <input value={eDst} onChange={(e) => setEDst(e.target.value)} placeholder="2" />
-            <label>Props (comma-separated values)</label>
-            <input value={eProps} onChange={(e) => setEProps(e.target.value)} placeholder="2020" />
+            <label>Properties</label>
+            <div />
           </div>
+          <PropEditor pairs={ePairs} onChange={setEPairs} />
           <div className="dm-actions">
             <button className="dm-btn-primary" onClick={insertEdge} data-testid="insert-edge-btn">
               Insert
@@ -266,7 +313,7 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
               placeholder="person"
               data-testid="csv-tag-input"
             />
-            <label>CSV file (first column = VID for vertex, src/dst for edge)</label>
+            <label>CSV file</label>
             <input
               type="file"
               accept=".csv"
@@ -275,6 +322,11 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
               data-testid="csv-file-input"
             />
           </div>
+          <p className="dm-hint">
+            Vertex CSV: first column = VID, remaining = property columns.
+            <br />
+            Edge CSV: first two columns = src VID, dst VID, remaining = properties.
+          </p>
           {csvPreview.length > 0 && (
             <div className="dm-preview">
               <p className="dm-hint">Preview (first 5 rows):</p>
@@ -305,4 +357,5 @@ function DataManager({ currentSpace, schema, onExecuteQuery }: DataManagerProps)
   );
 }
 
+export { buildInsertVertex, buildInsertEdge };
 export default DataManager;

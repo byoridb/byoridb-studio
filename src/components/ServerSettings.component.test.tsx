@@ -50,6 +50,9 @@ describe("ServerSettings", () => {
     expect(screen.getByText("renamed")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "×" }));
+    // ConfirmDialog appears — confirm the deletion
+    await waitFor(() => expect(screen.getByTestId("confirm-ok")).toBeInTheDocument());
+    await user.click(screen.getByTestId("confirm-ok"));
     expect(screen.getByText("No saved connections")).toBeInTheDocument();
   });
 
@@ -97,11 +100,17 @@ describe("ServerSettings", () => {
 
     await user.click(screen.getByRole("button", { name: "+ Add" }));
     await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(window.alert).toHaveBeenCalledWith("Please enter a connection name");
+    expect(await screen.findByTestId("toast-error")).toBeInTheDocument();
+    expect(screen.getByTestId("toast-error").textContent).toContain(
+      "Please enter a connection name",
+    );
 
     await user.type(screen.getByPlaceholderText("My Server"), "local");
     await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(window.alert).toHaveBeenCalledWith("A connection with this name already exists");
+    const toasts = await screen.findAllByTestId("toast-error");
+    expect(
+      toasts.some((t) => t.textContent?.includes("A connection with this name already exists")),
+    ).toBe(true);
   });
 
   it("tests a form connection and resets the form with cancel", async () => {

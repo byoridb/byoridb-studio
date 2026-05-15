@@ -6,6 +6,7 @@ import SchemaManager from "./SchemaManager";
 import DataManager from "./DataManager";
 import MonitorPanel from "./MonitorPanel";
 import { schemaContext } from "../lib/ngql-language";
+import { useTranslation } from "../hooks/useTranslation";
 import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
 import "../styles/Sidebar.css";
 
@@ -63,6 +64,9 @@ function Sidebar({
   const [activeTab, setActiveTab] = useState<TabType>("schema");
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
   const [schema, setSchema] = useState<SchemaInfo>({ tags: [], edges: [] });
+  const [spacesError, setSpacesError] = useState("");
+  const [schemaError, setSchemaError] = useState("");
+  const { t } = useTranslation();
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     spaces: true,
     tags: true,
@@ -96,9 +100,14 @@ function Sidebar({
     try {
       const result = await invoke<SpaceInfo[]>("get_spaces");
       setSpaces(result);
+      setSpacesError("");
       schemaContext.spaces = result.map((s) => s.name);
     } catch (error) {
-      console.error("Failed to load spaces:", error);
+      const msg =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+      setSpacesError(msg);
     }
   };
 
@@ -106,11 +115,16 @@ function Sidebar({
     try {
       const result = await invoke<SchemaInfo>("get_schema");
       setSchema(result);
+      setSchemaError("");
       schemaContext.tags = result.tags;
       schemaContext.edges = result.edges;
       setSchema(result);
     } catch (error) {
-      console.error("Failed to load schema:", error);
+      const msg =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+      setSchemaError(msg);
     }
   };
 
@@ -256,7 +270,7 @@ function Sidebar({
       <div className="sidebar-section">
         <div className="section-header" onClick={() => toggleSection("spaces")}>
           <span className={`arrow ${expandedSections.spaces ? "expanded" : ""}`}>▶</span>
-          <span className="section-title">Spaces</span>
+          <span className="section-title">{t("schema.spaces")}</span>
           <button
             className="refresh-btn"
             onClick={(e) => {
@@ -270,8 +284,12 @@ function Sidebar({
         </div>
         {expandedSections.spaces && (
           <div className="section-content">
-            {spaces.length === 0 ? (
-              <div className="empty-message">No spaces found</div>
+            {spacesError ? (
+              <div className="error-message" title={spacesError}>
+                ⚠ {spacesError}
+              </div>
+            ) : spaces.length === 0 ? (
+              <div className="empty-message">{t("schema.noSpaces")}</div>
             ) : (
               spaces.map((space) => (
                 <div
@@ -294,7 +312,7 @@ function Sidebar({
           <div className="sidebar-section">
             <div className="section-header" onClick={() => toggleSection("tags")}>
               <span className={`arrow ${expandedSections.tags ? "expanded" : ""}`}>▶</span>
-              <span className="section-title">Tags</span>
+              <span className="section-title">{t("schema.tags")}</span>
               <button
                 className="refresh-btn"
                 onClick={(e) => {
@@ -308,8 +326,12 @@ function Sidebar({
             </div>
             {expandedSections.tags && (
               <div className="section-content">
-                {schema.tags.length === 0 ? (
-                  <div className="empty-message">No tags found</div>
+                {schemaError ? (
+                  <div className="error-message" title={schemaError}>
+                    ⚠ {schemaError}
+                  </div>
+                ) : schema.tags.length === 0 ? (
+                  <div className="empty-message">{t("schema.noTags")}</div>
                 ) : (
                   schema.tags.map((tag) => renderSchemaItem("tag", tag, "🏷️"))
                 )}
@@ -320,12 +342,12 @@ function Sidebar({
           <div className="sidebar-section">
             <div className="section-header" onClick={() => toggleSection("edges")}>
               <span className={`arrow ${expandedSections.edges ? "expanded" : ""}`}>▶</span>
-              <span className="section-title">Edges</span>
+              <span className="section-title">{t("schema.edges")}</span>
             </div>
             {expandedSections.edges && (
               <div className="section-content">
                 {schema.edges.length === 0 ? (
-                  <div className="empty-message">No edges found</div>
+                  <div className="empty-message">{t("schema.noEdges")}</div>
                 ) : (
                   schema.edges.map((edge) => renderSchemaItem("edge", edge, "↔️"))
                 )}
@@ -344,37 +366,37 @@ function Sidebar({
           className={`sidebar-tab ${activeTab === "schema" ? "active" : ""}`}
           onClick={() => setActiveTab("schema")}
         >
-          Schema
+          {t("sidebar.schema")}
         </button>
         <button
           className={`sidebar-tab ${activeTab === "manage" ? "active" : ""}`}
           onClick={() => setActiveTab("manage")}
         >
-          Manage
+          {t("sidebar.manage")}
         </button>
         <button
           className={`sidebar-tab ${activeTab === "data" ? "active" : ""}`}
           onClick={() => setActiveTab("data")}
         >
-          Data
+          {t("sidebar.data")}
         </button>
         <button
           className={`sidebar-tab ${activeTab === "monitor" ? "active" : ""}`}
           onClick={() => setActiveTab("monitor")}
         >
-          Monitor
+          {t("sidebar.monitor")}
         </button>
         <button
           className={`sidebar-tab ${activeTab === "history" ? "active" : ""}`}
           onClick={() => setActiveTab("history")}
         >
-          History
+          {t("sidebar.history")}
         </button>
         <button
           className={`sidebar-tab ${activeTab === "settings" ? "active" : ""}`}
           onClick={() => setActiveTab("settings")}
         >
-          Settings
+          {t("sidebar.settings")}
         </button>
       </div>
 

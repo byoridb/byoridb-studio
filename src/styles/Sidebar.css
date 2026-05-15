@@ -216,3 +216,15 @@
 .describe-table tr:last-child td {
   border-bottom: none;
 }
+
+.error-message {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--accent-error);
+  background: rgba(243, 139, 168, 0.08);
+  border-left: 2px solid var(--accent-error);
+  cursor: help;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

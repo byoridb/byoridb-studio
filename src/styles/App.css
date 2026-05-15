@@ -98,3 +98,132 @@
   flex-direction: column;
   overflow: hidden;
 }
+
+/* Toast notifications */
+.toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 360px;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  animation: toast-in 0.2s ease;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.toast-error {
+  background: #3b1a1f;
+  color: var(--accent-error);
+  border: 1px solid var(--accent-error);
+}
+.toast-success {
+  background: #1a2e1f;
+  color: var(--accent-success);
+  border: 1px solid var(--accent-success);
+}
+.toast-info {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.toast-message {
+  flex: 1;
+}
+
+.toast-close {
+  padding: 0 4px;
+  font-size: 16px;
+  background: transparent;
+  color: inherit;
+  border: none;
+  opacity: 0.7;
+  line-height: 1;
+}
+
+.toast-close:hover {
+  opacity: 1;
+}
+
+/* Confirm dialog */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.confirm-box {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 20px 24px;
+  min-width: 280px;
+  max-width: 400px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.confirm-message {
+  font-size: 14px;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-cancel {
+  padding: 6px 14px;
+  font-size: 13px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.confirm-cancel:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.confirm-ok {
+  padding: 6px 14px;
+  font-size: 13px;
+  background: var(--accent-error);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+}
+
+.confirm-ok:hover {
+  opacity: 0.85;
+}

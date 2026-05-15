@@ -251,6 +251,15 @@ const catppuccinMochaTheme: Monaco.editor.IStandaloneThemeData = {
 // Registration
 // ---------------------------------------------------------------------------
 
+export interface SchemaContext {
+  tags: string[];
+  edges: string[];
+  spaces: string[];
+}
+
+// Mutable ref updated by QueryEditor when schema changes
+export const schemaContext: SchemaContext = { tags: [], edges: [], spaces: [] };
+
 export function registerNgqlLanguage(monaco: typeof Monaco): void {
   // Avoid double-registration
   const existing = monaco.languages.getLanguages().find((l) => l.id === LANGUAGE_ID);
@@ -276,7 +285,31 @@ export function registerNgqlLanguage(monaco: typeof Monaco): void {
         range,
       }));
 
-      return { suggestions: keywordItems };
+      const tagItems = schemaContext.tags.map((t) => ({
+        label: t,
+        kind: monaco.languages.CompletionItemKind.Class,
+        insertText: t,
+        detail: "Tag",
+        range,
+      }));
+
+      const edgeItems = schemaContext.edges.map((e) => ({
+        label: e,
+        kind: monaco.languages.CompletionItemKind.Interface,
+        insertText: e,
+        detail: "Edge",
+        range,
+      }));
+
+      const spaceItems = schemaContext.spaces.map((s) => ({
+        label: s,
+        kind: monaco.languages.CompletionItemKind.Module,
+        insertText: s,
+        detail: "Space",
+        range,
+      }));
+
+      return { suggestions: [...keywordItems, ...tagItems, ...edgeItems, ...spaceItems] };
     },
   });
 }

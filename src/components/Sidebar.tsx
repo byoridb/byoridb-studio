@@ -5,6 +5,7 @@ import HistoryPanel from "./HistoryPanel";
 import SchemaManager from "./SchemaManager";
 import DataManager from "./DataManager";
 import MonitorPanel from "./MonitorPanel";
+import { schemaContext } from "../lib/ngql-language";
 import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
 import "../styles/Sidebar.css";
 
@@ -95,6 +96,7 @@ function Sidebar({
     try {
       const result = await invoke<SpaceInfo[]>("get_spaces");
       setSpaces(result);
+      schemaContext.spaces = result.map((s) => s.name);
     } catch (error) {
       console.error("Failed to load spaces:", error);
     }
@@ -103,6 +105,9 @@ function Sidebar({
   const loadSchema = async () => {
     try {
       const result = await invoke<SchemaInfo>("get_schema");
+      setSchema(result);
+      schemaContext.tags = result.tags;
+      schemaContext.edges = result.edges;
       setSchema(result);
     } catch (error) {
       console.error("Failed to load schema:", error);
@@ -379,6 +384,7 @@ function Sidebar({
           <SchemaManager
             spaces={spaces}
             currentSpace={currentSpace}
+            schema={schema}
             onRefresh={() => {
               loadSpaces();
               if (currentSpace) loadSchema();

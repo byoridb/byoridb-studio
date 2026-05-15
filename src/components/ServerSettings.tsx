@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionConfig, SavedConnection } from "../types";
 import { DEFAULT_CONNECTION_CONFIG } from "../types";
+import { setLocale, getLocale } from "../lib/i18n";
 import "../styles/ServerSettings.css";
 
 export type { ConnectionConfig, SavedConnection };
@@ -57,6 +58,12 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
   const [fontSize, setFontSize] = useState<number>(() =>
     parseInt(localStorage.getItem(FONT_SIZE_KEY) ?? "14", 10),
   );
+  const [locale, setLocaleState] = useState<"en" | "ko">(() => getLocale());
+
+  const handleLocaleChange = (l: "en" | "ko") => {
+    setLocaleState(l);
+    setLocale(l);
+  };
 
   const handleThemeChange = (t: "dark" | "light") => {
     setTheme(t);
@@ -201,8 +208,28 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
             </button>
           </div>
         </div>
+        <div className="appearance-row">
+          <span className="appearance-label">Language</span>
+          <div className="theme-toggle">
+            <button
+              className={`theme-btn ${locale === "en" ? "active" : ""}`}
+              onClick={() => handleLocaleChange("en")}
+              aria-pressed={locale === "en"}
+              data-testid="lang-en"
+            >
+              EN
+            </button>
+            <button
+              className={`theme-btn ${locale === "ko" ? "active" : ""}`}
+              onClick={() => handleLocaleChange("ko")}
+              aria-pressed={locale === "ko"}
+              data-testid="lang-ko"
+            >
+              한국어
+            </button>
+          </div>
+        </div>
       </div>
-
       <div className="settings-header">
         <h3>Server Connections</h3>
         {!isAdding && (

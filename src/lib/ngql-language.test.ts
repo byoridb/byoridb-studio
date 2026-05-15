@@ -7,6 +7,7 @@ import {
   NGQL_DDL,
   NGQL_DML,
   NGQL_DQL,
+  schemaContext,
 } from "./ngql-language";
 
 describe("isNgqlKeyword", () => {
@@ -105,5 +106,13 @@ describe("completion candidates", () => {
         }
       }),
     );
+  });
+});
+
+describe("schemaContext", () => {
+  it("is mutable and starts empty", () => {
+    expect(schemaContext.tags).toEqual([]);
+    expect(schemaContext.edges).toEqual([]);
+    expect(schemaContext.spaces).toEqual([]);
   });
 });

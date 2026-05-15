@@ -14,11 +14,21 @@ interface NodeDetail {
   props: Record<string, string>;
 }
 
+type LayoutName = "cose" | "circle" | "grid" | "breadthfirst";
+
+const LAYOUTS: { name: LayoutName; label: string }[] = [
+  { name: "cose", label: "Force" },
+  { name: "breadthfirst", label: "Hierarchical" },
+  { name: "circle", label: "Circular" },
+  { name: "grid", label: "Grid" },
+];
+
 function GraphView({ result }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<cytoscape.Core | null>(null);
   const [selected, setSelected] = useState<NodeDetail | null>(null);
   const [elementCount, setElementCount] = useState({ nodes: 0, edges: 0 });
+  const [layout, setLayout] = useState<LayoutName>("cose");
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -80,11 +90,7 @@ function GraphView({ result }: GraphViewProps) {
           style: { "line-color": "#89b4fa", "target-arrow-color": "#89b4fa" },
         },
       ],
-      layout: {
-        name: elements.length > 50 ? "cose" : "cose",
-        animate: false,
-        padding: 30,
-      } as cytoscape.LayoutOptions,
+      layout: { name: layout, animate: false, padding: 30 } as cytoscape.LayoutOptions,
     });
 
     cy.on("tap", "node", (evt) => {
@@ -102,7 +108,7 @@ function GraphView({ result }: GraphViewProps) {
       cy.destroy();
       cyRef.current = null;
     };
-  }, [result]);
+  }, [result, layout]);
 
   const elements = parseGraphElements(result);
 
@@ -123,6 +129,18 @@ function GraphView({ result }: GraphViewProps) {
         <span className="graph-stats">
           {elementCount.nodes} nodes · {elementCount.edges} edges
         </span>
+        <div className="graph-layouts">
+          {LAYOUTS.map((l) => (
+            <button
+              key={l.name}
+              className={`graph-layout-btn ${layout === l.name ? "active" : ""}`}
+              onClick={() => setLayout(l.name)}
+              data-testid={`layout-${l.name}`}
+            >
+              {l.label}
+            </button>
+          ))}
+        </div>
         <button
           className="graph-fit-btn"
           onClick={() => cyRef.current?.fit(undefined, 30)}

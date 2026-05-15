@@ -1,11 +1,13 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SpaceInfo } from "../types";
+import type { SpaceInfo, SchemaInfo } from "../types";
+import ErdDiagram from "./ErdDiagram";
 import "../styles/SchemaManager.css";
 
 interface SchemaManagerProps {
   spaces: SpaceInfo[];
   currentSpace: string | null;
+  schema: SchemaInfo;
   onRefresh: () => void;
   onSelectSpace: (name: string) => void;
 }
@@ -71,8 +73,14 @@ function buildFieldsDDL(fields: TagEdgeField[]): string {
     .join(", ");
 }
 
-function SchemaManager({ spaces, currentSpace, onRefresh, onSelectSpace }: SchemaManagerProps) {
-  const [tab, setTab] = useState<"spaces" | "tags" | "edges" | "indexes">("spaces");
+function SchemaManager({
+  spaces,
+  currentSpace,
+  schema,
+  onRefresh,
+  onSelectSpace,
+}: SchemaManagerProps) {
+  const [tab, setTab] = useState<"spaces" | "tags" | "edges" | "indexes" | "erd">("spaces");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [newSpaceName, setNewSpaceName] = useState("");
@@ -129,7 +137,7 @@ function SchemaManager({ spaces, currentSpace, onRefresh, onSelectSpace }: Schem
   return (
     <div className="schema-manager">
       <div className="sm-tabs">
-        {(["spaces", "tags", "edges", "indexes"] as const).map((t) => (
+        {(["spaces", "tags", "edges", "indexes", "erd"] as const).map((t) => (
           <button
             key={t}
             className={`sm-tab ${tab === t ? "active" : ""}`}
@@ -234,6 +242,12 @@ function SchemaManager({ spaces, currentSpace, onRefresh, onSelectSpace }: Schem
             To list/drop indexes, use the Query Editor: SHOW TAG INDEXES / DROP TAG INDEX
             &lt;name&gt;
           </p>
+        </div>
+      )}
+
+      {tab === "erd" && (
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <ErdDiagram schema={schema} currentSpace={currentSpace} />
         </div>
       )}
     </div>

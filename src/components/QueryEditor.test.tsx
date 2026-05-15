@@ -2,6 +2,104 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import QueryEditor from "./QueryEditor";
 
+// ---------------------------------------------------------------------------
+// Monaco mock
+// ---------------------------------------------------------------------------
+// @monaco-editor/react renders a full Monaco instance which requires a real
+// browser DOM. In jsdom we replace it with a plain <textarea> that exposes
+// the same value/onChange surface and simulates the keybindings the component
+// registers via editor.addCommand().
+// ---------------------------------------------------------------------------
+
+interface MockEditorProps {
+  value?: string;
+  onChange?: (value: string) => void;
+  onMount?: (editor: MockEditorInstance, monaco: unknown) => void;
+  options?: { readOnly?: boolean };
+}
+
+interface MockEditorInstance {
+  getValue: () => string;
+  setValue: (v: string) => void;
+  focus: () => void;
+  addCommand: (keybinding: number, handler: () => void) => void;
+}
+
+// Keybinding constants mirroring Monaco's KeyMod / KeyCode values
+const KeyMod = { CtrlCmd: 1 << 11 };
+const KeyCode = { Enter: 3, UpArrow: 16, DownArrow: 18 };
+
+vi.mock("@monaco-editor/react", async () => {
+  const { useRef, useEffect } = await vi.importActual<typeof import("react")>("react");
+
+  function MockEditor({ value = "", onChange, onMount, options }: MockEditorProps) {
+    const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const commandsRef = useRef<Map<number, () => void>>(new Map());
+
+    useEffect(() => {
+      if (!onMount) return;
+
+      const editor: MockEditorInstance = {
+        getValue: () => textareaRef.current?.value ?? "",
+        setValue: (v: string) => {
+          if (textareaRef.current) {
+            // Simulate React-controlled update
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype,
+              "value",
+            )?.set;
+            nativeInputValueSetter?.call(textareaRef.current, v);
+            textareaRef.current.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+          onChange?.(v);
+        },
+        focus: () => textareaRef.current?.focus(),
+        addCommand: (keybinding: number, handler: () => void) => {
+          commandsRef.current.set(keybinding, handler);
+        },
+      };
+
+      const monacoStub = { KeyMod, KeyCode };
+      onMount(editor, monacoStub);
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+      let keybinding: number | null = null;
+      if (e.key === "Enter") keybinding = KeyMod.CtrlCmd | KeyCode.Enter;
+      if (e.key === "ArrowUp") keybinding = KeyMod.CtrlCmd | KeyCode.UpArrow;
+      if (e.key === "ArrowDown") keybinding = KeyMod.CtrlCmd | KeyCode.DownArrow;
+      if (keybinding !== null) {
+        e.preventDefault();
+        commandsRef.current.get(keybinding)?.();
+      }
+    };
+
+    return (
+      <textarea
+        ref={textareaRef}
+        data-testid="monaco-editor"
+        value={value}
+        disabled={options?.readOnly}
+        onChange={(e) => onChange?.(e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+
+  return { default: MockEditor };
+});
+
+vi.mock("../lib/ngql-language", () => ({
+  registerNgqlLanguage: vi.fn(),
+  LANGUAGE_ID: "ngql",
+}));
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 describe("QueryEditor", () => {
   beforeEach(() => {
     localStorage.clear();

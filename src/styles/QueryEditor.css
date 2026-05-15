@@ -79,51 +79,7 @@
   display: flex;
   overflow: hidden;
   position: relative;
-}
-
-.query-textarea {
-  flex: 1;
-  padding: 12px 12px 12px 50px;
-  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  background: var(--bg-primary);
-  border: none;
-  border-radius: 0;
-  resize: none;
-  color: var(--text-primary);
-  outline: none;
-}
-
-.query-textarea::placeholder {
-  color: var(--text-muted);
-}
-
-.query-textarea:disabled {
-  background: var(--bg-tertiary);
-  cursor: not-allowed;
-}
-
-.line-numbers {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 40px;
-  padding: 12px 8px;
-  background: var(--bg-secondary);
-  border-right: 1px solid var(--border-color);
-  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-muted);
-  text-align: right;
-  user-select: none;
-  overflow: hidden;
-}
-
-.line-number {
-  height: 20.8px;
+  min-height: 0;
 }
 
 .editor-footer {

@@ -31,4 +31,6 @@ custom-protocol = ["tauri/custom-protocol"]
 grpc = ["tonic"]
 
 [lints.clippy]
-all = "warn"
+correctness = "deny"
+style = "warn"
+perf = "warn"

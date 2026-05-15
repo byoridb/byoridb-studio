@@ -143,7 +143,7 @@ function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [isConnected, connectionConfig?.host, connectionConfig?.port]);
+  }, [isConnected, connectionConfig]);
 
   const handleConnect = async (config: ConnectionConfig) => {
     try {

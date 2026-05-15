@@ -47,7 +47,7 @@ jobs:
         working-directory: src-tauri
 
       - name: Lint (clippy)
-        run: cargo clippy -- -D clippy::correctness -W clippy::style -W clippy::perf
+        run: cargo clippy --all-targets --no-default-features -- -D clippy::correctness -W clippy::style -W clippy::perf
         working-directory: src-tauri
 
       - name: Test backend

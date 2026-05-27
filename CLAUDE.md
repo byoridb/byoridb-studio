@@ -170,3 +170,65 @@ FIND SHORTEST PATH FROM 1 TO 5 OVER follows;
 - `$^` - Source vertex
 - `$$` - Destination vertex
 - `follows._src`, `follows._dst` - Edge endpoints
+
+---
+
+## AI-DLC (cah-dlc) 통합
+
+본 코드베이스는 Connexioh cah-dlc를 적용 중입니다. 공통 에이전트 규칙은 `AGENTS.md`를 참조. 아래는 Claude Code 전용 보강입니다.
+
+### 사용 가능한 Skill
+
+| Skill | 용도 |
+|---|---|
+| `/cah:brownfield-audit` | 코드베이스 재감사 (분기별 권장) |
+| `/cah:brownfield-onboard` | CLAUDE.md / AGENTS.md 재생성 / 업데이트 |
+| `/cah:brownfield-migrate` | AI-DLC 마이그레이션 플랜 작성 |
+| `/cah:vision` | 신규 기능 비전 작성 |
+| `/cah:tech` | 신규 기능 기술 환경 문서 |
+| `/cah:inception` | personas + requirements |
+| `/cah:construction` | 코드 생성 + NFR + 인프라 |
+| `/cah:retro` | phase 종료 / 마일스톤 / 사고 후 회고 |
+| `/cah:review` | 현재 작업 상태 게이트 검사 |
+
+### 우선 호출 순서
+
+- **신규 기능** → `/cah:vision` → `/cah:tech` → `/cah:inception` → `/cah:construction`
+- **기존 모듈 수정** → 영향 범위 파악 → `/cah:review` 사전 호출 권장
+- **사고 / 장애 직후** → `/cah:retro` (incident 모드)
+- **분기별 재감사** → `/cah:brownfield-audit`
+
+### AI-DLC 산출물 위치
+
+```
+aidlc-docs/
+├── audit/audit-report.md        # 최신 감사 보고서 (2026-05-21)
+├── onboard/onboard-notes.md     # 문서 변경 이력
+└── migration/                   # (예정) migration-plan, tech-debt, gate-grace
+```
+
+---
+
+## 코드베이스 주의사항
+
+audit-report에서 확인된 함정 (변경 전 인지 필수):
+
+- **`src/App.tsx`**: M1 완료로 훅 분리됨. `useConnection` + `useQueryExecution` 사용. health poll `useEffect`만 App.tsx에 잔존 (두 훅에 걸친 cross-cutting concern).
+- **`src/components/Sidebar.tsx`**: M1-3 완료로 `useSchemaData` 훅 분리됨. UI 렌더링만 담당.
+- **heuristic 세션 만료 감지**: `client.rs::is_session_error()`가 메시지 텍스트 매칭으로 세션 만료를 감지. 서버가 전용 `code` 필드를 추가하면 제거 예정.
+- **CSS**: Tailwind CSS v4 사용. `src/styles/index.css`에 `@theme`으로 Catppuccin Mocha 토큰 정의. 컴포넌트별 CSS 파일 없음 — 모든 스타일을 Tailwind 유틸리티 클래스로 인라인.
+- **CI 없음**: `npm test` + `cargo test`는 수동. PR 전 반드시 로컬 실행.
+
+---
+
+## TODO (cah-dlc 도입 진행 중)
+
+- [x] `brownfield-migrate` 완료 → `aidlc-docs/migration/` 산출물 생성됨
+- [x] **M0**: GitHub Actions CI 파이프라인 구성 (`npm test` + `cargo test` 자동화)
+- [x] **M1-1**: `App.tsx` → `useConnection` 훅 추출 (`src/hooks/useConnection.ts`)
+- [x] **M1-2**: `App.tsx` → `useQueryExecution` 훅 추출 (`src/hooks/useQueryExecution.ts`)
+- [x] **M1-3**: `Sidebar.tsx` → `useSchemaData` 훅 추출 (`src/hooks/useSchemaData.ts`)
+- [x] **M2**: CSS 아키텍처 방식 결정 + 전환 → Tailwind CSS v4 (Catppuccin Mocha 테마)
+- [x] **M3**: `client.rs` 모듈화 → `client/{error,types,http}.rs` (gRPC 추가 전 선행)
+
+마이그레이션 상세: `aidlc-docs/migration/migration-plan.md` 참조.

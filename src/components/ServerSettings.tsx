@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import "../styles/ServerSettings.css";
 
 export interface ConnectionConfig {
   host: string;
@@ -95,7 +94,6 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
         c.name === editingConnection.name ? newConnection : c
       );
     } else {
-      // Check for duplicate name
       if (connections.some((c) => c.name === formData.name)) {
         alert("A connection with this name already exists");
         return;
@@ -118,10 +116,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
   const handleEdit = (connection: SavedConnection) => {
     setEditingConnection(connection);
-    setFormData({
-      name: connection.name,
-      ...connection.config,
-    });
+    setFormData({ name: connection.name, ...connection.config });
     setIsAdding(true);
   };
 
@@ -131,110 +126,105 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
     setIsAdding(false);
   };
 
-  const handleConnect = (config: ConnectionConfig) => {
-    onConnect(config);
-  };
+  const formHostKey = `${formData.host}:${formData.port}`;
 
   return (
-    <div className="server-settings">
-      <div className="settings-header">
-        <h3>Server Connections</h3>
+    <div className="p-3">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-xs font-semibold uppercase tracking-[0.5px] text-subtext m-0">
+          Server Connections
+        </h3>
         {!isAdding && (
-          <button className="add-btn" onClick={() => setIsAdding(true)}>
+          <button
+            className="px-3 py-1 text-xs bg-blue text-app rounded font-medium hover:bg-sapphire"
+            onClick={() => setIsAdding(true)}
+          >
             + Add
           </button>
         )}
       </div>
 
       {isAdding && (
-        <div className="connection-form">
-          <div className="form-row">
-            <label>Name</label>
-            <input
-              type="text"
-              value={formData.name}
-              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              placeholder="My Server"
-            />
-          </div>
-          <div className="form-row">
-            <label>Host</label>
-            <input
-              type="text"
-              value={formData.host}
-              onChange={(e) => setFormData({ ...formData, host: e.target.value })}
-              placeholder="127.0.0.1"
-            />
-          </div>
-          <div className="form-row">
-            <label>Port</label>
-            <input
-              type="number"
-              value={formData.port}
-              onChange={(e) =>
-                setFormData({ ...formData, port: parseInt(e.target.value) || 19669 })
-              }
-              placeholder="19669"
-            />
-          </div>
-          <div className="form-row">
-            <label>Username</label>
-            <input
-              type="text"
-              value={formData.username}
-              onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-              placeholder="root"
-            />
-          </div>
-          <div className="form-row">
-            <label>Password</label>
-            <input
-              type="password"
-              value={formData.password}
-              onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-              placeholder="Enter password"
-            />
-          </div>
-          <div className="form-actions">
-            <button className="cancel-btn" onClick={resetForm}>
+        <div className="bg-crust rounded-lg p-4 mb-4">
+          {(
+            [
+              { label: "Name", key: "name", type: "text", placeholder: "My Server" },
+              { label: "Host", key: "host", type: "text", placeholder: "127.0.0.1" },
+              { label: "Port", key: "port", type: "number", placeholder: "19669" },
+              { label: "Username", key: "username", type: "text", placeholder: "root" },
+              { label: "Password", key: "password", type: "password", placeholder: "Enter password" },
+            ] as const
+          ).map(({ label, key, type, placeholder }) => (
+            <div key={key} className="flex flex-col gap-1 mb-3 last:mb-0">
+              <label className="text-[11px] font-medium text-subtext">{label}</label>
+              <input
+                type={type}
+                value={String(formData[key])}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    [key]: key === "port" ? parseInt(e.target.value) || 19669 : e.target.value,
+                  })
+                }
+                placeholder={placeholder}
+                className="w-full py-2 px-2.5 text-[13px] bg-mantle border border-surface1 rounded text-text focus:border-blue outline-none"
+              />
+            </div>
+          ))}
+
+          <div className="flex gap-2 mt-4">
+            <button
+              className="px-3 py-1.5 text-xs bg-transparent text-subtext border border-surface1 rounded hover:bg-surface1 hover:text-text"
+              onClick={resetForm}
+            >
               Cancel
             </button>
             <button
-              className="test-btn"
+              className="px-3 py-1.5 text-xs bg-mantle text-subtext border border-surface1 rounded hover:bg-surface1 hover:text-text disabled:opacity-50 disabled:cursor-not-allowed"
               onClick={() => handleTest(formData)}
-              disabled={testingHost === `${formData.host}:${formData.port}`}
+              disabled={testingHost === formHostKey}
             >
-              {testingHost === `${formData.host}:${formData.port}` ? "Testing..." : "Test"}
+              {testingHost === formHostKey ? "Testing..." : "Test"}
             </button>
-            <button className="save-btn" onClick={handleSave}>
+            <button
+              className="px-3 py-1.5 text-xs bg-blue text-app rounded font-medium hover:bg-sapphire ml-auto"
+              onClick={handleSave}
+            >
               {editingConnection ? "Update" : "Save"}
             </button>
           </div>
-          {testResult && testResult.host === `${formData.host}:${formData.port}` && (
-            <div className={`test-result ${testResult.success ? "success" : "error"}`}>
+
+          {testResult && testResult.host === formHostKey && (
+            <div
+              className={`mt-2 px-2.5 py-1.5 text-xs rounded text-center ${
+                testResult.success
+                  ? "bg-green/15 text-green"
+                  : "bg-red/15 text-red"
+              }`}
+            >
               {testResult.success ? "Connection successful!" : "Connection failed"}
             </div>
           )}
         </div>
       )}
 
-      <div className="connections-list">
+      <div className="flex flex-col gap-2">
         {connections.length === 0 ? (
-          <div className="empty-message">No saved connections</div>
+          <div className="p-4 text-xs text-overlay italic text-center">No saved connections</div>
         ) : (
           connections.map((conn) => {
             const hostKey = `${conn.config.host}:${conn.config.port}`;
             return (
-              <div key={conn.name} className="connection-item">
-                <div className="connection-info">
-                  <span className="connection-name">{conn.name}</span>
-                  <span className="connection-details">
+              <div key={conn.name} className="bg-crust rounded-md p-3 relative">
+                <div className="flex flex-col gap-1 mb-2.5">
+                  <span className="text-sm font-medium text-text">{conn.name}</span>
+                  <span className="text-xs text-overlay">
                     {conn.config.host}:{conn.config.port} ({conn.config.username})
                   </span>
                 </div>
-                <div className="connection-actions">
+                <div className="flex gap-1.5 flex-wrap">
                   <button
-                    className="action-btn test"
+                    className="px-2.5 py-1 text-[11px] font-medium rounded bg-mantle text-subtext border border-surface1 hover:bg-surface1 disabled:opacity-50 disabled:cursor-not-allowed"
                     onClick={() => handleTest(conn.config)}
                     disabled={testingHost === hostKey}
                     title="Test connection"
@@ -242,29 +232,35 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
                     {testingHost === hostKey ? "..." : "Test"}
                   </button>
                   <button
-                    className="action-btn edit"
+                    className="px-2.5 py-1 text-[11px] font-medium rounded bg-mantle text-subtext border border-surface1 hover:bg-surface1"
                     onClick={() => handleEdit(conn)}
                     title="Edit"
                   >
                     Edit
                   </button>
                   <button
-                    className="action-btn delete"
+                    className="px-2 py-1 text-sm font-medium rounded bg-transparent text-overlay border border-transparent hover:bg-red hover:text-app"
                     onClick={() => handleDelete(conn.name)}
                     title="Delete"
                   >
                     ×
                   </button>
                   <button
-                    className="action-btn connect"
-                    onClick={() => handleConnect(conn.config)}
+                    className="px-2.5 py-1 text-[11px] font-medium rounded bg-blue text-app hover:bg-sapphire ml-auto"
+                    onClick={() => onConnect(conn.config)}
                     title="Connect"
                   >
                     Connect
                   </button>
                 </div>
                 {testResult && testResult.host === hostKey && (
-                  <div className={`test-result ${testResult.success ? "success" : "error"}`}>
+                  <div
+                    className={`mt-2.5 px-2 py-1 text-[11px] rounded text-center ${
+                      testResult.success
+                        ? "bg-green/15 text-green"
+                        : "bg-red/15 text-red"
+                    }`}
+                  >
                     {testResult.success ? "OK" : "Failed"}
                   </div>
                 )}

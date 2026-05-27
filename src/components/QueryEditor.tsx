@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect } from "react";
-import "../styles/QueryEditor.css";
 
 interface QueryEditorProps {
   onExecute: (query: string) => void;
@@ -35,7 +34,6 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
 
     onExecute(query);
 
-    // Add to history
     const newHistory = [query, ...history.filter((h) => h !== query)].slice(0, 50);
     setHistory(newHistory);
     setHistoryIndex(-1);
@@ -43,14 +41,12 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Ctrl/Cmd + Enter to execute
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       handleExecute();
       return;
     }
 
-    // Navigate history with Ctrl/Cmd + Up/Down
     if ((e.ctrlKey || e.metaKey) && history.length > 0) {
       if (e.key === "ArrowUp") {
         e.preventDefault();
@@ -78,15 +74,17 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
   };
 
   return (
-    <div className="query-editor">
-      <div className="editor-toolbar">
-        <div className="toolbar-left">
-          <span className="toolbar-title">Query Editor</span>
-          <div className="sample-queries">
+    <div className="flex flex-col h-[250px] min-h-[150px] border-b border-surface1">
+      <div className="flex justify-between items-center px-4 py-2 bg-mantle border-b border-surface1">
+        <div className="flex items-center gap-4">
+          <span className="text-xs font-semibold uppercase tracking-[0.5px] text-subtext">
+            Query Editor
+          </span>
+          <div className="flex gap-1.5">
             {SAMPLE_QUERIES.map((sample) => (
               <button
                 key={sample.label}
-                className="sample-query-btn"
+                className="px-2 py-1 text-[11px] bg-crust text-subtext border border-surface1 rounded hover:bg-surface1 hover:text-text hover:border-blue disabled:opacity-50 disabled:cursor-not-allowed"
                 onClick={() => handleSampleQuery(sample.query)}
                 disabled={!isConnected}
               >
@@ -95,12 +93,15 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
             ))}
           </div>
         </div>
-        <div className="toolbar-right">
-          <button className="btn-clear" onClick={handleClear}>
+        <div className="flex gap-2">
+          <button
+            className="bg-transparent text-subtext border border-surface1 hover:bg-surface1 hover:text-text"
+            onClick={handleClear}
+          >
             Clear
           </button>
           <button
-            className="btn-execute"
+            className="bg-blue text-app font-medium hover:bg-sapphire disabled:opacity-50 disabled:cursor-not-allowed"
             onClick={handleExecute}
             disabled={!query.trim() || isExecuting || !isConnected}
           >
@@ -109,10 +110,10 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
         </div>
       </div>
 
-      <div className="editor-container">
+      <div className="flex-1 flex overflow-hidden relative">
         <textarea
           ref={textareaRef}
-          className="query-textarea"
+          className="flex-1 p-3 pl-[50px] font-mono text-[13px] leading-[1.6] bg-app border-none rounded-none resize-none text-text outline-none disabled:bg-crust disabled:cursor-not-allowed"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -120,23 +121,19 @@ function QueryEditor({ onExecute, isExecuting, isConnected }: QueryEditorProps) 
           disabled={!isConnected}
           spellCheck={false}
         />
-        <div className="line-numbers">
+        <div className="absolute inset-y-0 left-0 w-10 px-2 py-3 bg-mantle border-r border-surface1 font-mono text-[13px] leading-[1.6] text-overlay text-right select-none overflow-hidden">
           {query.split("\n").map((_, i) => (
-            <div key={i} className="line-number">
+            <div key={i} className="h-[20.8px]">
               {i + 1}
             </div>
           ))}
         </div>
       </div>
 
-      <div className="editor-footer">
-        <span className="hint">
-          ⌘↵ Execute | ⌘↑/↓ History
-        </span>
+      <div className="flex justify-between px-4 py-1.5 bg-mantle border-t border-surface1 text-[11px] text-overlay">
+        <span className="font-mono">⌘↵ Execute | ⌘↑/↓ History</span>
         {history.length > 0 && (
-          <span className="history-info">
-            History: {history.length} queries
-          </span>
+          <span className="text-sapphire">History: {history.length} queries</span>
         )}
       </div>
     </div>

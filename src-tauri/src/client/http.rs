@@ -1,137 +1,16 @@
-//! ByoriDB client for communicating with the graph database server
+//! HTTP REST transport for the ByoriDB client.
+//!
+//! Contains `ByoriDBClient`, `test_connection`, and the JSON response parsers.
+//! When gRPC support is added, add a sibling `grpc.rs` that shares
+//! `super::error` and `super::types`.
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tracing::info;
 
-/// Errors returned by `ByoriDBClient` methods.
-///
-/// The `code()` method returns a stable string that the Tauri boundary
-/// surfaces to the frontend so the UI can react (e.g. force re-auth on
-/// `SESSION_EXPIRED`).
-#[derive(Debug)]
-pub enum ClientError {
-    /// Network/timeout/reqwest-level error — couldn't reach the server.
-    Transport(String),
-    /// Server rejected credentials on `POST /api/v1/session` (HTTP 401).
-    Auth(String),
-    /// Server says the session is invalid or expired; the UI should re-authenticate.
-    SessionExpired,
-    /// Server returned 4xx/5xx for a query with a query-level error body.
-    Query(String),
-    /// Client has no session yet (never connected, or already disconnected).
-    NotConnected,
-    /// Response body did not match the expected shape.
-    Protocol(String),
-}
+use super::error::ClientError;
+use super::types::{ConnectionConfig, QueryResult, SchemaInfo, SpaceInfo};
 
-impl ClientError {
-    /// Stable string code used at the Tauri → frontend boundary.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::Transport(_) => "TRANSPORT",
-            Self::Auth(_) => "AUTH_FAILED",
-            Self::SessionExpired => "SESSION_EXPIRED",
-            Self::Query(_) => "QUERY_ERROR",
-            Self::NotConnected => "NOT_CONNECTED",
-            Self::Protocol(_) => "PROTOCOL_ERROR",
-        }
-    }
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(m) => write!(f, "Transport error: {m}"),
-            Self::Auth(m) => write!(f, "Authentication failed: {m}"),
-            Self::SessionExpired => write!(f, "Session expired; please reconnect"),
-            Self::Query(m) => write!(f, "Query error: {m}"),
-            Self::NotConnected => write!(f, "Not connected"),
-            Self::Protocol(m) => write!(f, "Protocol error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
-
-impl From<reqwest::Error> for ClientError {
-    fn from(err: reqwest::Error) -> Self {
-        ClientError::Transport(err.to_string())
-    }
-}
-
-/// Parse byoridb's structured `{error, code}` error body. Falls back to
-/// the raw text if the body isn't valid JSON or is missing fields.
-///
-/// Returns `(code, message)` where `code` is `None` if the server didn't
-/// provide one.
-fn parse_error_response(raw: &str) -> (Option<String>, String) {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(body) => {
-            let code = body
-                .get("code")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let message = body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| raw.to_string());
-            (code, message)
-        }
-        Err(_) => (None, raw.to_string()),
-    }
-}
-
-/// Heuristic: does this server error message indicate the session is gone?
-///
-/// byoridb currently bundles "Session not found" and "Session expired"
-/// under the generic `QUERY_ERROR` code (see `byoridb-graph/src/error.rs`
-/// and `byoridb-graph/src/server.rs`), so we match on the message text.
-fn is_session_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("session not found") || lower.contains("session expired")
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectionConfig {
-    pub host: String,
-    pub port: u32,
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<HashMap<String, serde_json::Value>>,
-    #[serde(rename = "executionTime")]
-    pub execution_time: f64,
-    /// Server-reported row count (see byoridb `QueryResponse.row_count`).
-    /// `None` when the response didn't include it; frontends should fall
-    /// back to `rows.len()` in that case.
-    #[serde(rename = "rowCount", skip_serializing_if = "Option::is_none")]
-    pub row_count: Option<usize>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SpaceInfo {
-    pub name: String,
-    #[serde(rename = "partitionNum")]
-    pub partition_num: u32,
-    #[serde(rename = "replicaFactor")]
-    pub replica_factor: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SchemaInfo {
-    pub tags: Vec<String>,
-    pub edges: Vec<String>,
-}
-
-/// Test connection to server using health endpoint
+/// Test reachability of the server via `GET /health`.
 pub async fn test_connection(host: &str, port: u32) -> Result<bool> {
     let url = format!("http://{}:{}/health", host, port);
     let http_client = reqwest::Client::builder()
@@ -147,14 +26,14 @@ pub async fn test_connection(host: &str, port: u32) -> Result<bool> {
     Ok(resp.status().is_success())
 }
 
-/// ByoriDB client
+/// HTTP-based ByoriDB client.
 pub struct ByoriDBClient {
     config: ConnectionConfig,
     session_id: Option<i64>,
 }
 
 impl ByoriDBClient {
-    /// Connect to ByoriDB server
+    /// Connect to ByoriDB server and authenticate.
     pub async fn connect(config: ConnectionConfig) -> Result<Self, ClientError> {
         info!("Connecting to ByoriDB at {}:{}", config.host, config.port);
 
@@ -163,7 +42,6 @@ impl ByoriDBClient {
             session_id: None,
         };
 
-        // Authenticate via HTTP REST API
         let session_id = client.authenticate().await?;
         client.session_id = Some(session_id);
 
@@ -171,7 +49,7 @@ impl ByoriDBClient {
         Ok(client)
     }
 
-    /// Authenticate with the server using `POST /api/v1/session`.
+    /// Authenticate with `POST /api/v1/session`.
     ///
     /// The byoridb HTTP API returns `session_id` as a JSON number (i64);
     /// see `byoridb-graph/src/server.rs::SessionResponse`.
@@ -204,24 +82,23 @@ impl ByoriDBClient {
         }
     }
 
-    /// Disconnect from the server using `DELETE /api/v1/session/{id}`.
+    /// Disconnect via `DELETE /api/v1/session/{id}`.
     ///
-    /// Errors from the DELETE request are swallowed — disconnect is best-effort
-    /// and the local session is always cleared.
+    /// Errors from the DELETE request are swallowed — disconnect is
+    /// best-effort and the local session is always cleared.
     pub async fn disconnect(self) -> Result<(), ClientError> {
         if let Some(session_id) = self.session_id {
             let url = format!(
                 "http://{}:{}/api/v1/session/{}",
                 self.config.host, self.config.port, session_id
             );
-
             let http_client = reqwest::Client::new();
             let _ = http_client.delete(&url).send().await;
         }
         Ok(())
     }
 
-    /// Execute a query using `POST /api/v1/query`.
+    /// Execute a query via `POST /api/v1/query`.
     ///
     /// `session_id` is sent as a JSON number to match the server's
     /// `QueryRequest.session_id: i64` deserializer. If the server indicates
@@ -256,8 +133,6 @@ impl ByoriDBClient {
             let (_code, message) = parse_error_response(&raw);
 
             if is_session_error(&message) {
-                // Server-side session is gone; drop local id so we don't keep
-                // retrying with a dead id.
                 self.session_id = None;
                 Err(ClientError::SessionExpired)
             } else {
@@ -266,29 +141,62 @@ impl ByoriDBClient {
         }
     }
 
-    /// Get list of spaces
+    /// Execute `SHOW SPACES` and parse the result.
     pub async fn get_spaces(&mut self) -> Result<Vec<SpaceInfo>, ClientError> {
         let result = self.execute("SHOW SPACES").await?;
         Ok(parse_spaces(&result))
     }
 
-    /// Get schema (tags and edges) for current space
+    /// Execute `SHOW TAGS` + `SHOW EDGES` and return the combined schema.
     pub async fn get_schema(&mut self) -> Result<SchemaInfo, ClientError> {
         let tags_result = self.execute("SHOW TAGS").await?;
         let edges_result = self.execute("SHOW EDGES").await?;
-
-        let tags = parse_names(&tags_result);
-        let edges = parse_names(&edges_result);
-
-        Ok(SchemaInfo { tags, edges })
+        Ok(SchemaInfo {
+            tags: parse_names(&tags_result),
+            edges: parse_names(&edges_result),
+        })
     }
+}
+
+// ── JSON response parsers ─────────────────────────────────────────────────────
+
+/// Parse byoridb's structured `{error, code}` error body, falling back to
+/// the raw text when the body isn't valid JSON or is missing fields.
+///
+/// Returns `(code, message)` where `code` is `None` if the server didn't
+/// provide one.
+fn parse_error_response(raw: &str) -> (Option<String>, String) {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(body) => {
+            let code = body
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let message = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| raw.to_string());
+            (code, message)
+        }
+        Err(_) => (None, raw.to_string()),
+    }
+}
+
+/// Heuristic: does this server error message indicate the session is gone?
+///
+/// byoridb currently bundles "Session not found" and "Session expired"
+/// under the generic `QUERY_ERROR` code (see `byoridb-graph/src/error.rs`
+/// and `byoridb-graph/src/server.rs`), so we match on the message text.
+fn is_session_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("session not found") || lower.contains("session expired")
 }
 
 /// Extract `session_id` from a `POST /api/v1/session` response body.
 ///
 /// The byoridb server always returns `session_id` as a JSON number (i64);
-/// any other shape is a protocol violation and should fail loudly rather
-/// than be silently coerced.
+/// any other shape is a protocol violation.
 fn parse_session_id(body: &serde_json::Value) -> Result<i64> {
     body["session_id"].as_i64().ok_or_else(|| {
         anyhow!(
@@ -326,10 +234,7 @@ fn parse_query_response(body: &serde_json::Value) -> QueryResult {
         .unwrap_or_default();
 
     let execution_time = body["latency_ms"].as_f64().unwrap_or(0.0);
-
-    let row_count = body["row_count"]
-        .as_u64()
-        .map(|n| n as usize);
+    let row_count = body["row_count"].as_u64().map(|n| n as usize);
 
     QueryResult {
         columns,
@@ -352,8 +257,7 @@ fn parse_names(result: &QueryResult) -> Vec<String> {
 ///
 /// The byoridb server returns columns `["Name", "Replica Factor", "Partition Num"]`
 /// (see `byoridb-executor/src/executor.rs` `ShowPlan::Spaces`). Missing
-/// numeric columns default to `0` — the sidebar still renders sensibly and
-/// flags the space as "not yet described".
+/// numeric columns default to `0`.
 fn parse_spaces(result: &QueryResult) -> Vec<SpaceInfo> {
     result
         .rows
@@ -382,6 +286,7 @@ fn parse_spaces(result: &QueryResult) -> Vec<SpaceInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use serde_json::json;
 
     #[test]
@@ -464,7 +369,6 @@ mod tests {
 
     #[test]
     fn parse_spaces_defaults_missing_numeric_columns_to_zero() {
-        // Forward-compat: older/partial server responses that only include Name.
         let result = QueryResult {
             columns: vec!["Name".to_string()],
             rows: vec![HashMap::from([("Name".to_string(), json!("demo"))])],

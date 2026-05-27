@@ -1,8 +1,16 @@
-import { useState } from "react";
-import ServerSettings, { ConnectionConfig } from "./ServerSettings";
-import { useSchemaData, type DescribeKey, type DescribeState } from "../hooks/useSchemaData";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import ServerSettings from "./ServerSettings";
+import HistoryPanel from "./HistoryPanel";
+import SchemaManager from "./SchemaManager";
+import DataManager from "./DataManager";
+import MonitorPanel from "./MonitorPanel";
+import { schemaContext } from "../lib/ngql-language";
+import { useTranslation } from "../hooks/useTranslation";
+import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
+import "../styles/Sidebar.css";
 
-type TabType = "schema" | "settings";
+type TabType = "schema" | "manage" | "data" | "monitor" | "history" | "settings";
 
 interface SidebarProps {
   isConnected: boolean;
@@ -10,73 +18,216 @@ interface SidebarProps {
   onSelectSpace: (spaceName: string) => void;
   onExecuteQuery: (query: string) => void;
   onConnect: (config: ConnectionConfig) => void;
+  historyEntries: HistoryEntry[];
+  onToggleFavorite: (id: string) => void;
+  onClearHistory: () => void;
+  connectionHost?: string;
+  connectionPort?: number;
+  lastQueryTime?: number;
+  lastRowCount?: number;
 }
 
-function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onConnect }: SidebarProps) {
+/**
+ * Field row shape returned by `DESCRIBE TAG` / `DESCRIBE EDGE` (byoridb
+ * `byoridb-executor/src/executor.rs::schema_fields_to_result`).
+ *
+ * `Default` is JSON null when the field has no default.
+ */
+interface DescribeRow {
+  Field: string;
+  Type: string;
+  Null: string;
+  Default: unknown;
+}
+
+type DescribeState =
+  | { status: "loading" }
+  | { status: "ready"; rows: DescribeRow[] }
+  | { status: "error"; message: string };
+
+type DescribeKey = `tag:${string}` | `edge:${string}`;
+
+function Sidebar({
+  isConnected,
+  currentSpace,
+  onSelectSpace,
+  onExecuteQuery,
+  onConnect,
+  historyEntries,
+  onToggleFavorite,
+  onClearHistory,
+  connectionHost = "",
+  connectionPort = 19669,
+  lastQueryTime,
+  lastRowCount,
+}: SidebarProps) {
   const [activeTab, setActiveTab] = useState<TabType>("schema");
+  const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
+  const [schema, setSchema] = useState<SchemaInfo>({ tags: [], edges: [] });
+  const [spacesError, setSpacesError] = useState("");
+  const [schemaError, setSchemaError] = useState("");
+  const { t } = useTranslation();
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     spaces: true,
     tags: true,
     edges: true,
   });
+  const [expandedItems, setExpandedItems] = useState<Set<DescribeKey>>(new Set());
+  const [describeCache, setDescribeCache] = useState<Record<DescribeKey, DescribeState>>(
+    {} as Record<DescribeKey, DescribeState>,
+  );
 
-  const { spaces, schema, expandedItems, describeCache, loadSpaces, refreshSchema, toggleDescribe } =
-    useSchemaData({ isConnected, currentSpace });
+  useEffect(() => {
+    if (isConnected) {
+      loadSpaces();
+    }
+  }, [isConnected]);
+
+  useEffect(() => {
+    if (currentSpace) {
+      loadSchema();
+    }
+  }, [currentSpace]);
+
+  // Reset per-space caches when switching spaces — different spaces have different
+  // schemas, so a `player` tag in space A is not the same object as one in space B.
+  useEffect(() => {
+    setExpandedItems(new Set());
+    setDescribeCache({} as Record<DescribeKey, DescribeState>);
+  }, [currentSpace]);
+
+  const loadSpaces = async () => {
+    try {
+      const result = await invoke<SpaceInfo[]>("get_spaces");
+      setSpaces(result);
+      setSpacesError("");
+      schemaContext.spaces = result.map((s) => s.name);
+    } catch (error) {
+      const msg =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+      setSpacesError(msg);
+    }
+  };
+
+  const loadSchema = async () => {
+    try {
+      const result = await invoke<SchemaInfo>("get_schema");
+      setSchema(result);
+      setSchemaError("");
+      schemaContext.tags = result.tags;
+      schemaContext.edges = result.edges;
+      setSchema(result);
+    } catch (error) {
+      const msg =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+      setSchemaError(msg);
+    }
+  };
+
+  const describe = async (kind: "tag" | "edge", name: string) => {
+    const key: DescribeKey = `${kind}:${name}`;
+    setDescribeCache((prev) => ({ ...prev, [key]: { status: "loading" } }));
+
+    const statement = kind === "tag" ? `DESCRIBE TAG ${name}` : `DESCRIBE EDGE ${name}`;
+    try {
+      const result = await invoke<QueryResult>("execute_query", { query: statement });
+      if (result.error) {
+        setDescribeCache((prev) => ({
+          ...prev,
+          [key]: { status: "error", message: result.error! },
+        }));
+        return;
+      }
+      setDescribeCache((prev) => ({
+        ...prev,
+        [key]: { status: "ready", rows: result.rows as unknown as DescribeRow[] },
+      }));
+    } catch (error) {
+      const message =
+        error && typeof error === "object" && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+      setDescribeCache((prev) => ({
+        ...prev,
+        [key]: { status: "error", message },
+      }));
+    }
+  };
+
+  const toggleDescribe = (kind: "tag" | "edge", name: string) => {
+    const key: DescribeKey = `${kind}:${name}`;
+    const nextExpanded = new Set(expandedItems);
+    if (nextExpanded.has(key)) {
+      nextExpanded.delete(key);
+    } else {
+      nextExpanded.add(key);
+      if (!describeCache[key]) {
+        describe(kind, name);
+      }
+    }
+    setExpandedItems(nextExpanded);
+  };
+
+  const refreshSchema = () => {
+    // Invalidate describe cache too: refreshing implies the user wants fresh data.
+    setDescribeCache({} as Record<DescribeKey, DescribeState>);
+    setExpandedItems(new Set());
+    loadSchema();
+  };
 
   const toggleSection = (section: string) => {
-    setExpandedSections((prev) => ({ ...prev, [section]: !prev[section] }));
+    setExpandedSections((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  };
+
+  const handleTagClick = (tagName: string) => {
+    onExecuteQuery(`MATCH (v:${tagName}) RETURN v LIMIT 100`);
+  };
+
+  const handleEdgeClick = (edgeName: string) => {
+    // byoridb requires the start node to have a variable (see
+    // byoridb-executor/src/match.rs). End node can stay anonymous.
+    onExecuteQuery(`MATCH (s)-[e:${edgeName}]->() RETURN e LIMIT 100`);
   };
 
   const renderDescribePanel = (kind: "tag" | "edge", name: string) => {
     const key: DescribeKey = `${kind}:${name}`;
-    const state: DescribeState | undefined = describeCache[key];
+    const state = describeCache[key];
 
     if (!state || state.status === "loading") {
-      return (
-        <div className="mx-4 mb-2 ml-[42px] p-2 bg-crust rounded text-[11px] text-overlay italic">
-          Loading schema…
-        </div>
-      );
+      return <div className="describe-panel loading">Loading schema…</div>;
     }
     if (state.status === "error") {
-      return (
-        <div className="mx-4 mb-2 ml-[42px] p-2 bg-red/8 rounded text-[11px] text-red">
-          Error: {state.message}
-        </div>
-      );
+      return <div className="describe-panel error">Error: {state.message}</div>;
     }
     if (state.rows.length === 0) {
-      return (
-        <div className="mx-4 mb-2 ml-[42px] p-2 bg-crust rounded text-[11px] text-overlay italic">
-          No properties.
-        </div>
-      );
+      return <div className="describe-panel empty">No properties.</div>;
     }
 
     return (
-      <div className="mx-4 mb-2 ml-[42px] p-2 bg-crust rounded text-[11px] text-subtext">
-        <table className="w-full border-collapse tabular-nums">
+      <div className="describe-panel">
+        <table className="describe-table">
           <thead>
             <tr>
-              {["Field", "Type", "Null", "Default"].map((h) => (
-                <th
-                  key={h}
-                  className="text-left px-1.5 py-0.5 border-b border-surface1 text-[10px] font-semibold uppercase tracking-[0.4px] text-overlay"
-                >
-                  {h}
-                </th>
-              ))}
+              <th>Field</th>
+              <th>Type</th>
+              <th>Null</th>
+              <th>Default</th>
             </tr>
           </thead>
           <tbody>
             {state.rows.map((row, i) => (
               <tr key={`${row.Field}-${i}`}>
-                <td className="px-1.5 py-0.5 border-b border-surface1 last:border-b-0">{row.Field}</td>
-                <td className="px-1.5 py-0.5 border-b border-surface1 last:border-b-0">{row.Type}</td>
-                <td className="px-1.5 py-0.5 border-b border-surface1 last:border-b-0">{row.Null}</td>
-                <td className="px-1.5 py-0.5 border-b border-surface1 last:border-b-0">
-                  {row.Default === null ? "—" : String(row.Default)}
-                </td>
+                <td>{row.Field}</td>
+                <td>{row.Type}</td>
+                <td>{row.Null}</td>
+                <td>{row.Default === null ? "—" : String(row.Default)}</td>
               </tr>
             ))}
           </tbody>
@@ -88,16 +239,13 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
   const renderSchemaItem = (kind: "tag" | "edge", name: string, icon: string) => {
     const key: DescribeKey = `${kind}:${name}`;
     const isOpen = expandedItems.has(key);
-    const onNameClick =
-      kind === "tag"
-        ? () => onExecuteQuery(`MATCH (v:${name}) RETURN v LIMIT 100`)
-        : () => onExecuteQuery(`MATCH ()-[e:${name}]->() RETURN e LIMIT 100`);
+    const onNameClick = kind === "tag" ? () => handleTagClick(name) : () => handleEdgeClick(name);
 
     return (
-      <div key={name}>
-        <div className="flex items-center gap-2 px-4 py-2 pl-6 cursor-pointer hover:bg-surface1 transition-colors duration-200">
+      <div key={name} className="schema-item">
+        <div className="tree-item">
           <button
-            className={`w-[14px] h-[14px] p-0 text-[9px] leading-none bg-transparent text-overlay border-none rounded-sm cursor-pointer transition-transform duration-150 hover:text-text ${isOpen ? "rotate-90" : ""}`}
+            className={`expand-btn ${isOpen ? "expanded" : ""}`}
             onClick={(e) => {
               e.stopPropagation();
               toggleDescribe(kind, name);
@@ -107,8 +255,8 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
           >
             ▶
           </button>
-          <span className="text-sm">{icon}</span>
-          <span className="flex-1 text-[13px] text-text truncate" onClick={onNameClick}>
+          <span className="icon">{icon}</span>
+          <span className="name" onClick={onNameClick}>
             {name}
           </span>
         </div>
@@ -117,62 +265,41 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
     );
   };
 
-  const sectionHeader = (
-    label: string,
-    sectionKey: string,
-    onRefresh?: () => void,
-  ) => (
-    <div
-      className="flex items-center gap-2 px-4 py-3 cursor-pointer select-none hover:bg-surface1 transition-colors duration-200"
-      onClick={() => toggleSection(sectionKey)}
-    >
-      <span
-        className={`text-[10px] text-overlay transition-transform duration-200 ${
-          expandedSections[sectionKey] ? "rotate-90" : ""
-        }`}
-      >
-        ▶
-      </span>
-      <span className="flex-1 text-xs font-semibold uppercase tracking-[0.5px] text-subtext">
-        {label}
-      </span>
-      {onRefresh && (
-        <button
-          className="p-0 px-1.5 text-sm bg-transparent text-overlay rounded hover:bg-surface1 hover:text-text"
-          onClick={(e) => {
-            e.stopPropagation();
-            onRefresh();
-          }}
-          title="Refresh"
-        >
-          ↻
-        </button>
-      )}
-    </div>
-  );
-
   const renderSchemaContent = () => (
     <>
-      <div className="border-b border-surface1">
-        {sectionHeader("Spaces", "spaces", loadSpaces)}
+      <div className="sidebar-section">
+        <div className="section-header" onClick={() => toggleSection("spaces")}>
+          <span className={`arrow ${expandedSections.spaces ? "expanded" : ""}`}>▶</span>
+          <span className="section-title">{t("schema.spaces")}</span>
+          <button
+            className="refresh-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              loadSpaces();
+            }}
+            title="Refresh"
+          >
+            ↻
+          </button>
+        </div>
         {expandedSections.spaces && (
-          <div className="py-1">
-            {spaces.length === 0 ? (
-              <div className="px-6 py-3 text-xs text-overlay italic">No spaces found</div>
+          <div className="section-content">
+            {spacesError ? (
+              <div className="error-message" title={spacesError}>
+                ⚠ {spacesError}
+              </div>
+            ) : spaces.length === 0 ? (
+              <div className="empty-message">{t("schema.noSpaces")}</div>
             ) : (
               spaces.map((space) => (
                 <div
                   key={space.name}
-                  className={`flex items-center gap-2 px-4 py-2 pl-6 cursor-pointer transition-colors duration-200 ${
-                    currentSpace === space.name ? "bg-surface2" : "hover:bg-surface1"
-                  }`}
+                  className={`tree-item ${currentSpace === space.name ? "selected" : ""}`}
                   onClick={() => onSelectSpace(space.name)}
                 >
-                  <span className="text-sm">📦</span>
-                  <span className="flex-1 text-[13px] text-text truncate">{space.name}</span>
-                  <span className="text-[11px] text-overlay px-1.5 py-0.5 bg-crust rounded">
-                    P:{space.partitionNum}
-                  </span>
+                  <span className="icon">📦</span>
+                  <span className="name">{space.name}</span>
+                  <span className="info">P:{space.partitionNum}</span>
                 </div>
               ))
             )}
@@ -182,12 +309,29 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
 
       {currentSpace && (
         <>
-          <div className="border-b border-surface1">
-            {sectionHeader("Tags", "tags", refreshSchema)}
+          <div className="sidebar-section">
+            <div className="section-header" onClick={() => toggleSection("tags")}>
+              <span className={`arrow ${expandedSections.tags ? "expanded" : ""}`}>▶</span>
+              <span className="section-title">{t("schema.tags")}</span>
+              <button
+                className="refresh-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  refreshSchema();
+                }}
+                title="Refresh"
+              >
+                ↻
+              </button>
+            </div>
             {expandedSections.tags && (
-              <div className="py-1">
-                {schema.tags.length === 0 ? (
-                  <div className="px-6 py-3 text-xs text-overlay italic">No tags found</div>
+              <div className="section-content">
+                {schemaError ? (
+                  <div className="error-message" title={schemaError}>
+                    ⚠ {schemaError}
+                  </div>
+                ) : schema.tags.length === 0 ? (
+                  <div className="empty-message">{t("schema.noTags")}</div>
                 ) : (
                   schema.tags.map((tag) => renderSchemaItem("tag", tag, "🏷️"))
                 )}
@@ -195,12 +339,15 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
             )}
           </div>
 
-          <div className="border-b border-surface1">
-            {sectionHeader("Edges", "edges")}
+          <div className="sidebar-section">
+            <div className="section-header" onClick={() => toggleSection("edges")}>
+              <span className={`arrow ${expandedSections.edges ? "expanded" : ""}`}>▶</span>
+              <span className="section-title">{t("schema.edges")}</span>
+            </div>
             {expandedSections.edges && (
-              <div className="py-1">
+              <div className="section-content">
                 {schema.edges.length === 0 ? (
-                  <div className="px-6 py-3 text-xs text-overlay italic">No edges found</div>
+                  <div className="empty-message">{t("schema.noEdges")}</div>
                 ) : (
                   schema.edges.map((edge) => renderSchemaItem("edge", edge, "↔️"))
                 )}
@@ -213,25 +360,85 @@ function Sidebar({ isConnected, currentSpace, onSelectSpace, onExecuteQuery, onC
   );
 
   return (
-    <div className="w-[250px] min-w-[250px] bg-mantle border-r border-surface1 flex flex-col">
-      <div className="flex border-b border-surface1 shrink-0">
-        {(["schema", "settings"] as const).map((tab) => (
-          <button
-            key={tab}
-            className={`flex-1 py-3 px-4 text-xs font-semibold uppercase tracking-[0.5px] bg-transparent border-none border-b-2 cursor-pointer transition-all duration-200 ${
-              activeTab === tab
-                ? "text-blue border-b-blue"
-                : "text-overlay border-b-transparent hover:text-subtext hover:bg-surface1"
-            }`}
-            onClick={() => setActiveTab(tab)}
-          >
-            {tab.charAt(0).toUpperCase() + tab.slice(1)}
-          </button>
-        ))}
+    <div className="sidebar">
+      <div className="sidebar-tabs">
+        <button
+          className={`sidebar-tab ${activeTab === "schema" ? "active" : ""}`}
+          onClick={() => setActiveTab("schema")}
+        >
+          {t("sidebar.schema")}
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "manage" ? "active" : ""}`}
+          onClick={() => setActiveTab("manage")}
+        >
+          {t("sidebar.manage")}
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "data" ? "active" : ""}`}
+          onClick={() => setActiveTab("data")}
+        >
+          {t("sidebar.data")}
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "monitor" ? "active" : ""}`}
+          onClick={() => setActiveTab("monitor")}
+        >
+          {t("sidebar.monitor")}
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "history" ? "active" : ""}`}
+          onClick={() => setActiveTab("history")}
+        >
+          {t("sidebar.history")}
+        </button>
+        <button
+          className={`sidebar-tab ${activeTab === "settings" ? "active" : ""}`}
+          onClick={() => setActiveTab("settings")}
+        >
+          {t("sidebar.settings")}
+        </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
-        {activeTab === "schema" ? renderSchemaContent() : <ServerSettings onConnect={onConnect} />}
+      <div className="sidebar-content">
+        {activeTab === "schema" && renderSchemaContent()}
+        {activeTab === "manage" && (
+          <SchemaManager
+            spaces={spaces}
+            currentSpace={currentSpace}
+            schema={schema}
+            onRefresh={() => {
+              loadSpaces();
+              if (currentSpace) loadSchema();
+            }}
+            onSelectSpace={onSelectSpace}
+          />
+        )}
+        {activeTab === "data" && (
+          <DataManager
+            currentSpace={currentSpace}
+            schema={schema}
+            onExecuteQuery={onExecuteQuery}
+          />
+        )}
+        {activeTab === "monitor" && (
+          <MonitorPanel
+            isConnected={isConnected}
+            connectionHost={connectionHost}
+            connectionPort={connectionPort}
+            lastQueryTime={lastQueryTime}
+            lastRowCount={lastRowCount}
+          />
+        )}
+        {activeTab === "history" && (
+          <HistoryPanel
+            entries={historyEntries}
+            onSelect={onExecuteQuery}
+            onToggleFavorite={onToggleFavorite}
+            onClear={onClearHistory}
+          />
+        )}
+        {activeTab === "settings" && <ServerSettings onConnect={onConnect} />}
       </div>
     </div>
   );

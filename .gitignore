@@ -27,6 +27,3 @@ npm-debug.log*
 
 # Tauri
 src-tauri/WixTools/
-src-tauri/icons/*.png
-src-tauri/icons/*.ico
-src-tauri/icons/*.icns

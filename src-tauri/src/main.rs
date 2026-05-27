@@ -11,10 +11,13 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 struct AppState {
     client: Arc<Mutex<Option<ByoriDBClient>>>,
+    /// Replaced each time a query starts; cancelled when the user requests abort.
+    query_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 /// Structured error returned to the frontend from every Tauri command.
@@ -85,15 +88,24 @@ async fn execute_query(
 ) -> Result<QueryResult, TauriError> {
     info!("Executing query: {}", query);
 
+    // Create a fresh cancellation token for this query
+    let token = CancellationToken::new();
+    {
+        let mut cancel_guard = state.query_cancel.lock().await;
+        *cancel_guard = Some(token.clone());
+    }
+
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
-    let result = client.execute(&query).await;
+    // Race the query against the cancellation token
+    let result = tokio::select! {
+        r = client.execute(&query) => r,
+        _ = token.cancelled() => Err(ClientError::Query("Query cancelled by user".to_string())),
+    };
 
-    // If the server told us the session is gone, drop our local ByoriDBClient too
-    // so the UI connection state matches server state.
     if matches!(result, Err(ClientError::SessionExpired)) {
         *guard = None;
     }
@@ -102,11 +114,20 @@ async fn execute_query(
 }
 
 #[tauri::command]
+async fn cancel_query(state: State<'_, AppState>) -> Result<(), TauriError> {
+    let mut cancel_guard = state.query_cancel.lock().await;
+    if let Some(token) = cancel_guard.take() {
+        token.cancel();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriError> {
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
     let result = client.get_spaces().await;
 
@@ -120,9 +141,9 @@ async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriE
 #[tauri::command]
 async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError> {
     let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
 
     let result = client.get_schema().await;
 
@@ -136,7 +157,51 @@ async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError
 #[tauri::command]
 async fn test_connection(host: String, port: u32) -> Result<bool, TauriError> {
     info!("Testing connection to {}:{}", host, port);
-    client_test_connection(&host, port).await.map_err(Into::into)
+    client_test_connection(&host, port)
+        .await
+        .map_err(Into::into)
+}
+
+/// Execute a DDL/DML statement that returns no rows (CREATE, DROP, ALTER, etc.)
+#[tauri::command]
+async fn execute_statement(
+    statement: String,
+    state: State<'_, AppState>,
+) -> Result<(), TauriError> {
+    info!("Executing statement: {}", statement);
+    let mut guard = state.client.lock().await;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
+    let result = client.execute(&statement).await;
+    if matches!(result, Err(ClientError::SessionExpired)) {
+        *guard = None;
+    }
+    result?;
+    Ok(())
+}
+
+/// Get index list for a tag or edge: SHOW TAG/EDGE INDEXES
+#[tauri::command]
+async fn get_indexes(
+    kind: String, // "tag" or "edge"
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<QueryResult, TauriError> {
+    let query = if kind == "tag" {
+        format!("SHOW TAG INDEXES ON {}", name)
+    } else {
+        format!("SHOW EDGE INDEXES ON {}", name)
+    };
+    let mut guard = state.client.lock().await;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
+    let result = client.execute(&query).await;
+    if matches!(result, Err(ClientError::SessionExpired)) {
+        *guard = None;
+    }
+    Ok(result?)
 }
 
 fn main() {
@@ -151,14 +216,18 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
+            query_cancel: Arc::new(Mutex::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
             connect,
             disconnect,
             execute_query,
+            cancel_query,
             get_spaces,
             get_schema,
             test_connection,
+            execute_statement,
+            get_indexes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

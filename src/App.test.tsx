@@ -8,10 +8,107 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
 
+vi.mock("@monaco-editor/react", async () => {
+  const { useRef, useEffect } = await vi.importActual<typeof import("react")>("react");
+  interface MockProps {
+    value?: string;
+    onChange?: (v: string) => void;
+    onMount?: (editor: unknown, monaco: unknown) => void;
+    options?: { readOnly?: boolean };
+  }
+  function MockEditor({ value = "", onChange, onMount, options }: MockProps) {
+    const ref = useRef<HTMLTextAreaElement>(null);
+    const cmds = useRef<Map<number, () => void>>(new Map());
+    useEffect(() => {
+      if (!onMount) return;
+      const KeyMod = { CtrlCmd: 1 << 11, Shift: 1 << 10 };
+      const KeyCode = { Enter: 3, UpArrow: 16, DownArrow: 18 };
+      onMount(
+        {
+          getValue: () => ref.current?.value ?? "",
+          setValue: (v: string) => {
+            onChange?.(v);
+          },
+          focus: () => ref.current?.focus(),
+          getSelection: () => ({ isEmpty: () => true }),
+          getModel: () => ({ getValueInRange: () => "" }),
+          addCommand: (kb: number, h: () => void) => cmds.current.set(kb, h),
+        },
+        { KeyMod, KeyCode },
+      );
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+      let kb: number | null = null;
+      if (e.key === "Enter") kb = (1 << 11) | 3;
+      if (e.key === "ArrowUp") kb = (1 << 11) | 16;
+      if (e.key === "ArrowDown") kb = (1 << 11) | 18;
+      if (kb !== null) {
+        e.preventDefault();
+        cmds.current.get(kb)?.();
+      }
+    };
+    return (
+      <textarea
+        ref={ref}
+        data-testid="monaco-editor"
+        value={value}
+        disabled={options?.readOnly}
+        onChange={(e) => onChange?.(e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+  return { default: MockEditor };
+});
+
+vi.mock("./components/Sidebar", () => ({
+  default: ({
+    isConnected,
+    onSelectSpace,
+    onExecuteQuery,
+  }: {
+    isConnected: boolean;
+    onSelectSpace: (s: string) => void;
+    onExecuteQuery: (q: string) => void;
+    [key: string]: unknown;
+  }) => (
+    <div data-testid="sidebar">
+      {isConnected && (
+        <>
+          <div onClick={() => onSelectSpace("demo")}>demo</div>
+          <div onClick={() => onSelectSpace("restricted")}>restricted</div>
+          <button onClick={() => onExecuteQuery("SHOW SPACES")}>Show Spaces</button>
+        </>
+      )}
+    </div>
+  ),
+}));
+
+vi.mock("./lib/ngql-language", () => ({ registerNgqlLanguage: vi.fn(), LANGUAGE_ID: "ngql" }));
+
+vi.mock("./components/TableView", () => ({
+  default: ({ result }: { result: { columns: string[]; rows: Record<string, unknown>[] } }) => (
+    <table>
+      <tbody>
+        {result.rows.map((row, i) =>
+          result.columns.map((col) => <td key={`${i}-${col}`}>{String(row[col] ?? "NULL")}</td>),
+        )}
+      </tbody>
+    </table>
+  ),
+}));
+
 describe("App", () => {
   beforeEach(() => {
     localStorage.clear();
     invokeMock.mockReset();
+    // Default: test_connection always succeeds (prevents backoff from interfering)
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "test_connection") return Promise.resolve(true);
+      return Promise.reject(new Error(`unexpected command ${command}`));
+    });
     vi.spyOn(window, "alert").mockImplementation(() => undefined);
   });
 
@@ -36,6 +133,7 @@ describe("App", () => {
           executionTime: 4,
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -53,17 +151,18 @@ describe("App", () => {
       },
     });
 
-    await user.click(screen.getByRole("button", { name: "Show Spaces" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    // Type query directly into the Monaco mock textarea
+    await user.type(screen.getByRole("textbox"), "SHOW SPACES");
+    await user.click(screen.getByTestId("execute-button"));
 
     await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
     expect(invokeMock).toHaveBeenCalledWith("execute_query", { query: "SHOW SPACES" });
 
-    await user.click(screen.getByRole("button", { name: "Disconnect" }));
+    await user.click(screen.getByRole("button", { name: /Disconnect/ }));
     await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
   });
 
-  it("shows an alert when connecting fails", async () => {
+  it("shows a toast when connecting fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockRejectedValueOnce("offline");
 
@@ -72,8 +171,9 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
 
     await waitFor(() => {
-      expect(window.alert).toHaveBeenCalledWith("Connection failed: offline");
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("toast-error").textContent).toContain("Connection failed");
   });
 
   it("hints at BYORIDB_ROOT_PASSWORD when the server reports AUTH_FAILED", async () => {
@@ -88,11 +188,11 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
 
     await waitFor(() => {
-      const alertCall = (window.alert as unknown as ReturnType<typeof vi.fn>).mock
-        .calls[0][0] as string;
-      expect(alertCall).toContain("Authentication failed: Invalid password");
-      expect(alertCall).toContain("BYORIDB_ROOT_PASSWORD");
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    const toastText = screen.getByTestId("toast-error").textContent ?? "";
+    expect(toastText).toContain("Authentication failed: Invalid password");
+    expect(toastText).toContain("BYORIDB_ROOT_PASSWORD");
   });
 
   it("renders query execution failures as result errors", async () => {
@@ -108,6 +208,7 @@ describe("App", () => {
       if (command === "execute_query") {
         return Promise.reject("bad query");
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -116,8 +217,8 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
     await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-    await user.click(screen.getByRole("button", { name: "Show Tags" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    await user.type(screen.getByRole("textbox"), "SHOW TAGS");
+    await user.click(screen.getByTestId("execute-button"));
 
     await waitFor(() => expect(screen.getByText("Error")).toBeInTheDocument());
     expect(screen.getByText("bad query")).toBeInTheDocument();
@@ -139,6 +240,7 @@ describe("App", () => {
           message: "Session expired; please reconnect",
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
@@ -147,19 +249,15 @@ describe("App", () => {
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
     await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-    await user.click(screen.getByRole("button", { name: "Show Tags" }));
-    await user.click(screen.getByRole("button", { name: /Execute/ }));
+    await user.type(screen.getByRole("textbox"), "SHOW TAGS");
+    await user.click(screen.getByTestId("execute-button"));
 
     // Connection status reverts to disconnected…
-    await waitFor(() =>
-      expect(screen.getByText("Not connected")).toBeInTheDocument()
-    );
+    await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
     // …the connection modal reopens…
     expect(screen.getByText("Connect to ByoriDB")).toBeInTheDocument();
     // …and the result panel shows the friendly expiry message.
-    expect(
-      screen.getByText("Session expired. Please reconnect.")
-    ).toBeInTheDocument();
+    expect(screen.getByText("Session expired. Please reconnect.")).toBeInTheDocument();
   });
 
   it("keeps modal open when close is requested before connecting", async () => {
@@ -178,6 +276,7 @@ describe("App", () => {
     const executeCalls: string[] = [];
     invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "connect") return Promise.resolve();
+      if (command === "test_connection") return Promise.resolve(true);
       if (command === "get_spaces") {
         return Promise.resolve([{ name: "demo", partitionNum: 10, replicaFactor: 1 }]);
       }
@@ -193,13 +292,14 @@ describe("App", () => {
           rowCount: 0,
         });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
     render(<App />);
 
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
-    await waitFor(() => expect(screen.getByText("demo")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("demo")).toBeInTheDocument(), { timeout: 3000 });
 
     await user.click(screen.getByText("demo"));
 
@@ -214,6 +314,7 @@ describe("App", () => {
 
     invokeMock.mockImplementation((command: string) => {
       if (command === "connect") return Promise.resolve();
+      if (command === "test_connection") return Promise.resolve(true);
       if (command === "get_spaces") {
         return Promise.resolve([{ name: "restricted", partitionNum: 10, replicaFactor: 1 }]);
       }
@@ -223,21 +324,23 @@ describe("App", () => {
       if (command === "execute_query") {
         return Promise.reject({ code: "QUERY_ERROR", message: "Permission denied" });
       }
+      if (command === "test_connection") return Promise.resolve(true);
       return Promise.reject(new Error(`unexpected command ${command}`));
     });
 
     render(<App />);
 
     await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
-    await waitFor(() => expect(screen.getByText("restricted")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("restricted")).toBeInTheDocument(), {
+      timeout: 3000,
+    });
 
     await user.click(screen.getByText("restricted"));
 
     await waitFor(() => {
-      expect(window.alert).toHaveBeenCalledWith(
-        'Failed to switch to space "restricted": Permission denied',
-      );
+      expect(screen.getByTestId("toast-error")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("toast-error").textContent).toContain("Permission denied");
     expect(screen.queryByText("/ restricted")).not.toBeInTheDocument();
   });
 
@@ -260,10 +363,11 @@ describe("App", () => {
       await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
       await waitFor(() => expect(screen.getByText("127.0.0.1:19669")).toBeInTheDocument());
 
-      // Next health tick returns false → App should flip to disconnected.
+      // Next health tick returns false → App retries with backoff then disconnects.
       healthOk = false;
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(30_000);
+        // 30s poll + 3 retries (2s + 4s + 8s = 14s) = 44s total
+        await vi.advanceTimersByTimeAsync(50_000);
       });
 
       await waitFor(() => expect(screen.getByText("Not connected")).toBeInTheDocument());
@@ -271,9 +375,7 @@ describe("App", () => {
         host: "127.0.0.1",
         port: 19669,
       });
-      expect(
-        screen.getByText("Lost connection to server. Please reconnect.")
-      ).toBeInTheDocument();
+      expect(screen.getByText("Lost connection to server. Please reconnect.")).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }

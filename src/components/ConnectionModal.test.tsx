@@ -55,7 +55,7 @@ describe("ConnectionModal", () => {
       host: "10.0.0.5",
       port: 19700,
       username: "admin",
-      password: "secret",
+      password: "", // password is not persisted in saved profiles
     });
   });
 
@@ -83,8 +83,8 @@ describe("ConnectionModal", () => {
     await user.type(screen.getByPlaceholderText("19669"), "abc");
     await user.clear(screen.getByPlaceholderText("root"));
     await user.type(screen.getByPlaceholderText("root"), "tester");
-    await user.clear(screen.getByPlaceholderText("Enter password"));
-    await user.type(screen.getByPlaceholderText("Enter password"), "pw");
+    await user.clear(screen.getByPlaceholderText("Enter password (not saved)"));
+    await user.type(screen.getByPlaceholderText("Enter password (not saved)"), "pw");
     await user.click(screen.getByRole("button", { name: "Connect" }));
 
     expect(onConnect).toHaveBeenCalledWith({

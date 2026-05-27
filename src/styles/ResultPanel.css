@@ -1,0 +1,332 @@
+.result-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.result-panel.empty {
+  justify-content: center;
+  align-items: center;
+}
+
+.result-panel.error .error-content {
+  flex: 1;
+  padding: 16px;
+  overflow: auto;
+}
+
+.result-panel.error pre {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 13px;
+  color: var(--accent-error);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-muted);
+}
+
+.empty-icon {
+  font-size: 48px;
+  opacity: 0.5;
+}
+
+.empty-text {
+  font-size: 14px;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.json-search-input {
+  padding: 3px 8px;
+  font-size: 12px;
+  width: 140px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+}
+
+.json-search-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.export-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.export-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.result-info {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.result-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.result-count {
+  font-size: 12px;
+  color: var(--accent-success);
+}
+
+.result-time {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.view-modes {
+  display: flex;
+  gap: 4px;
+}
+
+.view-mode-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+}
+
+.view-mode-btn:hover {
+  color: var(--text-primary);
+}
+
+.view-mode-btn.active {
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-radius: 4px;
+}
+
+.result-content {
+  flex: 1;
+  overflow: auto;
+}
+
+.table-container {
+  overflow: auto;
+  height: 100%;
+}
+
+.result-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.result-table th,
+.result-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
+.result-table th {
+  background: var(--bg-secondary);
+  font-weight: 600;
+  color: var(--text-secondary);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  user-select: none;
+}
+
+.sortable-col {
+  cursor: pointer;
+}
+
+.sortable-col:hover {
+  color: var(--text-primary);
+  background: var(--hover-bg);
+}
+
+.sortable-col.sorted {
+  color: var(--accent-primary);
+}
+
+.sort-icon {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.copyable-cell {
+  cursor: pointer;
+}
+
+.copyable-cell:hover {
+  background: var(--hover-bg);
+}
+
+.copyable-cell.copied {
+  color: var(--accent-success);
+}
+
+.result-table td {
+  color: var(--text-primary);
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+}
+
+.result-table tr:hover td {
+  background: var(--hover-bg);
+}
+
+.row-number {
+  color: var(--text-muted) !important;
+  width: 50px;
+  text-align: right !important;
+  background: var(--bg-secondary) !important;
+}
+
+.no-data {
+  padding: 40px;
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.json-container {
+  padding: 16px;
+  overflow: auto;
+  height: 100%;
+}
+
+.json-container pre {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* JSON Tree View */
+.json-tree-container {
+  padding: 8px;
+  overflow: auto;
+  height: 100%;
+}
+
+.json-tree {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.json-row {
+  white-space: nowrap;
+}
+
+.json-expandable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.json-expandable:hover {
+  background: var(--hover-bg);
+  border-radius: 2px;
+}
+
+.json-toggle {
+  display: inline-block;
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.json-key {
+  color: var(--accent-primary);
+}
+
+.json-string {
+  color: var(--accent-success);
+}
+
+.json-number {
+  color: var(--accent-warning);
+}
+
+.json-bool {
+  color: var(--accent-secondary);
+}
+
+.json-null {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.json-bracket {
+  color: var(--text-secondary);
+}
+
+.json-collapsed {
+  color: var(--text-muted);
+  font-style: italic;
+  margin: 0 4px;
+}
+
+.json-highlight {
+  background: var(--accent-warning);
+  color: var(--bg-primary);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.graph-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+}
+
+.graph-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-muted);
+}
+
+.placeholder-icon {
+  font-size: 48px;
+}
+
+.placeholder-text {
+  font-size: 14px;
+}

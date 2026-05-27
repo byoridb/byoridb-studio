@@ -152,10 +152,18 @@ FETCH PROP ON person 1;
 FETCH PROP ON * 1;  -- all tags
 
 -- Graph traversal
-GO FROM 1 OVER follows YIELD $$.person.name;
-GO 2 STEPS FROM 1 OVER follows;
+GO FROM 1 OVER follows YIELD follows._dst AS friend_id;
+GO 2 STEPS FROM 1 OVER follows YIELD vertex AS v;
+GO 1..3 STEPS FROM 1 OVER follows YIELD follows._dst;
+GO FROM 1 OVER follows WHERE follows.since > 2020 YIELD follows.since, follows._dst;
 
--- Pattern matching
+-- To project destination-vertex properties, use a compound statement:
+$f = GO FROM 1 OVER follows YIELD follows._dst AS dst;
+FETCH PROP ON person $f.dst;
+-- or use MATCH (single statement):
+MATCH (a:person)-[:follows]->(b:person) WHERE a.name == 'Alice' RETURN b.name;
+
+-- Pattern matching (start node MUST have a variable; end node may be anonymous)
 MATCH (n:person) WHERE n.age > 25 RETURN n;
 MATCH (a:person)-[e:follows]->(b:person) RETURN a.name, b.name;
 
@@ -166,10 +174,22 @@ LOOKUP ON person WHERE person.age > 25 YIELD person.name;
 FIND SHORTEST PATH FROM 1 TO 5 OVER follows;
 ```
 
-**Special Variables in GO**
-- `$^` - Source vertex
-- `$$` - Destination vertex
-- `follows._src`, `follows._dst` - Edge endpoints
+**GO YIELD column references** (what byoridb actually accepts — see
+`byoridb-parser/src/parser/dql.rs::parse_go` and the executor's GO tests):
+- `<edge>._src`, `<edge>._dst` — edge endpoint VIDs
+- `<edge>.<prop>` — edge property
+- `vertex` — destination vertex object (multi-step traversals)
+- `$var` / `$var.col` — reference to a previous compound-statement result
+
+The nGQL-standard placeholders `$^` (source vertex) and `$$` (destination
+vertex) are **not implemented** in byoridb; the parser rejects them at
+the `Dollar` token. Use the workarounds above (compound `$var = GO ...;
+FETCH PROP ...`, or `MATCH`) when you need vertex properties.
+
+**MATCH constraint**: byoridb requires the *start node* of a `MATCH`
+pattern to bind a variable (see `byoridb-executor/src/match.rs`).
+`MATCH ()-[e:follows]->()` is rejected; use `MATCH (s)-[e:follows]->()`
+instead. The end node may stay anonymous.
 
 ---
 
@@ -204,31 +224,24 @@ FIND SHORTEST PATH FROM 1 TO 5 OVER follows;
 aidlc-docs/
 ├── audit/audit-report.md        # 최신 감사 보고서 (2026-05-21)
 ├── onboard/onboard-notes.md     # 문서 변경 이력
-└── migration/                   # (예정) migration-plan, tech-debt, gate-grace
+└── migration/                   # migration-plan, tech-debt, gate-grace
 ```
 
 ---
 
 ## 코드베이스 주의사항
 
-audit-report에서 확인된 함정 (변경 전 인지 필수):
-
-- **`src/App.tsx`**: M1 완료로 훅 분리됨. `useConnection` + `useQueryExecution` 사용. health poll `useEffect`만 App.tsx에 잔존 (두 훅에 걸친 cross-cutting concern).
-- **`src/components/Sidebar.tsx`**: M1-3 완료로 `useSchemaData` 훅 분리됨. UI 렌더링만 담당.
 - **heuristic 세션 만료 감지**: `client.rs::is_session_error()`가 메시지 텍스트 매칭으로 세션 만료를 감지. 서버가 전용 `code` 필드를 추가하면 제거 예정.
-- **CSS**: Tailwind CSS v4 사용. `src/styles/index.css`에 `@theme`으로 Catppuccin Mocha 토큰 정의. 컴포넌트별 CSS 파일 없음 — 모든 스타일을 Tailwind 유틸리티 클래스로 인라인.
-- **CI 없음**: `npm test` + `cargo test`는 수동. PR 전 반드시 로컬 실행.
+- **CSS**: CSS 변수 방식 (`src/styles/index.css`의 `:root` 토큰). 컴포넌트별 CSS 파일 유지.
+- **CI**: GitHub Actions (`.github/workflows/ci.yml`) — ESLint, Prettier, rustfmt, clippy, 테스트 자동화.
 
 ---
 
 ## TODO (cah-dlc 도입 진행 중)
 
 - [x] `brownfield-migrate` 완료 → `aidlc-docs/migration/` 산출물 생성됨
-- [x] **M0**: GitHub Actions CI 파이프라인 구성 (`npm test` + `cargo test` 자동화)
-- [x] **M1-1**: `App.tsx` → `useConnection` 훅 추출 (`src/hooks/useConnection.ts`)
-- [x] **M1-2**: `App.tsx` → `useQueryExecution` 훅 추출 (`src/hooks/useQueryExecution.ts`)
-- [x] **M1-3**: `Sidebar.tsx` → `useSchemaData` 훅 추출 (`src/hooks/useSchemaData.ts`)
-- [x] **M2**: CSS 아키텍처 방식 결정 + 전환 → Tailwind CSS v4 (Catppuccin Mocha 테마)
-- [x] **M3**: `client.rs` 모듈화 → `client/{error,types,http}.rs` (gRPC 추가 전 선행)
+- [x] **M0**: GitHub Actions CI 파이프라인 구성
+- [x] **M1**: 훅 분리 (`useConnection`, `useQueryExecution`, `useSchemaData`)
+- [x] **M3**: `client.rs` 모듈화 → `client/{error,types,http}.rs`
 
 마이그레이션 상세: `aidlc-docs/migration/migration-plan.md` 참조.

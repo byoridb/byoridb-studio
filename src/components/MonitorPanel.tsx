@@ -63,19 +63,23 @@ function MonitorPanel({
   }, [isConnected]);
 
   const fetchMetrics = useCallback(async () => {
-    if (!isConnected) return;
+    if (!isConnected || !connectionHost || !connectionPort) return;
     setLoading(true);
     setMetricsError("");
     try {
-      // Use Tauri shell or fetch via backend — we use a simple HTTP fetch here
-      // since the metrics endpoint is on the same host the user configured.
-      const url = `http://${connectionHost}:${connectionPort}/metrics`;
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const text = await resp.text();
+      // Cross-origin fetch from Tauri WebView is blocked ("TypeError: Load failed"
+      // on macOS WKWebView). Proxy via Rust backend.
+      const text = await invoke<string>("fetch_metrics", {
+        host: connectionHost,
+        port: connectionPort,
+      });
       setMetrics(parsePrometheus(text).slice(0, 50));
     } catch (e: unknown) {
-      setMetricsError(String(e));
+      const msg =
+        e && typeof e === "object" && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+      setMetricsError(msg);
       setMetrics([]);
     } finally {
       setLoading(false);

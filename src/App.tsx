@@ -34,6 +34,10 @@ const HEALTH_MAX_RETRIES = 3;
 /** Backoff base delay in ms (doubles each retry: 2s, 4s, 8s). */
 const HEALTH_BACKOFF_BASE_MS = 2_000;
 
+const SIDEBAR_WIDTH_KEY = "byoridb-sidebar-width";
+const SIDEBAR_MIN = 180;
+const SIDEBAR_MAX = 600;
+
 function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [showConnectionModal, setShowConnectionModal] = useState(true);
@@ -42,6 +46,37 @@ function App() {
   const [currentSpace, setCurrentSpace] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    const n = saved ? Number(saved) : 250;
+    return Number.isFinite(n) && n >= SIDEBAR_MIN && n <= SIDEBAR_MAX ? n : 250;
+  });
+
+  const startSidebarResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = sidebarWidth;
+      let lastWidth = startWidth;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      const onMove = (ev: MouseEvent) => {
+        const w = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, startWidth + ev.clientX - startX));
+        lastWidth = w;
+        setSidebarWidth(w);
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(lastWidth));
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [sidebarWidth],
+  );
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>(() => {
     try {
       const saved = localStorage.getItem(HISTORY_STORAGE_KEY);
@@ -252,7 +287,10 @@ function App() {
   };
 
   return (
-    <div className="app">
+    <div
+      className="app"
+      style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
+    >
       <ToastContainer toasts={toasts} onRemove={removeToast} />
       {showConnectionModal && (
         <ConnectionModal
@@ -312,6 +350,14 @@ function App() {
           connectionPort={connectionConfig?.port}
           lastQueryTime={queryResult?.executionTime}
           lastRowCount={queryResult?.rowCount ?? queryResult?.rows.length}
+        />
+
+        <div
+          className="sidebar-resizer"
+          onMouseDown={startSidebarResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
         />
 
         <div className="main-content">

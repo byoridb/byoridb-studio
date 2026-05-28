@@ -204,6 +204,33 @@ async fn get_indexes(
     Ok(result?)
 }
 
+/// Fetch Prometheus metrics text. Tauri WebView blocks cross-origin fetch on
+/// macOS WKWebView ("TypeError: Load failed"), so we proxy via Rust.
+#[tauri::command]
+async fn fetch_metrics(host: String, port: u32) -> Result<String, TauriError> {
+    let url = format!("http://{}:{}/metrics", host, port);
+    info!("Fetching metrics from {}", url);
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(TauriError::new(
+            "TRANSPORT",
+            format!("HTTP {}", resp.status().as_u16()),
+        ));
+    }
+    resp.text()
+        .await
+        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -228,6 +255,7 @@ fn main() {
             test_connection,
             execute_statement,
             get_indexes,
+            fetch_metrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

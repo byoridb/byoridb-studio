@@ -291,6 +291,9 @@ function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEdi
           theme="catppuccin-mocha"
           value={activeTab.query}
           onChange={(val) => updateTabQuery(activeTab.id, val ?? "")}
+          beforeMount={(monaco: typeof Monaco) => {
+            registerNgqlLanguage(monaco);
+          }}
           onMount={handleMount}
           options={{
             readOnly: !isConnected,

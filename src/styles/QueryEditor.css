@@ -1,8 +1,10 @@
 .query-editor {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
   height: 250px;
   min-height: 150px;
+  flex-shrink: 0;
+  overflow: hidden;
   border-bottom: 1px solid var(--border-color);
 }
 

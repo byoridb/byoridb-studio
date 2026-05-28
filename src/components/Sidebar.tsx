@@ -380,24 +380,6 @@ function Sidebar({
         >
           {t("sidebar.data")}
         </button>
-        <button
-          className={`sidebar-tab ${activeTab === "monitor" ? "active" : ""}`}
-          onClick={() => setActiveTab("monitor")}
-        >
-          {t("sidebar.monitor")}
-        </button>
-        <button
-          className={`sidebar-tab ${activeTab === "history" ? "active" : ""}`}
-          onClick={() => setActiveTab("history")}
-        >
-          {t("sidebar.history")}
-        </button>
-        <button
-          className={`sidebar-tab ${activeTab === "settings" ? "active" : ""}`}
-          onClick={() => setActiveTab("settings")}
-        >
-          {t("sidebar.settings")}
-        </button>
       </div>
 
       <div className="sidebar-content">
@@ -439,6 +421,36 @@ function Sidebar({
           />
         )}
         {activeTab === "settings" && <ServerSettings onConnect={onConnect} />}
+      </div>
+
+      <div className="sidebar-footer">
+        <button
+          className={`sidebar-footer-btn ${activeTab === "monitor" ? "active" : ""}`}
+          onClick={() => setActiveTab("monitor")}
+          title={t("sidebar.monitor")}
+          aria-label={t("sidebar.monitor")}
+        >
+          <span className="sidebar-footer-icon">📊</span>
+          <span className="sidebar-footer-label">{t("sidebar.monitor")}</span>
+        </button>
+        <button
+          className={`sidebar-footer-btn ${activeTab === "history" ? "active" : ""}`}
+          onClick={() => setActiveTab("history")}
+          title={t("sidebar.history")}
+          aria-label={t("sidebar.history")}
+        >
+          <span className="sidebar-footer-icon">🕒</span>
+          <span className="sidebar-footer-label">{t("sidebar.history")}</span>
+        </button>
+        <button
+          className={`sidebar-footer-btn ${activeTab === "settings" ? "active" : ""}`}
+          onClick={() => setActiveTab("settings")}
+          title={t("sidebar.settings")}
+          aria-label={t("sidebar.settings")}
+        >
+          <span className="sidebar-footer-icon">⚙️</span>
+          <span className="sidebar-footer-label">{t("sidebar.settings")}</span>
+        </button>
       </div>
     </div>
   );

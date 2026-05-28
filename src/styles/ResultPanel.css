@@ -142,6 +142,34 @@
 .table-container {
   overflow: auto;
   height: 100%;
+  position: relative;
+  isolation: isolate;
+}
+
+/* Virtualized table — table/thead/tbody를 block으로 강제해야
+   tbody의 position:relative가 먹고, absolute tr들이 tbody 기준으로 잡힘.
+   tr은 display:table+tableLayout:fixed로 column 정렬 유지. */
+.result-table {
+  display: block;
+  width: 100%;
+}
+
+.result-table thead {
+  display: block;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.result-table thead tr {
+  display: table;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.result-table tbody {
+  display: block;
+  position: relative;
 }
 
 .result-table {
@@ -162,9 +190,6 @@
   background: var(--bg-secondary);
   font-weight: 600;
   color: var(--text-secondary);
-  position: sticky;
-  top: 0;
-  z-index: 1;
   user-select: none;
 }
 

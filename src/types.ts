@@ -38,6 +38,13 @@ export interface TauriError {
   message: string;
 }
 
+export function normalizeError(err: unknown): TauriError {
+  if (err && typeof err === "object" && "code" in err && "message" in err) {
+    return err as TauriError;
+  }
+  return { code: "UNKNOWN", message: String(err) };
+}
+
 export interface SavedConnection {
   name: string;
   config: ConnectionConfig;

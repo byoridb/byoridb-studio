@@ -44,6 +44,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -61,6 +63,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -85,6 +89,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -107,6 +113,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -132,6 +140,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -178,6 +188,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 
@@ -233,6 +245,8 @@ describe("Sidebar", () => {
         historyEntries={[]}
         onToggleFavorite={vi.fn()}
         onClearHistory={vi.fn()}
+        savedQueries={[]}
+        onDeleteSavedQuery={vi.fn()}
       />,
     );
 

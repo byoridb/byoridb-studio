@@ -61,6 +61,14 @@ export interface HistoryEntry {
   favorite: boolean;
 }
 
+/** A user-named, persisted query (distinct from auto-captured history). */
+export interface SavedQuery {
+  id: string;
+  name: string;
+  query: string;
+  createdAt: number; // Date.now()
+}
+
 export const HISTORY_STORAGE_KEY = "byoridb-studio-query-history";
 export const FAVORITES_STORAGE_KEY = "byoridb-studio-favorites";
 

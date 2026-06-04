@@ -53,7 +53,9 @@ function downloadFile(content: string, filename: string, mime: string) {
 function ResultPanel({ result }: ResultPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [jsonSearch, setJsonSearch] = useState("");
-  const [lastResult, setLastResult] = useState(result);
+  // Initialised to null (not `result`) so the very first result — even an
+  // EXPLAIN/PROFILE one — triggers the view-mode adjustment below.
+  const [lastResult, setLastResult] = useState<QueryResult | null>(null);
 
   const explainMode = result ? detectExplainMode(result) : null;
 

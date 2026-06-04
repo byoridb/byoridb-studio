@@ -195,4 +195,24 @@ describe("ResultPanel", () => {
     );
     expect(screen.queryByTestId("result-warning")).not.toBeInTheDocument();
   });
+
+  it("shows a Plan tab for EXPLAIN results and drops it for the next normal result", () => {
+    const explain = {
+      columns: ["id", "operator", "access", "detail"],
+      rows: [{ id: 0, operator: "Project", access: "-", detail: "n" }],
+      executionTime: 1,
+    };
+    const { rerender } = render(<ResultPanel result={explain} />);
+    // Plan view auto-selected; the Plan tab is present.
+    expect(screen.getByRole("button", { name: "Plan" })).toBeInTheDocument();
+    expect(screen.getByTestId("plan-row-0")).toBeInTheDocument();
+
+    // A subsequent ordinary result must drop the Plan tab and fall back to table.
+    rerender(
+      <ResultPanel result={{ columns: ["name"], rows: [{ name: "alice" }], executionTime: 1 }} />,
+    );
+    expect(screen.queryByRole("button", { name: "Plan" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("plan-row-0")).not.toBeInTheDocument();
+    expect(screen.getByTestId("table-view")).toBeInTheDocument();
+  });
 });

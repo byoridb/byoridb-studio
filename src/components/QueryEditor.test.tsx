@@ -18,12 +18,14 @@ interface MockEditorInstance {
   setValue: (v: string) => void;
   focus: () => void;
   getSelection: () => { isEmpty: () => boolean } | null;
-  getModel: () => { getValueInRange: (sel: unknown) => string } | null;
+  getModel: () => { getValueInRange: (sel: unknown) => string; getValue: () => string } | null;
   addCommand: (keybinding: number, handler: () => void) => void;
+  onDidChangeModelContent: (cb: () => void) => { dispose: () => void };
 }
 
 const KeyMod = { CtrlCmd: 1 << 11, Shift: 1 << 10 };
 const KeyCode = { Enter: 3, UpArrow: 16, DownArrow: 18 };
+const MarkerSeverity = { Error: 8, Warning: 4 };
 
 vi.mock("@monaco-editor/react", async () => {
   const { useRef, useEffect } = await vi.importActual<typeof import("react")>("react");
@@ -47,12 +49,21 @@ vi.mock("@monaco-editor/react", async () => {
         },
         focus: () => textareaRef.current?.focus(),
         getSelection: () => ({ isEmpty: () => true }),
-        getModel: () => ({ getValueInRange: () => "" }),
+        getModel: () => ({
+          getValueInRange: () => "",
+          getValue: () => textareaRef.current?.value ?? "",
+        }),
         addCommand: (keybinding: number, handler: () => void) => {
           commandsRef.current.set(keybinding, handler);
         },
+        onDidChangeModelContent: () => ({ dispose: () => {} }),
       };
-      onMount(editor, { KeyMod, KeyCode });
+      onMount(editor, {
+        KeyMod,
+        KeyCode,
+        MarkerSeverity,
+        editor: { setModelMarkers: () => {} },
+      });
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -87,6 +98,8 @@ vi.mock("@monaco-editor/react", async () => {
 vi.mock("../lib/ngql-language", () => ({
   registerNgqlLanguage: vi.fn(),
   LANGUAGE_ID: "ngql",
+  setPropertyLoader: vi.fn(),
+  schemaContext: { tags: [], edges: [], spaces: [], properties: {} },
 }));
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,15 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
-import { registerNgqlLanguage, LANGUAGE_ID } from "../lib/ngql-language";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  registerNgqlLanguage,
+  LANGUAGE_ID,
+  setPropertyLoader,
+  schemaContext,
+} from "../lib/ngql-language";
+import { validateNgql } from "../lib/ngql-validate";
+import type { QueryResult } from "../types";
 import { type QueryTab, SNIPPETS, newTab } from "../lib/query-tabs";
 import { HISTORY_STORAGE_KEY } from "../types";
 import "../styles/QueryEditor.css";
@@ -90,6 +98,42 @@ function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEdi
   const handleMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     registerNgqlLanguage(monaco);
+
+    // Heuristic lint → Monaco markers (reserved-word identifier collisions).
+    const runValidation = () => {
+      const model = editor.getModel();
+      if (!model) return;
+      const markers = validateNgql(model.getValue()).map((m) => ({
+        message: m.message,
+        severity:
+          m.severity === "error" ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+        startLineNumber: m.line,
+        startColumn: m.startColumn,
+        endLineNumber: m.line,
+        endColumn: m.endColumn,
+      }));
+      monaco.editor.setModelMarkers(model, "ngql", markers);
+    };
+    runValidation();
+    editor.onDidChangeModelContent(runValidation);
+
+    // Lazy property loader for `<entity>.` autocomplete: DESCRIBE the tag/edge
+    // only when the user references it.
+    setPropertyLoader(async (entity) => {
+      const isEdge = !schemaContext.tags.includes(entity) && schemaContext.edges.includes(entity);
+      const kind = isEdge ? "EDGE" : "TAG";
+      try {
+        const result = await invoke<QueryResult>("execute_query", {
+          query: `DESCRIBE ${kind} ${entity}`,
+        });
+        if (result.error) return [];
+        return result.rows
+          .map((r) => r.Field)
+          .filter((f): f is string => typeof f === "string" && f.length > 0);
+      } catch {
+        return [];
+      }
+    });
 
     // ⌘↵ — execute full query
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {

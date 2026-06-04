@@ -23,6 +23,7 @@ vi.mock("@monaco-editor/react", async () => {
       if (!onMount) return;
       const KeyMod = { CtrlCmd: 1 << 11, Shift: 1 << 10 };
       const KeyCode = { Enter: 3, UpArrow: 16, DownArrow: 18 };
+      const MarkerSeverity = { Error: 8, Warning: 4 };
       onMount(
         {
           getValue: () => ref.current?.value ?? "",
@@ -31,10 +32,14 @@ vi.mock("@monaco-editor/react", async () => {
           },
           focus: () => ref.current?.focus(),
           getSelection: () => ({ isEmpty: () => true }),
-          getModel: () => ({ getValueInRange: () => "" }),
+          getModel: () => ({
+            getValueInRange: () => "",
+            getValue: () => ref.current?.value ?? "",
+          }),
           addCommand: (kb: number, h: () => void) => cmds.current.set(kb, h),
+          onDidChangeModelContent: () => ({ dispose: () => {} }),
         },
-        { KeyMod, KeyCode },
+        { KeyMod, KeyCode, MarkerSeverity, editor: { setModelMarkers: () => {} } },
       );
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -86,7 +91,12 @@ vi.mock("./components/Sidebar", () => ({
   ),
 }));
 
-vi.mock("./lib/ngql-language", () => ({ registerNgqlLanguage: vi.fn(), LANGUAGE_ID: "ngql" }));
+vi.mock("./lib/ngql-language", () => ({
+  registerNgqlLanguage: vi.fn(),
+  LANGUAGE_ID: "ngql",
+  setPropertyLoader: vi.fn(),
+  schemaContext: { tags: [], edges: [], spaces: [], properties: {} },
+}));
 
 vi.mock("./components/TableView", () => ({
   default: ({ result }: { result: { columns: string[]; rows: Record<string, unknown>[] } }) => (

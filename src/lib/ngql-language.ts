@@ -259,10 +259,58 @@ export interface SchemaContext {
   tags: string[];
   edges: string[];
   spaces: string[];
+  /** Property names keyed by tag/edge name (filled by background DESCRIBE). */
+  properties: Record<string, string[]>;
 }
 
-// Mutable ref updated by QueryEditor when schema changes
-export const schemaContext: SchemaContext = { tags: [], edges: [], spaces: [] };
+// Mutable ref updated by Sidebar when schema changes
+export const schemaContext: SchemaContext = {
+  tags: [],
+  edges: [],
+  spaces: [],
+  properties: {},
+};
+
+/**
+ * If the text immediately before the cursor ends with `<entity>.`, return the
+ * entity token (e.g. `person` in `person.`). Used to offer property
+ * completions scoped to that tag/edge.
+ */
+export function entityBeforeDot(linePrefix: string): string | null {
+  const m = linePrefix.match(/(\w+)\.$/);
+  return m ? m[1] : null;
+}
+
+/** Look up an entity's already-cached properties case-insensitively. */
+function propertiesFor(entity: string): string[] | null {
+  const key = Object.keys(schemaContext.properties).find(
+    (k) => k.toLowerCase() === entity.toLowerCase(),
+  );
+  return key ? schemaContext.properties[key] : null;
+}
+
+/**
+ * On-demand property loader, injected by QueryEditor. Lazily fetches a tag/edge's
+ * property names (via DESCRIBE) only when the user references it, matching the
+ * codebase's lazy-schema philosophy. Returns [] for unknown entities.
+ */
+export type PropertyLoader = (entity: string) => Promise<string[]>;
+
+let propertyLoader: PropertyLoader | null = null;
+
+export function setPropertyLoader(loader: PropertyLoader | null): void {
+  propertyLoader = loader;
+}
+
+/** Resolve an entity's properties from cache, else via the loader (cached). */
+async function resolveProperties(entity: string): Promise<string[]> {
+  const cached = propertiesFor(entity);
+  if (cached) return cached;
+  if (!propertyLoader) return [];
+  const props = await propertyLoader(entity);
+  if (props.length > 0) schemaContext.properties[entity] = props;
+  return props;
+}
 
 export function registerNgqlLanguage(monaco: typeof Monaco): void {
   // Avoid double-registration
@@ -273,7 +321,9 @@ export function registerNgqlLanguage(monaco: typeof Monaco): void {
   monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, monarchTokens);
   monaco.editor.defineTheme("catppuccin-mocha", catppuccinMochaTheme);
   monaco.languages.registerCompletionItemProvider(LANGUAGE_ID, {
-    provideCompletionItems(model, position) {
+    // `.` triggers property completion after an entity (e.g. `person.`).
+    triggerCharacters: ["."],
+    async provideCompletionItems(model, position) {
       const word = model.getWordUntilPosition(position);
       const range = {
         startLineNumber: position.lineNumber,
@@ -281,6 +331,28 @@ export function registerNgqlLanguage(monaco: typeof Monaco): void {
         startColumn: word.startColumn,
         endColumn: word.endColumn,
       };
+
+      const propItem = (name: string, owner: string) => ({
+        label: name,
+        kind: monaco.languages.CompletionItemKind.Field,
+        insertText: name,
+        detail: `${owner} property`,
+        range,
+      });
+
+      // After `<entity>.`, offer only that entity's properties when known.
+      const linePrefix = model.getValueInRange({
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: 1,
+        endColumn: word.startColumn,
+      });
+      const entity = entityBeforeDot(linePrefix);
+      if (entity) {
+        const props = await resolveProperties(entity);
+        // After a dot we only ever want properties — never keywords/tags.
+        return { suggestions: props.map((p) => propItem(p, entity)) };
+      }
 
       const keywordItems = [...NGQL_KEYWORDS, ...NGQL_TYPES].map((kw) => ({
         label: kw,
@@ -313,7 +385,21 @@ export function registerNgqlLanguage(monaco: typeof Monaco): void {
         range,
       }));
 
-      return { suggestions: [...keywordItems, ...tagItems, ...edgeItems, ...spaceItems] };
+      // All known properties (deduped), so `name` is suggested even without an
+      // explicit entity prefix. Detail names the owning tag/edge.
+      const seen = new Set<string>();
+      const propItems: ReturnType<typeof propItem>[] = [];
+      for (const [owner, props] of Object.entries(schemaContext.properties)) {
+        for (const p of props) {
+          if (seen.has(p)) continue;
+          seen.add(p);
+          propItems.push(propItem(p, owner));
+        }
+      }
+
+      return {
+        suggestions: [...keywordItems, ...tagItems, ...edgeItems, ...spaceItems, ...propItems],
+      };
     },
   });
 }

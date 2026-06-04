@@ -1,0 +1,139 @@
+.query-builder {
+  padding: 12px;
+  overflow-y: auto;
+  height: 100%;
+}
+
+.qb-empty {
+  padding: 24px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.qb-field {
+  margin-bottom: 14px;
+}
+
+.qb-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+
+.qb-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.qb-label-row .qb-label {
+  margin-bottom: 0;
+}
+
+.qb-select,
+.qb-input {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.qb-select:focus,
+.qb-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.qb-condition {
+  display: grid;
+  grid-template-columns: 1fr 90px 1fr 24px;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.qb-add {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg-tertiary);
+  color: var(--accent-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.qb-add:hover {
+  background: var(--hover-bg);
+}
+
+.qb-remove {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.qb-remove:hover {
+  color: var(--accent-error);
+}
+
+.qb-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.qb-edge {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-color);
+}
+
+.qb-limit {
+  width: 100px;
+}
+
+.qb-preview {
+  margin: 8px 0;
+  padding: 10px;
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--accent-success);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.qb-run {
+  width: 100%;
+  padding: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.qb-run:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

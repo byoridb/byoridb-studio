@@ -18,6 +18,7 @@ const translations: Record<string, Record<Locale, string>> = {
   "sidebar.schema": { en: "Schema", ko: "스키마" },
   "sidebar.manage": { en: "Manage", ko: "관리" },
   "sidebar.data": { en: "Data", ko: "데이터" },
+  "sidebar.build": { en: "Build", ko: "빌더" },
   "sidebar.monitor": { en: "Monitor", ko: "모니터" },
   "sidebar.history": { en: "History", ko: "히스토리" },
   "sidebar.settings": { en: "Settings", ko: "설정" },

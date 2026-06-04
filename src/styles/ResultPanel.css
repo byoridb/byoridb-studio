@@ -144,11 +144,13 @@
 }
 
 .result-warning.warning {
+  background: var(--bg-secondary);
   background: color-mix(in srgb, var(--accent-warning) 14%, transparent);
   color: var(--accent-warning);
 }
 
 .result-warning.danger {
+  background: var(--bg-secondary);
   background: color-mix(in srgb, var(--accent-error) 14%, transparent);
   color: var(--accent-error);
 }

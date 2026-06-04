@@ -19,6 +19,8 @@ interface QueryEditorProps {
   onCancel?: () => void;
   isExecuting: boolean;
   isConnected: boolean;
+  /** Persist the current query under a user-given name (A4 saved queries). */
+  onSaveQuery?: (name: string, query: string) => void;
 }
 
 const TABS_STORAGE_KEY = "byoridb-studio-tabs";
@@ -37,12 +39,19 @@ function saveTabs(tabs: QueryTab[]) {
   localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabs));
 }
 
-function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEditorProps) {
+function QueryEditor({
+  onExecute,
+  onCancel,
+  isExecuting,
+  isConnected,
+  onSaveQuery,
+}: QueryEditorProps) {
   const [tabs, setTabs] = useState<QueryTab[]>(loadTabs);
   const [activeTabId, setActiveTabId] = useState<string>(() => loadTabs()[0].id);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [showSnippets, setShowSnippets] = useState(false);
+  const [saveName, setSaveName] = useState<string | null>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
@@ -186,6 +195,14 @@ function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEdi
     setEditorValue("");
   };
 
+  const submitSave = () => {
+    const name = (saveName ?? "").trim();
+    if (name && activeTab.query.trim() && onSaveQuery) {
+      onSaveQuery(name, activeTab.query);
+    }
+    setSaveName(null);
+  };
+
   // Tab management
   const addTab = () => {
     const tab = newTab();
@@ -283,6 +300,35 @@ function QueryEditor({ onExecute, onCancel, isExecuting, isConnected }: QueryEdi
               </div>
             )}
           </div>
+          {onSaveQuery && (
+            <div className="save-wrapper">
+              {saveName === null ? (
+                <button
+                  className="snippet-btn"
+                  onClick={() => setSaveName("")}
+                  disabled={!activeTab.query.trim()}
+                  title="Save current query"
+                  data-testid="save-query-button"
+                >
+                  ★ Save
+                </button>
+              ) : (
+                <input
+                  className="save-name-input"
+                  autoFocus
+                  placeholder="Query name…"
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") submitSave();
+                    else if (e.key === "Escape") setSaveName(null);
+                  }}
+                  onBlur={submitSave}
+                  data-testid="save-name-input"
+                />
+              )}
+            </div>
+          )}
         </div>
         <div className="toolbar-right">
           <button className="btn-clear" onClick={handleClear} data-testid="clear-button">

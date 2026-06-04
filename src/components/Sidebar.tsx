@@ -2,12 +2,20 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ServerSettings from "./ServerSettings";
 import HistoryPanel from "./HistoryPanel";
+import SavedQueriesPanel from "./SavedQueriesPanel";
 import SchemaManager from "./SchemaManager";
 import DataManager from "./DataManager";
 import MonitorPanel from "./MonitorPanel";
 import { schemaContext } from "../lib/ngql-language";
 import { useTranslation } from "../hooks/useTranslation";
-import type { ConnectionConfig, QueryResult, SpaceInfo, SchemaInfo, HistoryEntry } from "../types";
+import type {
+  ConnectionConfig,
+  QueryResult,
+  SpaceInfo,
+  SchemaInfo,
+  HistoryEntry,
+  SavedQuery,
+} from "../types";
 import "../styles/Sidebar.css";
 
 type TabType = "schema" | "manage" | "data" | "monitor" | "history" | "settings";
@@ -21,6 +29,8 @@ interface SidebarProps {
   historyEntries: HistoryEntry[];
   onToggleFavorite: (id: string) => void;
   onClearHistory: () => void;
+  savedQueries: SavedQuery[];
+  onDeleteSavedQuery: (id: string) => void;
   connectionHost?: string;
   connectionPort?: number;
   lastQueryTime?: number;
@@ -56,6 +66,8 @@ function Sidebar({
   historyEntries,
   onToggleFavorite,
   onClearHistory,
+  savedQueries,
+  onDeleteSavedQuery,
   connectionHost = "",
   connectionPort = 19669,
   lastQueryTime,
@@ -413,12 +425,19 @@ function Sidebar({
           />
         )}
         {activeTab === "history" && (
-          <HistoryPanel
-            entries={historyEntries}
-            onSelect={onExecuteQuery}
-            onToggleFavorite={onToggleFavorite}
-            onClear={onClearHistory}
-          />
+          <>
+            <SavedQueriesPanel
+              queries={savedQueries}
+              onSelect={onExecuteQuery}
+              onDelete={onDeleteSavedQuery}
+            />
+            <HistoryPanel
+              entries={historyEntries}
+              onSelect={onExecuteQuery}
+              onToggleFavorite={onToggleFavorite}
+              onClear={onClearHistory}
+            />
+          </>
         )}
         {activeTab === "settings" && <ServerSettings onConnect={onConnect} />}
       </div>

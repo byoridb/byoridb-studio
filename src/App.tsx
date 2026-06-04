@@ -6,8 +6,14 @@ import ResultPanel from "./components/ResultPanel";
 import ConnectionModal from "./components/ConnectionModal";
 import { loadThemeSettings } from "./components/ServerSettings";
 import { useToast, ToastContainer } from "./hooks/useToast";
-import type { ConnectionConfig, QueryResult, TauriError, HistoryEntry } from "./types";
+import type { ConnectionConfig, QueryResult, TauriError, HistoryEntry, SavedQuery } from "./types";
 import { HISTORY_STORAGE_KEY } from "./types";
+import {
+  loadSavedQueries,
+  persistSavedQueries,
+  addSavedQuery,
+  removeSavedQuery,
+} from "./lib/savedQueries";
 import "./styles/App.css";
 
 // Apply saved theme/font on startup
@@ -106,6 +112,29 @@ function App() {
   const clearHistory = useCallback(() => {
     setHistoryEntries([]);
     localStorage.removeItem(HISTORY_STORAGE_KEY);
+  }, []);
+
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(() => loadSavedQueries());
+
+  const handleSaveQuery = useCallback((name: string, query: string) => {
+    setSavedQueries((prev) => {
+      const next = addSavedQuery(prev, {
+        id: `sq-${Date.now()}`,
+        name,
+        query,
+        createdAt: Date.now(),
+      });
+      persistSavedQueries(next);
+      return next;
+    });
+  }, []);
+
+  const deleteSavedQuery = useCallback((id: string) => {
+    setSavedQueries((prev) => {
+      const next = removeSavedQuery(prev, id);
+      persistSavedQueries(next);
+      return next;
+    });
   }, []);
 
   /** Called when we detect the server session or reachability is gone. */
@@ -343,6 +372,8 @@ function App() {
           historyEntries={historyEntries}
           onToggleFavorite={toggleFavorite}
           onClearHistory={clearHistory}
+          savedQueries={savedQueries}
+          onDeleteSavedQuery={deleteSavedQuery}
           connectionHost={connectionConfig?.host}
           connectionPort={connectionConfig?.port}
           lastQueryTime={queryResult?.executionTime}
@@ -363,6 +394,7 @@ function App() {
             onCancel={handleCancelQuery}
             isExecuting={isExecuting}
             isConnected={isConnected}
+            onSaveQuery={handleSaveQuery}
           />
           <ResultPanel result={queryResult} />
         </div>

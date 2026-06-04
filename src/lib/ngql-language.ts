@@ -34,6 +34,8 @@ export const NGQL_KEYWORDS: readonly string[] = [
   "FIND",
   "RETURN",
   "YIELD",
+  "EXPLAIN",
+  "PROFILE",
   "WHERE",
   "FROM",
   "OVER",
@@ -106,6 +108,8 @@ export const NGQL_DQL: readonly string[] = [
   "FIND",
   "RETURN",
   "YIELD",
+  "EXPLAIN",
+  "PROFILE",
 ];
 
 /** Case-insensitive keyword check. */

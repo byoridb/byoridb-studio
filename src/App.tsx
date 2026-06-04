@@ -287,10 +287,7 @@ function App() {
   };
 
   return (
-    <div
-      className="app"
-      style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
-    >
+    <div className="app" style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}>
       <ToastContainer toasts={toasts} onRemove={removeToast} />
       {showConnectionModal && (
         <ConnectionModal

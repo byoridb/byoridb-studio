@@ -1,15 +1,17 @@
 import { useState } from "react";
 import type { QueryResult } from "../types";
+import { detectExplainMode } from "../lib/explainPlan";
 import TableView from "./TableView";
 import JsonTreeView from "./JsonTreeView";
 import GraphView from "./GraphView";
+import ExplainView from "./ExplainView";
 import "../styles/ResultPanel.css";
 
 interface ResultPanelProps {
   result: QueryResult | null;
 }
 
-type ViewMode = "table" | "json" | "graph";
+type ViewMode = "table" | "json" | "graph" | "explain";
 
 export function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "NULL";
@@ -50,6 +52,17 @@ function downloadFile(content: string, filename: string, mime: string) {
 function ResultPanel({ result }: ResultPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [jsonSearch, setJsonSearch] = useState("");
+  const [lastResult, setLastResult] = useState(result);
+
+  const explainMode = result ? detectExplainMode(result) : null;
+
+  // When a new result arrives, default to the plan view for EXPLAIN/PROFILE,
+  // otherwise the table view. Adjusting state during render (instead of in an
+  // effect) is React's recommended pattern for "reset on prop change".
+  if (result !== lastResult) {
+    setLastResult(result);
+    setViewMode(explainMode ? "explain" : "table");
+  }
 
   if (!result) {
     return (
@@ -111,6 +124,14 @@ function ResultPanel({ result }: ResultPanelProps) {
             ↓ JSON
           </button>
           <div className="view-modes">
+            {explainMode && (
+              <button
+                className={`view-mode-btn ${viewMode === "explain" ? "active" : ""}`}
+                onClick={() => setViewMode("explain")}
+              >
+                Plan
+              </button>
+            )}
             <button
               className={`view-mode-btn ${viewMode === "table" ? "active" : ""}`}
               onClick={() => setViewMode("table")}
@@ -134,6 +155,7 @@ function ResultPanel({ result }: ResultPanelProps) {
       </div>
 
       <div className="result-content">
+        {viewMode === "explain" && explainMode && <ExplainView result={result} />}
         {viewMode === "table" && <TableView result={result} />}
         {viewMode === "json" && (
           <div className="json-tree-container">

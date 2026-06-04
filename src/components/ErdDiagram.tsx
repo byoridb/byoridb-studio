@@ -73,8 +73,8 @@ async function inferRelations(schema: SchemaInfo): Promise<Relation[]> {
     }
     const src = r.rows[0].src;
     const dst = r.rows[0].dst;
-    const srcTag = src !== null && src !== undefined ? vidToTag.get(String(src)) ?? null : null;
-    const dstTag = dst !== null && dst !== undefined ? vidToTag.get(String(dst)) ?? null : null;
+    const srcTag = src !== null && src !== undefined ? (vidToTag.get(String(src)) ?? null) : null;
+    const dstTag = dst !== null && dst !== undefined ? (vidToTag.get(String(dst)) ?? null) : null;
     relations.push({ edge, srcTag, dstTag, dangling: !srcTag || !dstTag });
   }
   return relations;
@@ -271,11 +271,19 @@ function ErdDiagram({ schema, currentSpace }: ErdDiagramProps) {
 
   const zoomIn = () => {
     const cy = cyRef.current;
-    if (cy) cy.zoom({ level: Math.min(cy.zoom() * 1.25, 3), renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+    if (cy)
+      cy.zoom({
+        level: Math.min(cy.zoom() * 1.25, 3),
+        renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+      });
   };
   const zoomOut = () => {
     const cy = cyRef.current;
-    if (cy) cy.zoom({ level: Math.max(cy.zoom() / 1.25, 0.2), renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+    if (cy)
+      cy.zoom({
+        level: Math.max(cy.zoom() / 1.25, 0.2),
+        renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+      });
   };
   const fit = () => cyRef.current?.fit(undefined, 40);
 

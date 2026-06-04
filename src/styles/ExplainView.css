@@ -1,0 +1,189 @@
+.explain-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ===== Summary bar ===== */
+.explain-summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.explain-mode-badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  color: var(--bg-primary);
+}
+
+.explain-mode-badge.explain {
+  background: var(--accent-secondary);
+}
+
+.explain-mode-badge.profile {
+  background: var(--accent-primary);
+}
+
+.explain-summary-item strong {
+  color: var(--text-primary);
+}
+
+.explain-summary-warning {
+  color: var(--accent-error);
+  font-weight: 600;
+}
+
+.explain-summary-hint {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.explain-summary-hint code {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  color: var(--accent-primary);
+}
+
+/* ===== Tree ===== */
+.explain-tree {
+  flex: 1;
+  overflow: auto;
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 12px;
+}
+
+.plan-row {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border-color);
+  border-left: 3px solid transparent;
+}
+
+/* PROFILE renders two extra metric columns (rows, time); EXPLAIN omits them,
+   so each mode needs its own column track count to stay aligned. */
+.mode-profile .plan-row {
+  grid-template-columns: 36px minmax(220px, 1.4fr) 110px 110px 130px minmax(120px, 1fr);
+}
+
+.mode-explain .plan-row {
+  grid-template-columns: 36px minmax(220px, 1.4fr) 130px minmax(120px, 1fr);
+}
+
+.plan-row:hover {
+  background: var(--hover-bg);
+}
+
+.plan-row.is-fullscan {
+  border-left-color: var(--accent-error);
+  background: color-mix(in srgb, var(--accent-error) 7%, transparent);
+}
+
+.plan-row.is-bottleneck {
+  border-left-color: var(--accent-warning);
+}
+
+.plan-id {
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.plan-operator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.plan-guide {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.plan-op-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.bottleneck-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-warning);
+  white-space: nowrap;
+}
+
+/* ===== Metric bars (PROFILE) ===== */
+.plan-metric {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 18px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+}
+
+.metric-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  opacity: 0.35;
+  min-width: 2px;
+}
+
+.metric-label {
+  position: relative;
+  z-index: 1;
+  padding: 0 6px;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== Access badge ===== */
+.access-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.access-badge.indexed {
+  background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  color: var(--accent-success);
+}
+
+.access-badge.scan {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.access-badge.full-scan {
+  background: color-mix(in srgb, var(--accent-error) 22%, transparent);
+  color: var(--accent-error);
+  font-weight: 700;
+}
+
+.access-none {
+  color: var(--text-muted);
+}
+
+.plan-detail {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

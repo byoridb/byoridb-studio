@@ -1,0 +1,69 @@
+.saved-queries {
+  border-bottom: 1px solid var(--border-color);
+}
+
+.saved-queries-header {
+  padding: 8px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+}
+
+.saved-queries-list {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.saved-query {
+  position: relative;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.saved-query:hover {
+  background: var(--hover-bg);
+}
+
+.saved-query-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 18px;
+}
+
+.saved-query-preview {
+  font-family: "SF Mono", "Monaco", "Inconsolata", "Fira Code", monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 18px;
+}
+
+.saved-query-delete {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  padding: 2px 4px;
+}
+
+.saved-query:hover .saved-query-delete {
+  opacity: 1;
+}
+
+.saved-query-delete:hover {
+  color: var(--accent-error);
+}

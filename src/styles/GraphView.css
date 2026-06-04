@@ -1,0 +1,343 @@
+.graph-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.graph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.graph-stats {
+  font-size: 12px;
+  color: var(--text-muted);
+  flex: 1;
+}
+
+.graph-layouts {
+  display: flex;
+  gap: 3px;
+}
+
+.graph-layout-btn {
+  padding: 3px 7px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.graph-layout-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.graph-layout-btn.active {
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-color: var(--accent-primary);
+}
+
+.graph-fit-btn,
+.graph-reset-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.graph-fit-btn:hover,
+.graph-reset-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.graph-body {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.graph-canvas {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+}
+
+.graph-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.graph-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+/* Node detail panel */
+.graph-detail {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 220px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+  overflow: hidden;
+}
+
+.graph-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.graph-detail-id {
+  font-family: "SF Mono", monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-detail-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-radius: 10px;
+}
+
+.graph-detail-close {
+  padding: 0 4px;
+  font-size: 14px;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  line-height: 1;
+}
+
+.graph-detail-close:hover {
+  color: var(--accent-error);
+}
+
+.graph-detail-props {
+  padding: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.graph-detail-row {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.graph-detail-row:last-child {
+  border-bottom: none;
+}
+
+.graph-detail-key {
+  color: var(--accent-primary);
+  min-width: 60px;
+  flex-shrink: 0;
+}
+
+.graph-detail-val {
+  color: var(--text-primary);
+  font-family: "SF Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.erd-diagram {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.erd-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.erd-refresh-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.erd-refresh-btn:hover:not(:disabled) {
+  background: var(--accent-secondary);
+}
+
+.erd-refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.erd-last-refreshed {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.erd-error {
+  font-size: 11px;
+  color: var(--accent-error);
+}
+
+.erd-hint {
+  color: var(--text-muted);
+  margin-left: auto;
+  font-size: 11px;
+}
+
+/* Canvas wrapper holds legend + zoom overlays */
+.erd-canvas-wrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.erd-canvas {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+}
+
+/* Legend overlay (top-right) */
+.erd-legend-box {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  z-index: 5;
+}
+
+.erd-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.erd-legend-dot {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.erd-legend-dot.tag {
+  background: var(--text-muted);
+  border: 1.5px solid var(--border-color);
+}
+
+.erd-legend-arrow {
+  display: inline-block;
+  width: 24px;
+  height: 0;
+  border-top: 1.5px solid var(--text-secondary);
+  position: relative;
+  flex-shrink: 0;
+}
+
+.erd-legend-arrow::after {
+  content: "▶";
+  position: absolute;
+  right: -4px;
+  top: -8px;
+  font-size: 8px;
+  color: var(--text-secondary);
+}
+
+.erd-legend-arrow.dashed {
+  border-top-style: dashed;
+}
+
+/* Zoom controls overlay (bottom-right) */
+.erd-zoom-controls {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  z-index: 5;
+}
+
+.erd-zoom-controls button {
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: none;
+  border-radius: 0;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.erd-zoom-controls button:last-child {
+  border-bottom: none;
+}
+
+.erd-zoom-controls button:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}

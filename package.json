@@ -1,0 +1,57 @@
+{
+  "name": "byoridb-studio",
+  "version": "0.1.0",
+  "description": "ByoriDB Studio - Desktop management tool for ByoriDB",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "keywords": [
+    "graph-database",
+    "byoridb",
+    "studio"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@tanstack/react-virtual": "^3.13.24",
+    "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-store": "^2.4.3",
+    "cytoscape": "^3.33.3",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tauri-apps/cli": "^2.9.6",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/cytoscape": "^3.21.9",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "@vitest/coverage-v8": "^4.1.5",
+    "eslint": "^10.3.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "fast-check": "^4.8.0",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.59.3",
+    "vite": "^7.3.1",
+    "vitest": "^4.1.5"
+  }
+}

@@ -27,3 +27,9 @@ npm-debug.log*
 
 # Tauri
 src-tauri/WixTools/
+
+# AI-DLC / 에이전트 산출물 — 로컬에만 유지 (git 추적 제외)
+CLAUDE.md
+AGENTS.md
+aidlc-docs/
+.kiro/

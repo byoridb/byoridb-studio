@@ -19,6 +19,8 @@ export interface QueryResult {
   /** Server-reported row count; falls back to rows.length if absent. */
   rowCount?: number;
   error?: string;
+  /** Client-attached source query that produced this result (for warnings). */
+  query?: string;
 }
 
 export interface SpaceInfo {

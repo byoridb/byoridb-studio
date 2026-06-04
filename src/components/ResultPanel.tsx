@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { QueryResult } from "../types";
 import { detectExplainMode } from "../lib/explainPlan";
+import { getResultWarning } from "../lib/resultWarning";
 import TableView from "./TableView";
 import JsonTreeView from "./JsonTreeView";
 import GraphView from "./GraphView";
@@ -88,6 +89,8 @@ function ResultPanel({ result }: ResultPanelProps) {
     );
   }
 
+  const warning = getResultWarning(result);
+
   return (
     <div className="result-panel">
       <div className="result-header">
@@ -153,6 +156,17 @@ function ResultPanel({ result }: ResultPanelProps) {
           </div>
         </div>
       </div>
+
+      {warning && (
+        <div
+          className={`result-warning ${warning.level}`}
+          role="alert"
+          data-testid="result-warning"
+        >
+          <span className="result-warning-icon">⚠</span>
+          <span className="result-warning-text">{warning.message}</span>
+        </div>
+      )}
 
       <div className="result-content">
         {viewMode === "explain" && explainMode && <ExplainView result={result} />}

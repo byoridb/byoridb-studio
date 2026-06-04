@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ServerSettings from "./ServerSettings";
 import HistoryPanel from "./HistoryPanel";
 import SavedQueriesPanel from "./SavedQueriesPanel";
+import QueryBuilderPanel from "./QueryBuilderPanel";
 import SchemaManager from "./SchemaManager";
 import DataManager from "./DataManager";
 import MonitorPanel from "./MonitorPanel";
@@ -18,7 +19,7 @@ import type {
 } from "../types";
 import "../styles/Sidebar.css";
 
-type TabType = "schema" | "manage" | "data" | "monitor" | "history" | "settings";
+type TabType = "schema" | "manage" | "data" | "build" | "monitor" | "history" | "settings";
 
 interface SidebarProps {
   isConnected: boolean;
@@ -392,6 +393,12 @@ function Sidebar({
         >
           {t("sidebar.data")}
         </button>
+        <button
+          className={`sidebar-tab ${activeTab === "build" ? "active" : ""}`}
+          onClick={() => setActiveTab("build")}
+        >
+          {t("sidebar.build")}
+        </button>
       </div>
 
       <div className="sidebar-content">
@@ -415,6 +422,7 @@ function Sidebar({
             onExecuteQuery={onExecuteQuery}
           />
         )}
+        {activeTab === "build" && <QueryBuilderPanel schema={schema} onRun={onExecuteQuery} />}
         {activeTab === "monitor" && (
           <MonitorPanel
             isConnected={isConnected}

@@ -163,4 +163,36 @@ describe("ResultPanel", () => {
     // GraphView renders empty state for no graph data
     expect(screen.getByText("No graph data detected.")).toBeInTheDocument();
   });
+
+  it("warns when a LIMIT appears to have been ignored", () => {
+    render(
+      <ResultPanel
+        result={{
+          columns: ["dst"],
+          rows: Array(50000).fill({ dst: 1 }),
+          executionTime: 5,
+          rowCount: 50000,
+          query: "GO FROM 1 OVER knows YIELD knows._dst | LIMIT 10",
+        }}
+      />,
+    );
+    const banner = screen.getByTestId("result-warning");
+    expect(banner.className).toContain("danger");
+    expect(banner).toHaveTextContent("LIMIT 10");
+  });
+
+  it("does not warn for a normal-sized result", () => {
+    render(
+      <ResultPanel
+        result={{
+          columns: ["name"],
+          rows: [{ name: "alice" }],
+          executionTime: 1,
+          rowCount: 1,
+          query: "MATCH (n) RETURN n",
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("result-warning")).not.toBeInTheDocument();
+  });
 });

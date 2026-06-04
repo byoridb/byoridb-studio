@@ -134,6 +134,34 @@
   border-radius: 4px;
 }
 
+.result-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 16px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.result-warning.warning {
+  background: color-mix(in srgb, var(--accent-warning) 14%, transparent);
+  color: var(--accent-warning);
+}
+
+.result-warning.danger {
+  background: color-mix(in srgb, var(--accent-error) 14%, transparent);
+  color: var(--accent-error);
+}
+
+.result-warning-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.result-warning-text {
+  line-height: 1.4;
+}
+
 .result-content {
   flex: 1;
   overflow: auto;

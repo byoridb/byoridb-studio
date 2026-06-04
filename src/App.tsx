@@ -232,7 +232,7 @@ function App() {
       const endTime = performance.now();
       const executionTime = endTime - startTime;
 
-      setQueryResult({ ...result, executionTime });
+      setQueryResult({ ...result, executionTime, query });
       addHistoryEntry({
         id: `h-${Date.now()}`,
         query,

@@ -270,8 +270,12 @@
   flex-shrink: 0;
 }
 
-.sm-expand-btn:hover { color: var(--accent-primary); }
-.sm-expand-btn.expanded { color: var(--accent-primary); }
+.sm-expand-btn:hover {
+  color: var(--accent-primary);
+}
+.sm-expand-btn.expanded {
+  color: var(--accent-primary);
+}
 
 .sm-list-name {
   flex: 1;
@@ -313,7 +317,7 @@
 .sm-describe-table td {
   padding: 3px 8px 3px 0;
   color: var(--text-secondary);
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .sm-describe-table .sm-type {
@@ -359,8 +363,14 @@
   border-radius: 4px;
 }
 
-.sm-btn-ghost:hover { color: var(--text-primary); border-color: var(--text-secondary); }
-.sm-btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+.sm-btn-ghost:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.sm-btn-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 
 .sm-index-table {
   width: 100%;
@@ -383,8 +393,15 @@
   color: var(--text-secondary);
 }
 
-.sm-idx-name { color: var(--text-primary); font-weight: 500; }
-.sm-idx-fields { color: var(--accent-secondary); font-family: var(--font-mono, monospace); font-size: 11px; }
+.sm-idx-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.sm-idx-fields {
+  color: var(--accent-secondary);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
 
 .sm-idx-ops {
   display: flex;
@@ -401,7 +418,9 @@
   border-radius: 4px;
 }
 
-.sm-btn-rebuild:hover { background: rgba(137,180,250,0.1); }
+.sm-btn-rebuild:hover {
+  background: rgba(137, 180, 250, 0.1);
+}
 
 /* ── Statistics ── */
 .sm-stats-toolbar {
@@ -452,7 +471,9 @@
   border-bottom: 1px solid var(--border-color);
 }
 
-.sm-stats-table tr:hover td { background: var(--hover-bg); }
+.sm-stats-table tr:hover td {
+  background: var(--hover-bg);
+}
 
 .sm-type-chip {
   display: inline-block;
@@ -462,10 +483,19 @@
   font-weight: 600;
 }
 
-.sm-type-chip.tag  { background: rgba(137,180,250,0.15); color: var(--accent-primary); }
-.sm-type-chip.edge { background: rgba(166,227,161,0.15); color: var(--accent-success); }
+.sm-type-chip.tag {
+  background: rgba(137, 180, 250, 0.15);
+  color: var(--accent-primary);
+}
+.sm-type-chip.edge {
+  background: rgba(166, 227, 161, 0.15);
+  color: var(--accent-success);
+}
 
-.sm-stats-name { color: var(--text-primary); font-weight: 500; }
+.sm-stats-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
 
 .sm-stats-count {
   color: var(--text-primary);

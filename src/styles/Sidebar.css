@@ -67,7 +67,9 @@
   border-top: 2px solid transparent;
   cursor: pointer;
   min-width: 0;
-  transition: color 0.15s ease, background 0.15s ease;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
 }
 
 .sidebar-footer-btn:hover {

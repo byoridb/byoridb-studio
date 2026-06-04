@@ -65,16 +65,26 @@ function FieldEditor({
             onChange={(e) => update(i, { name: e.target.value })}
           />
           <select value={f.type} onChange={(e) => update(i, { type: e.target.value })}>
-            {FIELD_TYPES.map((t) => <option key={t}>{t}</option>)}
+            {FIELD_TYPES.map((t) => (
+              <option key={t}>{t}</option>
+            ))}
           </select>
           <label className="field-null">
-            <input type="checkbox" checked={f.nullable} onChange={(e) => update(i, { nullable: e.target.checked })} />
+            <input
+              type="checkbox"
+              checked={f.nullable}
+              onChange={(e) => update(i, { nullable: e.target.checked })}
+            />
             NULL
           </label>
-          <button className="field-remove" onClick={() => remove(i)}>×</button>
+          <button className="field-remove" onClick={() => remove(i)}>
+            ×
+          </button>
         </div>
       ))}
-      <button className="field-add" onClick={add}>+ Add field</button>
+      <button className="field-add" onClick={add}>
+        + Add field
+      </button>
     </div>
   );
 }
@@ -86,7 +96,13 @@ function buildFieldsDDL(fields: TagEdgeField[]): string {
     .join(", ");
 }
 
-function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace }: SchemaManagerProps) {
+function SchemaManager({
+  spaces,
+  currentSpace,
+  schema,
+  onRefresh,
+  onSelectSpace,
+}: SchemaManagerProps) {
   const [tab, setTab] = useState<Tab>("spaces");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -117,17 +133,24 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
   const [statsLoading, setStatsLoading] = useState(false);
   const [statsTime, setStatsTime] = useState("");
 
-  const run = useCallback(async (stmt: string) => {
-    setError(""); setSuccess("");
-    try {
-      await invoke("execute_statement", { statement: stmt });
-      setSuccess(`✓ Done: ${stmt.split(" ").slice(0, 3).join(" ")}`);
-      onRefresh();
-    } catch (e: unknown) {
-      const msg = e && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e);
-      setError(msg);
-    }
-  }, [onRefresh]);
+  const run = useCallback(
+    async (stmt: string) => {
+      setError("");
+      setSuccess("");
+      try {
+        await invoke("execute_statement", { statement: stmt });
+        setSuccess(`✓ Done: ${stmt.split(" ").slice(0, 3).join(" ")}`);
+        onRefresh();
+      } catch (e: unknown) {
+        const msg =
+          e && typeof e === "object" && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        setError(msg);
+      }
+    },
+    [onRefresh],
+  );
 
   const runQuery = useCallback(async (query: string): Promise<QueryResult | null> => {
     try {
@@ -177,20 +200,31 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
   }, [currentSpace]);
 
   // --- Describe ---
-  const toggleDescribe = useCallback(async (kind: "tag" | "edge", name: string) => {
-    const key = `${kind}:${name}`;
-    if (expandedItems[key]) {
-      setExpandedItems((prev) => { const next = { ...prev }; delete next[key]; return next; });
-      return;
-    }
-    setLoadingDescribe((prev) => ({ ...prev, [key]: true }));
-    const stmt = kind === "tag" ? `DESCRIBE TAG ${name}` : `DESCRIBE EDGE ${name}`;
-    const result = await runQuery(stmt);
-    if (result) {
-      setExpandedItems((prev) => ({ ...prev, [key]: result.rows as unknown as DescribeRow[] }));
-    }
-    setLoadingDescribe((prev) => { const next = { ...prev }; delete next[key]; return next; });
-  }, [expandedItems, runQuery]);
+  const toggleDescribe = useCallback(
+    async (kind: "tag" | "edge", name: string) => {
+      const key = `${kind}:${name}`;
+      if (expandedItems[key]) {
+        setExpandedItems((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        return;
+      }
+      setLoadingDescribe((prev) => ({ ...prev, [key]: true }));
+      const stmt = kind === "tag" ? `DESCRIBE TAG ${name}` : `DESCRIBE EDGE ${name}`;
+      const result = await runQuery(stmt);
+      if (result) {
+        setExpandedItems((prev) => ({ ...prev, [key]: result.rows as unknown as DescribeRow[] }));
+      }
+      setLoadingDescribe((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    },
+    [expandedItems, runQuery],
+  );
 
   // --- DDL ---
   const createSpace = () => {
@@ -202,7 +236,10 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
   const dropSpace = (name: string) => {
     setConfirmMsg({
       msg: `Drop space "${name}"? This cannot be undone.`,
-      action: () => { run(`DROP SPACE ${name}`); setConfirmMsg(null); },
+      action: () => {
+        run(`DROP SPACE ${name}`);
+        setConfirmMsg(null);
+      },
     });
   };
 
@@ -210,13 +247,17 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
     if (!newName.trim()) return;
     const fieldsDDL = buildFieldsDDL(fields);
     run(`CREATE ${kind} ${newName} (${fieldsDDL})`);
-    setNewName(""); setFields([]);
+    setNewName("");
+    setFields([]);
   };
 
   const dropTagEdge = (kind: "TAG" | "EDGE", name: string) => {
     setConfirmMsg({
       msg: `Drop ${kind.toLowerCase()} "${name}"? This cannot be undone.`,
-      action: () => { run(`DROP ${kind} ${name}`); setConfirmMsg(null); },
+      action: () => {
+        run(`DROP ${kind} ${name}`);
+        setConfirmMsg(null);
+      },
     });
   };
 
@@ -224,7 +265,8 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
     if (!indexName.trim() || !indexOn.trim()) return;
     const k = indexKind === "tag" ? "TAG" : "EDGE";
     run(`CREATE ${k} INDEX ${indexName} ON ${indexOn}()`);
-    setIndexName(""); setIndexOn("");
+    setIndexName("");
+    setIndexOn("");
     setTimeout(loadIndexes, 500);
   };
 
@@ -237,34 +279,50 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
     const k = kind === "tag" ? "TAG" : "EDGE";
     setConfirmMsg({
       msg: `Drop index "${name}"?`,
-      action: () => { run(`DROP ${k} INDEX ${name}`); setConfirmMsg(null); setTimeout(loadIndexes, 500); },
+      action: () => {
+        run(`DROP ${k} INDEX ${name}`);
+        setConfirmMsg(null);
+        setTimeout(loadIndexes, 500);
+      },
     });
   };
 
   // --- filtered lists ---
-  const filteredTags = schema.tags.filter((t) => t.toLowerCase().includes(searchFilter.toLowerCase()));
-  const filteredEdges = schema.edges.filter((e) => e.toLowerCase().includes(searchFilter.toLowerCase()));
+  const filteredTags = schema.tags.filter((t) =>
+    t.toLowerCase().includes(searchFilter.toLowerCase()),
+  );
+  const filteredEdges = schema.edges.filter((e) =>
+    e.toLowerCase().includes(searchFilter.toLowerCase()),
+  );
   const currentIndexes = indexViewKind === "tag" ? tagIndexes : edgeIndexes;
 
-  const statTags  = stats.filter((r) => r.Type === "Tag");
+  const statTags = stats.filter((r) => r.Type === "Tag");
   const statEdges = stats.filter((r) => r.Type === "Edge");
   const statTotal = stats.filter((r) => r.Type === "Total");
 
   return (
     <div className="schema-manager">
       {confirmMsg && (
-        <ConfirmDialog message={confirmMsg.msg} onConfirm={confirmMsg.action} onCancel={() => setConfirmMsg(null)} />
+        <ConfirmDialog
+          message={confirmMsg.msg}
+          onConfirm={confirmMsg.action}
+          onCancel={() => setConfirmMsg(null)}
+        />
       )}
 
       <div className="sm-tabs">
         {TABS.map((t) => (
-          <button key={t} className={`sm-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+          <button
+            key={t}
+            className={`sm-tab ${tab === t ? "active" : ""}`}
+            onClick={() => setTab(t)}
+          >
             {t === "erd" ? "ERD" : t.charAt(0).toUpperCase() + t.slice(1)}
           </button>
         ))}
       </div>
 
-      {error   && <div className="sm-error">{error}</div>}
+      {error && <div className="sm-error">{error}</div>}
       {success && <div className="sm-success">{success}</div>}
 
       {/* ── SPACES ── */}
@@ -272,19 +330,35 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
         <div className="sm-section">
           <h4>Create Space</h4>
           <div className="sm-form-row">
-            <input placeholder="space name" value={newSpaceName} onChange={(e) => setNewSpaceName(e.target.value)} data-testid="space-name-input" />
+            <input
+              placeholder="space name"
+              value={newSpaceName}
+              onChange={(e) => setNewSpaceName(e.target.value)}
+              data-testid="space-name-input"
+            />
             <select value={vidType} onChange={(e) => setVidType(e.target.value)}>
               <option>INT64</option>
               <option>FIXED_STRING(32)</option>
             </select>
-            <button className="sm-btn-primary" onClick={createSpace} data-testid="create-space-btn">Create</button>
+            <button className="sm-btn-primary" onClick={createSpace} data-testid="create-space-btn">
+              Create
+            </button>
           </div>
           <h4>Existing Spaces</h4>
           {spaces.map((s) => (
             <div key={s.name} className="sm-item">
-              <span className={`sm-item-name ${s.name === currentSpace ? "current" : ""}`} onClick={() => onSelectSpace(s.name)}>{s.name}</span>
-              <span className="sm-item-meta">P:{s.partitionNum} R:{s.replicaFactor}</span>
-              <button className="sm-btn-danger" onClick={() => dropSpace(s.name)}>Drop</button>
+              <span
+                className={`sm-item-name ${s.name === currentSpace ? "current" : ""}`}
+                onClick={() => onSelectSpace(s.name)}
+              >
+                {s.name}
+              </span>
+              <span className="sm-item-meta">
+                P:{s.partitionNum} R:{s.replicaFactor}
+              </span>
+              <button className="sm-btn-danger" onClick={() => dropSpace(s.name)}>
+                Drop
+              </button>
             </div>
           ))}
         </div>
@@ -296,16 +370,27 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
           {!currentSpace && <p className="sm-hint">Select a space first.</p>}
           <h4>Create {tab === "tags" ? "Tag" : "Edge"}</h4>
           <div className="sm-form-row">
-            <input placeholder={`${tab === "tags" ? "tag" : "edge"} name`} value={newName} onChange={(e) => setNewName(e.target.value)} data-testid="tag-edge-name-input" />
+            <input
+              placeholder={`${tab === "tags" ? "tag" : "edge"} name`}
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              data-testid="tag-edge-name-input"
+            />
           </div>
           <FieldEditor fields={fields} onChange={setFields} />
-          <button className="sm-btn-primary" onClick={() => createTagEdge(tab === "tags" ? "TAG" : "EDGE")} data-testid="create-tag-edge-btn">
+          <button
+            className="sm-btn-primary"
+            onClick={() => createTagEdge(tab === "tags" ? "TAG" : "EDGE")}
+            data-testid="create-tag-edge-btn"
+          >
             Create {tab === "tags" ? "Tag" : "Edge"}
           </button>
 
           <h4 style={{ marginTop: 16 }}>
             {tab === "tags" ? "Tags" : "Edges"}
-            <span className="sm-count-badge">{tab === "tags" ? filteredTags.length : filteredEdges.length}</span>
+            <span className="sm-count-badge">
+              {tab === "tags" ? filteredTags.length : filteredEdges.length}
+            </span>
           </h4>
           <input
             className="sm-search"
@@ -330,9 +415,7 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
                       {loading ? "…" : expanded ? "▾" : "▸"}
                     </button>
                     <span className="sm-list-name">{name}</span>
-                    {expanded && (
-                      <span className="sm-prop-num">{expanded.length} fields</span>
-                    )}
+                    {expanded && <span className="sm-prop-num">{expanded.length} fields</span>}
                     <button
                       className="sm-btn-danger sm-btn-xs"
                       onClick={() => dropTagEdge(tab === "tags" ? "TAG" : "EDGE", name)}
@@ -344,7 +427,12 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
                     <div className="sm-describe-panel">
                       <table className="sm-describe-table">
                         <thead>
-                          <tr><th>Field</th><th>Type</th><th>Null</th><th>Default</th></tr>
+                          <tr>
+                            <th>Field</th>
+                            <th>Type</th>
+                            <th>Null</th>
+                            <th>Default</th>
+                          </tr>
                         </thead>
                         <tbody>
                           {expanded.map((row) => (
@@ -371,19 +459,42 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
         <div className="sm-section">
           <h4>Create Index</h4>
           <div className="sm-form-row">
-            <select value={indexKind} onChange={(e) => setIndexKind(e.target.value as "tag" | "edge")}>
+            <select
+              value={indexKind}
+              onChange={(e) => setIndexKind(e.target.value as "tag" | "edge")}
+            >
               <option value="tag">Tag</option>
               <option value="edge">Edge</option>
             </select>
-            <input placeholder="tag/edge name" value={indexOn} onChange={(e) => setIndexOn(e.target.value)} />
-            <input placeholder="index name" value={indexName} onChange={(e) => setIndexName(e.target.value)} />
-            <button className="sm-btn-primary" onClick={createIndex} data-testid="create-index-btn">Create</button>
+            <input
+              placeholder="tag/edge name"
+              value={indexOn}
+              onChange={(e) => setIndexOn(e.target.value)}
+            />
+            <input
+              placeholder="index name"
+              value={indexName}
+              onChange={(e) => setIndexName(e.target.value)}
+            />
+            <button className="sm-btn-primary" onClick={createIndex} data-testid="create-index-btn">
+              Create
+            </button>
           </div>
 
           <div className="sm-idx-toolbar">
             <div className="sm-toggle-group">
-              <button className={`sm-toggle ${indexViewKind === "tag" ? "active" : ""}`} onClick={() => setIndexViewKind("tag")}>Tag</button>
-              <button className={`sm-toggle ${indexViewKind === "edge" ? "active" : ""}`} onClick={() => setIndexViewKind("edge")}>Edge</button>
+              <button
+                className={`sm-toggle ${indexViewKind === "tag" ? "active" : ""}`}
+                onClick={() => setIndexViewKind("tag")}
+              >
+                Tag
+              </button>
+              <button
+                className={`sm-toggle ${indexViewKind === "edge" ? "active" : ""}`}
+                onClick={() => setIndexViewKind("edge")}
+              >
+                Edge
+              </button>
             </div>
             <button className="sm-btn-ghost" onClick={loadIndexes} disabled={indexesLoading}>
               {indexesLoading ? "…" : "↺ Refresh"}
@@ -413,8 +524,18 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
                       <td>{onName}</td>
                       <td className="sm-idx-fields">{fieldStr}</td>
                       <td className="sm-idx-ops">
-                        <button className="sm-btn-rebuild" onClick={() => rebuildIndex(indexViewKind, idxName)}>Rebuild</button>
-                        <button className="sm-btn-danger sm-btn-xs" onClick={() => dropIndex(indexViewKind, idxName)}>Drop</button>
+                        <button
+                          className="sm-btn-rebuild"
+                          onClick={() => rebuildIndex(indexViewKind, idxName)}
+                        >
+                          Rebuild
+                        </button>
+                        <button
+                          className="sm-btn-danger sm-btn-xs"
+                          onClick={() => dropIndex(indexViewKind, idxName)}
+                        >
+                          Drop
+                        </button>
                       </td>
                     </tr>
                   );
@@ -453,12 +574,20 @@ function SchemaManager({ spaces, currentSpace, schema, onRefresh, onSelectSpace 
               ) : (
                 <table className="sm-stats-table">
                   <thead>
-                    <tr><th>Type</th><th>Name</th><th>Count</th></tr>
+                    <tr>
+                      <th>Type</th>
+                      <th>Name</th>
+                      <th>Count</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {[...statTags, ...statEdges].map((row) => (
                       <tr key={`${row.Type}-${row.Name}`}>
-                        <td><span className={`sm-type-chip ${row.Type.toLowerCase()}`}>{row.Type}</span></td>
+                        <td>
+                          <span className={`sm-type-chip ${row.Type.toLowerCase()}`}>
+                            {row.Type}
+                          </span>
+                        </td>
                         <td className="sm-stats-name">{row.Name}</td>
                         <td className="sm-stats-count">{row.Count.toLocaleString()}</td>
                       </tr>

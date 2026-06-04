@@ -54,12 +54,12 @@
 
 이쪽이 ROI가 가장 명확하다. 코드 기반이 이미 다 깔려 있어서 "마지막 1cm"만 채우면 된다.
 
-| 우선순위 | 항목 | 작업 내용 | 기반 |
+| 우선순위 | 항목 | 작업 내용 | 상태 |
 |---------|------|----------|------|
-| **A1** | 대용량 결과 경고 | row_count가 임계값(예 10k) 초과 또는 LIMIT 없는 쿼리에서 결과 상단에 경고 배너 ("107,646행 반환됨 · LIMIT 확인 필요"). Q4 LIMIT 무시 버그 방어. | `ResultPanel.tsx`/`TableView.tsx` (가상 스크롤 이미 있음) |
-| **A2** | 프로퍼티 레벨 자동완성 + 예약어/타입 경고 | `DESC TAG`/`DESC EDGE` 백그라운드 로드 → `tag.<prop>` 자동완성. `tag`·`edge` 같은 예약어를 식별자로 쓸 때 사전 경고. VID 타입 불일치 힌트. | `ngql-language.ts` + `useSchemaData` |
-| **A3** | EXPLAIN 문자열 뷰어 (최소판) | 서버가 주는 EXPLAIN 한 줄 문자열을 파싱해 Plan 타입·필드를 읽기 쉬운 카드/트리로 정리. 비용·행수는 아직 없음을 명시. "풀스캔이면 LookupPlan에 인덱스명 없음" 같은 휴리스틱 경고. | 신규 `ExplainView`, `execute_query` 재사용 |
-| **A4** | 저장된 쿼리/즐겨찾기 UI | 이미 정의된 `FAVORITES_STORAGE_KEY` 위에 UI만 얹기. | `HistoryPanel.tsx` 확장 |
+| **A1** | 대용량 결과 경고 | LIMIT 지정 초과 시 danger / LIMIT 없는 대용량(≥10k) warning 배너. Q4 LIMIT 무시 버그 방어. | ✅ **완료** (PR #2 — `resultWarning.ts`) |
+| **A2** | 프로퍼티 레벨 자동완성 + 예약어 경고 | `<entity>.` 입력 시 지연 `DESCRIBE`로 프로퍼티 자동완성. 예약어를 tag/edge/space·프로퍼티 이름으로 쓰면 Monaco 경고 마커. | ✅ **완료** (PR #3 — `ngql-validate.ts`, `PropertyLoader`) |
+| **A3** | EXPLAIN 뷰어 | (B1/B2로 흡수 — 서버가 구조화 트리를 주게 되어 최소판 불필요) | ✅ B1/B2로 대체 |
+| **A4** | 저장된 쿼리 UI | 이름 붙인 저장 쿼리 라이브러리(`FAVORITES_STORAGE_KEY`). | ✅ **완료** (PR #4 — `SavedQueriesPanel`) |
 
 ### Track B — 서버 작업이 선행되어야 진짜 가치 (제안서의 진짜 P0)
 
@@ -87,11 +87,11 @@
 
 ### Track C — 확장 (낮은 우선순위, 큰 작업)
 
-| 항목 | 비고 |
+| 항목 | 상태 |
 |------|------|
-| 단계별 쿼리 빌더 (MATCH 시각 조립) | 비개발자 확장. 큰 작업, 후순위 |
-| SSH 터널 | 내부망 접근용. Tauri 사이드카/네이티브 작업 필요 |
-| 다중 연결 | 현재 단일 연결 — space 전환은 있음 |
+| 단계별 쿼리 빌더 (MATCH 시각 조립) | ✅ **완료** (PR #6 — `queryBuilder.ts`, `QueryBuilderPanel`, 사이드바 "빌더" 탭) |
+| SSH 터널 | ⏸ **보류** — 네이티브 Rust 네트워킹(russh/ssh2) + 자격증명·키 관리 + 보안 검토 필요. 라이브러리·인증 방식(키 vs 비밀번호·점프호스트) 결정이 선행되어야 하므로 자동 구현 대신 별도 설계 트랙 권장. |
+| 다중 연결 | ⏸ **보류** — `AppState`(`Arc<Mutex<Option<ByoriDBClient>>>`)의 단일 연결 모델을 다중으로 바꾸는 백엔드+프론트 아키텍처 변경. 별도 설계 트랙 권장. |
 
 ---
 
@@ -109,8 +109,14 @@
 
 - [x] ~~B1(PROFILE 구조화 응답), B2(인덱스/풀스캔 플래그)~~ → 서버 `dc5be3b` + Studio `ExplainView` 로 완료
 - [ ] byoridb 레포에 **B3(개별 SlowLog 조회 API)** 이슈 등록 — 남은 서버 작업
-- [ ] `NEXT.md` 의 "향후 과제"를 Track A + (남은) B3 로 교체
-- [ ] Track A 착수: A1(대용량 결과 경고)부터 — 가장 작고 효과 큼
+- [x] ~~Track A 전부~~ → A1(PR #2)·A2(PR #3)·A4(PR #4) 완료, A3는 B1/B2로 흡수
+- [x] ~~Track C 쿼리 빌더~~ → PR #6 완료
+- [ ] **남은 작업은 전부 별도 트랙** (서버 또는 아키텍처/보안 결정 필요):
+  - B3 SlowLog — byoridb 서버에 개별 슬로우 쿼리 조회 API 추가 후
+  - SSH 터널 — 네이티브 네트워킹 + 보안 설계
+  - 다중 연결 — 연결 모델 아키텍처 변경
+
+> **요약**: 서버 없이 Studio 단독으로 가능한 개선(Track A 전부 + Track B의 B1/B2 + Track C 쿼리 빌더)은 모두 구현·머지 완료(PR #1~#6). 남은 3건은 외부 의존(서버 API) 또는 신중한 설계(보안·아키텍처)가 필요해 의도적으로 분리.
 - [ ] (선택) ExplainView 를 QueryEditor 의 "Explain"/"Profile" 단축 버튼과 연결 — 현재는 사용자가 직접 `EXPLAIN`/`PROFILE` 프리픽스 입력
 
 ---

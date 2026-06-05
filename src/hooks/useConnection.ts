@@ -1,6 +1,8 @@
 import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionConfig } from "../components/ServerSettings";
+import { upsertConnection } from "../components/ServerSettings";
+import { savePassword } from "../lib/credentials";
 import { normalizeError } from "../types";
 
 export function useConnection() {
@@ -23,6 +25,14 @@ export function useConnection() {
       setConnectionConfig(config);
       setIsConnected(true);
       setShowConnectionModal(false);
+      // Auto-remember the server (metadata in localStorage, password in the OS
+      // keychain). Best-effort: never blocks or fails the connection.
+      try {
+        upsertConnection(config);
+        void savePassword(config);
+      } catch (e) {
+        console.warn("Failed to remember connection:", e);
+      }
     } catch (error) {
       const e = normalizeError(error);
       console.error("Connection failed:", e);

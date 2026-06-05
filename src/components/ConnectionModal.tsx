@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { loadSavedConnections } from "./ServerSettings";
+import { loadPassword } from "../lib/credentials";
 import type { ConnectionConfig, SavedConnection } from "../types";
 import { DEFAULT_CONNECTION_CONFIG } from "../types";
 import "../styles/ConnectionModal.css";
@@ -19,9 +20,11 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
   useEffect(() => {
     const connections = loadSavedConnections();
     setSavedConnections(connections);
-    // If there's a saved connection, use the first one as default
+    // Default to the first saved connection, pulling its password from the
+    // keychain so the user can connect in one click.
     if (connections.length > 0) {
-      setConfig(connections[0].config);
+      const first = connections[0];
+      loadPassword(first.config).then((password) => setConfig({ ...first.config, password }));
     }
   }, []);
 
@@ -36,8 +39,9 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
     }
   };
 
-  const handleSelectConnection = (saved: SavedConnection) => {
-    setConfig(saved.config);
+  const handleSelectConnection = async (saved: SavedConnection) => {
+    const password = await loadPassword(saved.config);
+    setConfig({ ...saved.config, password });
   };
 
   return (
@@ -134,12 +138,12 @@ function ConnectionModal({ onConnect, onClose }: ConnectionModalProps) {
                 type="password"
                 value={config.password}
                 onChange={(e) => setConfig({ ...config, password: e.target.value })}
-                placeholder="Enter password (not saved)"
+                placeholder="Enter password"
                 autoComplete="current-password"
               />
             </div>
             <p className="settings-hint" style={{ fontSize: "11px", marginTop: 4 }}>
-              🔒 Passwords are never saved to disk.
+              🔒 Saved securely in your OS keychain — never written to disk or git.
             </p>
           </div>
 

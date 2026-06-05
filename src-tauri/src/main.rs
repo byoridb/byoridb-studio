@@ -235,7 +235,8 @@ async fn fetch_metrics(host: String, port: u32) -> Result<String, TauriError> {
 const KEYRING_SERVICE: &str = "byoridb-studio";
 
 fn keyring_entry(key: &str) -> Result<keyring::Entry, TauriError> {
-    keyring::Entry::new(KEYRING_SERVICE, key).map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
+    keyring::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
 }
 
 /// Store a connection password in the OS keychain, keyed by `host:port:user`.

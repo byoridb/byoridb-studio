@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionConfig, SavedConnection } from "../types";
 import { DEFAULT_CONNECTION_CONFIG } from "../types";
 import { setLocale, getLocale } from "../lib/i18n";
+import { savePassword, loadPassword, deletePassword } from "../lib/credentials";
 import { useToast, ToastContainer, ConfirmDialog } from "../hooks/useToast";
 import "../styles/ServerSettings.css";
 
@@ -44,12 +45,32 @@ export function loadSavedConnections(): SavedConnection[] {
 }
 
 export function saveSavedConnections(connections: SavedConnection[]): void {
-  // Strip passwords before persisting — passwords are never stored on disk.
+  // Strip passwords before persisting — the secret lives in the OS keychain,
+  // never in localStorage. Only connection metadata is stored here.
   const sanitized = connections.map((c) => ({
     ...c,
     config: { ...c.config, password: "" },
   }));
   localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
+}
+
+/**
+ * Insert or update a saved connection identified by `host:port:username`.
+ * Used to auto-remember a server after a successful connect. Returns the new
+ * list. (Password persistence is handled separately via the keychain.)
+ */
+export function upsertConnection(config: ConnectionConfig, name?: string): SavedConnection[] {
+  const list = loadSavedConnections();
+  const identity = (c: ConnectionConfig) => `${c.host}:${c.port}:${c.username}`;
+  const key = identity(config);
+  const existing = list.find((c) => identity(c.config) === key);
+  const entry: SavedConnection = {
+    name: existing?.name ?? name ?? `${config.host}:${config.port}`,
+    config: { ...config },
+  };
+  const updated = existing ? list.map((c) => (c === existing ? entry : c)) : [...list, entry];
+  saveSavedConnections(updated);
+  return updated;
 }
 
 function ServerSettings({ onConnect }: ServerSettingsProps) {
@@ -139,6 +160,8 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
 
     setConnections(updated);
     saveSavedConnections(updated);
+    // Store the password securely in the OS keychain (best-effort).
+    void savePassword(newConnection.config);
     resetForm();
   };
 
@@ -147,9 +170,11 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
   };
 
   const doDelete = (name: string) => {
+    const target = connections.find((c) => c.name === name);
     const updated = connections.filter((c) => c.name !== name);
     setConnections(updated);
     saveSavedConnections(updated);
+    if (target) void deletePassword(target.config);
     setConfirmDelete(null);
   };
 
@@ -168,8 +193,10 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
     setIsAdding(false);
   };
 
-  const handleConnect = (config: ConnectionConfig) => {
-    onConnect(config);
+  const handleConnect = async (config: ConnectionConfig) => {
+    // Saved connections carry no password (stored in keychain) — fetch it.
+    const password = config.password || (await loadPassword(config));
+    onConnect({ ...config, password });
   };
 
   return (
@@ -303,7 +330,7 @@ function ServerSettings({ onConnect }: ServerSettingsProps) {
               type="password"
               value={formData.password}
               onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-              placeholder="Enter password (not saved)"
+              placeholder="Saved securely in your OS keychain"
               autoComplete="current-password"
             />
           </div>

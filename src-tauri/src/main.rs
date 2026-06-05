@@ -231,6 +231,41 @@ async fn fetch_metrics(host: String, port: u32) -> Result<String, TauriError> {
         .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))
 }
 
+/// Service name under which connection passwords are stored in the OS keychain.
+const KEYRING_SERVICE: &str = "byoridb-studio";
+
+fn keyring_entry(key: &str) -> Result<keyring::Entry, TauriError> {
+    keyring::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
+}
+
+/// Store a connection password in the OS keychain, keyed by `host:port:user`.
+#[tauri::command]
+fn save_password(key: String, password: String) -> Result<(), TauriError> {
+    keyring_entry(&key)?
+        .set_password(&password)
+        .map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
+}
+
+/// Retrieve a stored password, or `None` if nothing is saved for this key.
+#[tauri::command]
+fn get_password(key: String) -> Result<Option<String>, TauriError> {
+    match keyring_entry(&key)?.get_password() {
+        Ok(p) => Ok(Some(p)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(TauriError::new("KEYCHAIN", e.to_string())),
+    }
+}
+
+/// Remove a stored password. Treats "not found" as success (idempotent).
+#[tauri::command]
+fn delete_password(key: String) -> Result<(), TauriError> {
+    match keyring_entry(&key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(TauriError::new("KEYCHAIN", e.to_string())),
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -256,6 +291,9 @@ fn main() {
             execute_statement,
             get_indexes,
             fetch_metrics,
+            save_password,
+            get_password,
+            delete_password,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,6 +1,6 @@
 # ByoriDB Studio
 
-Desktop management tool for [ByoriDB](https://github.com/byoridb/byoridb) — a distributed graph database with nGQL support.
+[ByoriDB](https://github.com/byoridb/byoridb)(nGQL을 지원하는 분산 그래프 데이터베이스)를 위한 데스크톱 관리 도구입니다.
 
 > ⚠️ **개발 중 (Under active development)**
 >
@@ -10,37 +10,52 @@ Desktop management tool for [ByoriDB](https://github.com/byoridb/byoridb) — a 
 
 ---
 
-## Features
+## 기능
 
-### 연결 관리 / Connection
+### 연결 관리
+
 - 다중 ByoriDB 서버 프로파일 저장·전환 (host/port/credentials)
+- 비밀번호는 OS 키체인에 안전하게 보관 (디스크·git에 평문 저장 안 함)
+- 접속 성공 시 연결 자동 기억 + 원클릭 재접속
 - 30초 주기 헬스체크 폴링 + 자동 재연결 모달
 - 구조화된 에러 코드 (`AUTH_FAILED`, `SESSION_EXPIRED`, `QUERY_ERROR`, …)
 
-### 쿼리 에디터 / Query Editor
+### 쿼리 에디터
+
 - Monaco 기반 다중 탭 에디터
 - nGQL 키워드·연산자·문자열 시맨틱 하이라이트 (Catppuccin Mocha)
+- 스키마 인식 자동완성 (태그/엣지/프로퍼티) + 예약어 충돌 경고
 - `⌘↵` 전체 실행 · `⌘⇧↵` 선택 영역 실행 · `⌘↑/↓` 히스토리
-- 스니펫 드롭다운, 실행 취소(Cancel), 쿼리 히스토리(즐겨찾기)
+- 스니펫 드롭다운, 실행 취소(Cancel), 쿼리 히스토리(즐겨찾기), 이름 붙인 저장 쿼리
 
-### 결과 패널 / Result Panel
+### 결과 패널
+
 - 가상화 테이블 뷰 (큰 결과 셋 부드러운 스크롤)
-- JSON / Table / Graph 보기 전환
-- 셀 클릭 복사, CSV/JSON 내보내기
-- 컬럼 정렬
+- 테이블 / JSON / 그래프 / 실행계획(Plan) 보기 전환
+- `EXPLAIN`/`PROFILE` 실행계획 시각화 (연산자 트리, 행수·시간 히트맵, 풀스캔·병목 경고)
+- 대용량 결과 / LIMIT 무시 경고 배너
+- 셀 클릭 복사, CSV/JSON 내보내기, 컬럼 정렬
 
-### 스키마 관리 / Schema Manager
+### 스키마 관리
+
 - **Spaces**: CREATE/DROP, 현재 스페이스 표시 + 자동 `USE`
 - **Tags / Edges**: 생성·삭제, 필드 상세 인라인 표시, 이름 검색
 - **Indexes**: `SHOW TAG/EDGE INDEXES` 목록, REBUILD/DROP, 생성 폼
 - **Statistics**: `SHOW STATS` 기반 tag·edge별 레코드 수, 전체 합계
 - **ERD**: 데이터 샘플링으로 tag 간 edge 관계 추론, 컬러 노드 + dangling edge 점선 표시
 
+### 쿼리 빌더
+
+- 코드 없이 그래프 패턴(시작 노드·WHERE·관계·끝 노드·LIMIT)을 조립해 nGQL 자동 생성
+- 라이브 미리보기 + 바로 실행
+
 ### 사이드바
-- 상단 탭 `Schema · Manage · Data`, 하단 풋터 `📊 Monitor · 🕒 History · ⚙️ Settings`
+
+- 상단 탭 `Schema · Manage · Data · Build`, 하단 풋터 `📊 Monitor · 🕒 History · ⚙️ Settings`
 - 폭 드래그 가능 (180~600px, 설정 영속화)
 
 ### 기타
+
 - macOS / Windows / Linux 빌드 지원 (Tauri 2)
 - 가벼운 크기 (~5 MB DMG)
 - 다국어 (한국어 / 영어)
@@ -71,16 +86,16 @@ GROUP BY n.person.city ORDER BY cnt DESC LIMIT 10
 
 ---
 
-## Development
+## 개발
 
-### Prerequisites
+### 사전 요구사항
 
 - Node.js 22+
 - Rust 1.70+
 - [Tauri CLI](https://tauri.app/start/prerequisites/)
 - macOS / Windows / Linux
 
-### Setup
+### 설치 및 실행
 
 ```bash
 # 의존성 설치
@@ -93,7 +108,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-### Testing
+### 테스트
 
 ```bash
 # 프론트엔드 (Vitest + Testing Library + jsdom)
@@ -104,7 +119,7 @@ npm run coverage
 cd src-tauri && cargo test
 ```
 
-### Quality Gates
+### 품질 게이트
 
 ```bash
 npm run lint           # ESLint
@@ -115,39 +130,41 @@ cd src-tauri && cargo clippy --all-targets --no-default-features -- -D clippy::c
 
 CI는 GitHub Actions (`.github/workflows/ci.yml`)에서 위 게이트 + 테스트를 모두 자동 실행합니다.
 
-### Project Structure
+### 프로젝트 구조
 
 ```
 byoridb-studio/
-├── src/                    # React frontend
-│   ├── components/         # UI components (+ co-located *.test.tsx)
+├── src/                    # React 프론트엔드
+│   ├── components/         # UI 컴포넌트 (+ 함께 위치한 *.test.tsx)
 │   │   ├── ConnectionModal.tsx
 │   │   ├── QueryEditor.tsx       # Monaco 기반 에디터
-│   │   ├── ResultPanel.tsx       # 결과 뷰 (Table/JSON/Graph)
+│   │   ├── ResultPanel.tsx       # 결과 뷰 (Table/JSON/Graph/Plan)
+│   │   ├── ExplainView.tsx       # EXPLAIN/PROFILE 실행계획 시각화
 │   │   ├── TableView.tsx         # 가상화 테이블
 │   │   ├── GraphView.tsx         # cytoscape 그래프
 │   │   ├── SchemaManager.tsx     # 스키마/인덱스/통계/ERD 통합
 │   │   ├── ErdDiagram.tsx        # NebulaGraph Studio 스타일 ERD
+│   │   ├── QueryBuilderPanel.tsx # 비주얼 MATCH 쿼리 빌더
 │   │   ├── MonitorPanel.tsx      # 메트릭/서버 상태
 │   │   ├── HistoryPanel.tsx
+│   │   ├── SavedQueriesPanel.tsx
 │   │   ├── DataManager.tsx
 │   │   ├── ServerSettings.tsx
 │   │   └── Sidebar.tsx
 │   ├── hooks/              # useConnection, useQueryExecution, useSchemaData, useToast
-│   ├── lib/                # ngql-language, graph-parser, query-tabs, i18n
+│   ├── lib/                # ngql-language, explainPlan, queryBuilder, credentials, i18n 등
 │   ├── styles/             # 컴포넌트별 CSS (Catppuccin Mocha)
-│   ├── test/               # Vitest setup
+│   ├── test/               # Vitest 설정
 │   ├── types.ts            # 공유 TypeScript 타입
 │   ├── App.tsx
 │   └── main.tsx
-├── src-tauri/              # Tauri/Rust backend
+├── src-tauri/              # Tauri/Rust 백엔드
 │   ├── src/
-│   │   ├── main.rs         # Tauri commands (connect, query, fetch_metrics, …)
+│   │   ├── main.rs         # Tauri 커맨드 (connect, query, fetch_metrics, *_password 등)
 │   │   └── client.rs       # ByoriDB HTTP API 클라이언트 (+ 단위 테스트)
 │   ├── icons/              # 앱 아이콘 (icns/ico/PNG)
 │   ├── Cargo.toml
 │   └── tauri.conf.json
-├── aidlc-docs/             # AI-DLC 산출물 (audit, migration, …)
 ├── .github/workflows/ci.yml
 ├── package.json
 └── vite.config.ts
@@ -155,7 +172,7 @@ byoridb-studio/
 
 ### Tauri 커맨드 목록
 
-| Command | 설명 |
+| 커맨드 | 설명 |
 |---|---|
 | `connect` / `disconnect` | 세션 인증 / 종료 |
 | `execute_query` | 결과 셋 반환 쿼리 |
@@ -165,6 +182,7 @@ byoridb-studio/
 | `get_indexes` | `SHOW TAG/EDGE INDEXES ON <name>` |
 | `test_connection` | 헬스체크 |
 | `fetch_metrics` | Prometheus metrics 프록시 (WebView CSP 우회) |
+| `save_password` / `get_password` / `delete_password` | OS 키체인 비밀번호 보관 |
 
 ---
 
@@ -186,25 +204,23 @@ BYORIDB_ROOT_PASSWORD=byoridb-dev cargo run --release --bin byoridb-server
 
 ---
 
-## Tech Stack
+## 기술 스택
 
-- **Frontend**: React 19, TypeScript 5, Vite 7
-- **Editor**: Monaco Editor + 자체 nGQL Monarch tokenizer
-- **Graph**: Cytoscape.js
-- **Backend**: Rust, Tauri 2, reqwest
-- **Testing**: Vitest, Testing Library, jsdom, fast-check (frontend); `cargo test` (backend)
-- **Styling**: CSS variables (Catppuccin Mocha 라이트/다크 테마)
-
----
-
-## Roadmap
-
-마이그레이션 상세는 [`aidlc-docs/migration/migration-plan.md`](./aidlc-docs/migration/migration-plan.md) 참조.
-
-진행 중인 작업과 다음 작업은 [`NEXT.md`](./NEXT.md), 장기 계획은 [`ROADMAP.md`](./ROADMAP.md) 를 확인하세요.
+- **프론트엔드**: React 19, TypeScript 5, Vite 7
+- **에디터**: Monaco Editor + 자체 nGQL Monarch tokenizer
+- **그래프**: Cytoscape.js
+- **백엔드**: Rust, Tauri 2, reqwest, keyring (OS 키체인)
+- **테스트**: Vitest, Testing Library, jsdom, fast-check (프론트엔드); `cargo test` (백엔드)
+- **스타일**: CSS 변수 (Catppuccin Mocha 라이트/다크 테마)
 
 ---
 
-## License
+## 로드맵
+
+진행 중인 작업과 다음 작업은 [`NEXT.md`](./NEXT.md), 장기 계획은 [`ROADMAP.md`](./ROADMAP.md)를 확인하세요.
+
+---
+
+## 라이선스
 
 Apache-2.0

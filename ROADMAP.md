@@ -1,4 +1,4 @@
-# ByoriDB Studio Roadmap
+# ByoriDB Studio 로드맵
 
 ByoriDB Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정리합니다.
 
@@ -60,12 +60,12 @@ ByoriDB Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정리
 
 **목표**: 개발자 경험(DX) 개선
 
-### 2.1 구문 강조 (Syntax Highlighting)
+### 2.1 구문 강조
 - [x] Monaco Editor 또는 CodeMirror 통합
 - [x] nGQL 언어 정의 (키워드, 연산자, 문자열, 숫자)
 - [x] 괄호 매칭
 
-### 2.2 자동완성 (Autocomplete)
+### 2.2 자동완성
 - [x] nGQL 키워드 자동완성
   - DDL: `CREATE`, `DROP`, `ALTER`, `SHOW`, `DESCRIBE`
   - DML: `INSERT`, `UPDATE`, `DELETE`
@@ -211,13 +211,13 @@ ByoriDB Studio 개발 로드맵. 각 단계별 목표와 구현 항목을 정리
 
 | 단계 | 이름 | 우선순위 | 예상 범위 | 진행률 |
 |------|------|----------|-----------|--------|
-| Phase 1 | 서버 연동 완성 | **Critical** | API 수정, 연결 관리 | 진행 중 (코어 완료) |
-| Phase 2 | 쿼리 에디터 강화 | **High** | Monaco Editor, 자동완성 | 미착수 |
-| Phase 3 | 결과 뷰어 개선 | **High** | 그래프 시각화, 내보내기 | 미착수 |
-| Phase 4 | 스키마 관리 UI | **Medium** | Tag/Edge/Index 폼 | 미착수 |
-| Phase 5 | 데이터 관리 UI | **Medium** | Vertex/Edge CRUD 폼 | 미착수 |
-| Phase 6 | 모니터링 | **Low** | 메트릭 대시보드 | 미착수 |
-| Phase 7 | UX 개선 | **Low** | 테마, 설정, 다국어 | 미착수 |
+| Phase 1 | 서버 연동 완성 | **긴급** | API 수정, 연결 관리 | 완료 |
+| Phase 2 | 쿼리 에디터 강화 | **높음** | Monaco Editor, 자동완성 | 완료 |
+| Phase 3 | 결과 뷰어 개선 | **높음** | 그래프 시각화, 내보내기 | 완료 |
+| Phase 4 | 스키마 관리 UI | **중간** | Tag/Edge/Index 폼 | 완료 |
+| Phase 5 | 데이터 관리 UI | **중간** | Vertex/Edge CRUD 폼 | 완료 |
+| Phase 6 | 모니터링 | **낮음** | 메트릭 대시보드 | 완료 |
+| Phase 7 | UX 개선 | **낮음** | 테마, 설정, 다국어 | 완료 |
 
 ---
 

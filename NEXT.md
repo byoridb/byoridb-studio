@@ -1,8 +1,8 @@
-# 다음 업무 (Next Up)
+# 다음 업무
 
 마지막 업데이트: 2026-05-15 — ROADMAP 전체 구현 완료.
 
-장기 계획은 [ROADMAP.md](./ROADMAP.md), 작업 컨텍스트는 [CLAUDE.md](./CLAUDE.md) 참고.
+장기 계획은 [ROADMAP.md](./ROADMAP.md)를 참고하세요.
 
 ---
 

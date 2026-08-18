@@ -1,6 +1,6 @@
 [package]
 name = "byoridb-studio"
-version = "0.1.0"
+version = "0.1.1"
 description = "ByoriDB Studio - Desktop management tool for ByoriDB"
 authors = ["ByoriDB Team"]
 license = "Apache-2.0"

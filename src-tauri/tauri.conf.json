@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Byori Studio",
-  "version": "0.1.0",
+  "version": "../package.json",
   "identifier": "com.byori.studio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -43,7 +43,16 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app", "dmg"],
+    "category": "Video",
+    "publisher": "Byori Team",
+    "copyright": "Copyright © 2026 Byori Team. Licensed under the Apache License 2.0.",
+    "shortDescription": "로컬 영상 편집기",
+    "longDescription": "타임라인 편집, 자막, 색 보정, 내보내기를 이 컴퓨터에서 처리하는 영상 편집기입니다. 설치된 CLI 에이전트와 창작 기억을 선택해 함께 쓸 수 있습니다.",
+    "licenseFile": "../LICENSE",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

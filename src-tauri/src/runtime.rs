@@ -519,11 +519,11 @@ impl Runtime {
         }
         let db = Database::discover(&self.root);
         let session = db.memory_session().await?;
-        let condition = if text.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE n.studio_note.body CONTAINS '{}'", escape_ngql(text))
-        };
+        let project = params["projectId"].as_str().unwrap_or("");
+        if project.len() > 128 {
+            return Err("프로젝트 ID가 너무 깁니다".into());
+        }
+        let condition = memory_condition(text, project);
         let query=format!("MATCH (n:studio_note){condition} RETURN n.studio_note.id AS id, n.studio_note.body AS body, n.studio_note.kind AS kind, n.studio_note.project_id AS projectId, n.studio_note.clip_id AS clipId, n.studio_note.ts AS createdAt ORDER BY createdAt DESC LIMIT {limit}");
         let result = db.query(session, &query).await;
         db.logout(session).await;
@@ -819,10 +819,11 @@ fn agent_command(
         &serde_json::to_vec(&json!({"mcpServers":servers})).unwrap(),
     )?;
         let mut command = Command::new(executable);
-        let allowed_tools = if higgsfield.is_some() {
+        let allowed_tools = if let Some(bridge) = higgsfield {
             std::iter::once("mcp__studio__*".to_owned())
                 .chain(
-                    crate::mcp_connections::READ_ONLY_TOOLS
+                    bridge
+                        .tools
                         .iter()
                         .map(|tool| format!("mcp__higgsfield__{tool}")),
                 )
@@ -900,7 +901,7 @@ fn agent_command(
                         .arg("mcp_servers.higgsfield.default_tools_approval_mode=\"approve\"");
                     command.arg("-c").arg(format!(
                         "mcp_servers.higgsfield.enabled_tools={}",
-                        json!(crate::mcp_connections::READ_ONLY_TOOLS)
+                        json!(bridge.tools)
                     ));
                 }
                 command.arg("-");
@@ -1126,6 +1127,22 @@ fn parse_version(value: &str) -> Option<semver::Version> {
     )
     .ok()
 }
+/// The WHERE clause of a note search: body text and, when given, one project.
+fn memory_condition(text: &str, project: &str) -> String {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(format!("n.studio_note.body CONTAINS '{}'", escape_ngql(text)));
+    }
+    if !project.is_empty() {
+        parts.push(format!("n.studio_note.project_id == '{}'", escape_ngql(project)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", parts.join(" AND "))
+    }
+}
+
 fn escape_ngql(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -2172,6 +2189,15 @@ mod tests {
     #[test]
     fn query_values_cannot_break_literals() {
         assert_eq!(escape_ngql("a'\\b\n"), "a\\'\\\\b\\n");
+        assert_eq!(memory_condition("", ""), "");
+        assert_eq!(
+            memory_condition("it's", "p1"),
+            " WHERE n.studio_note.body CONTAINS 'it\\'s' AND n.studio_note.project_id == 'p1'"
+        );
+        assert_eq!(
+            memory_condition("", "p'1"),
+            " WHERE n.studio_note.project_id == 'p\\'1'"
+        );
     }
     #[test]
     fn shell_path_quotes_are_preserved() {

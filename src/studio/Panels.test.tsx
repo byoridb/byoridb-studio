@@ -10,12 +10,14 @@ import { describe, expect, it, vi } from "vitest";
 import { Library } from "./Library";
 import { Inspector } from "./Inspector";
 import type { Clip, Project } from "./types";
-import { pickFiles, savePath } from "./api";
+import { pickFiles, savePath, uploadFile } from "./api";
+import { PreviewDraftContext } from "./previewDraft";
 
 vi.mock("./api", () => ({
   assetUrl: (id: string) => `http://studio/assets/${id}`,
   pickFiles: vi.fn().mockResolvedValue(null),
   savePath: vi.fn().mockResolvedValue(null),
+  uploadFile: vi.fn(),
   rpc: vi
     .fn()
     .mockResolvedValue({
@@ -743,9 +745,9 @@ describe("Library media management", () => {
     expect(screen.getByRole("button", { name: /타이틀/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /미니멀/ })).toBeNull();
     for (const [tab, hit, miss] of [
-      ["스티커", "LIVE", "NEW"],
+      ["스티커", "별", "하트"],
       ["효과", "가까이", "원형 프레임"],
-      ["전환", "페이드 인", "없음"],
+      ["전환", "디졸브", "줌"],
       ["필터", "빈티지", "모노"],
     ]) {
       fireEvent.click(screen.getByRole("button", { name: tab }));
@@ -898,5 +900,608 @@ describe("Inspector color inputs", () => {
     expect(command).toHaveBeenCalledWith("project.update", {
       patch: { background: "#223344" },
     });
+  });
+});
+
+describe("Library transitions and stickers", () => {
+  const next: Clip = { ...clip, id: "clip2", name: "산.mp4", start: 5, duration: 4 };
+  const two: Project = { ...project, clips: [clip, next] };
+  const open = (
+    value: Project,
+    selected: Clip | null,
+    command = vi.fn().mockResolvedValue(value),
+    preview = vi.fn(),
+    onSelect = vi.fn(),
+  ) => {
+    render(
+      <PreviewDraftContext.Provider value={preview}>
+        <Library
+          project={value}
+          selected={selected}
+          onCommand={command}
+          onImport={vi.fn()}
+          onSelect={onSelect}
+          playhead={2}
+        />
+      </PreviewDraftContext.Provider>,
+    );
+    return { command, preview, onSelect };
+  };
+
+  it("previews a transition on hover and applies it with a synced fade", async () => {
+    const { command, preview } = open(project, clip);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    const wipe = screen.getByRole("button", { name: "왼쪽 와이프" });
+    fireEvent.mouseEnter(wipe);
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      transitionIn: { type: "wipeLeft", duration: 0.5 },
+      fadeIn: 0.5,
+    });
+    fireEvent.mouseLeave(wipe);
+    expect(preview).toHaveBeenLastCalledWith("clip1", null);
+    fireEvent.click(screen.getByRole("button", { name: "퇴장" }));
+    fireEvent.change(screen.getByLabelText("전환 길이"), { target: { value: "1.5" } });
+    fireEvent.click(screen.getByRole("button", { name: "줌" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { transitionOut: { type: "zoom", duration: 1.5 }, fadeOut: 1.5 },
+      }),
+    );
+  });
+
+  it("changes the length of an applied transition and removes it", async () => {
+    const faded: Clip = {
+      ...clip,
+      fadeIn: 0.5,
+      transitionIn: { type: "slideLeft", duration: 0.5 },
+    };
+    const { command } = open({ ...project, clips: [faded] }, faded);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    expect(screen.getByRole("button", { name: "왼쪽 슬라이드" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const length = screen.getByLabelText("전환 길이");
+    fireEvent.change(length, { target: { value: "1" } });
+    fireEvent.blur(length);
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith(
+        "edit.update",
+        expect.objectContaining({
+          patch: { transitionIn: { type: "slideLeft", duration: 1 }, fadeIn: 1 },
+        }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "등장 전환 제거" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith(
+        "edit.update",
+        expect.objectContaining({ patch: { transitionIn: null, fadeIn: 0 } }),
+      ),
+    );
+  });
+
+  it("offers only a fade for audio clips", () => {
+    const audio: Clip = { ...clip, kind: "audio" };
+    open({ ...project, clips: [audio] }, audio);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    expect(screen.getByRole("button", { name: "페이드" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "디졸브" })).toBeNull();
+  });
+
+  it("joins a clip to the previous one as one atomic batch", async () => {
+    const third: Clip = { ...clip, id: "clip3", start: 9, duration: 2 };
+    const value = { ...two, clips: [clip, next, third] };
+    const { command } = open(value, next);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    fireEvent.click(screen.getByRole("button", { name: "앞 클립과 겹쳐 전환" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: {
+              id: "clip2",
+              patch: {
+                transitionIn: { type: "dissolve", duration: 0.5 },
+                fadeIn: 0.5,
+                start: 4.5,
+              },
+            },
+          },
+          { method: "edit.update", params: { id: "clip3", patch: { start: 8.5 } } },
+        ],
+      }),
+    );
+  });
+
+  it("joins an audio clip with a fade, the only transition audio supports", async () => {
+    const first: Clip = { ...clip, kind: "audio" };
+    const second: Clip = { ...next, kind: "audio" };
+    const { command } = open({ ...project, clips: [first, second] }, second);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    fireEvent.click(screen.getByRole("button", { name: "앞 클립과 겹쳐 전환" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: {
+              id: "clip2",
+              patch: {
+                transitionIn: { type: "fade", duration: 0.5 },
+                fadeIn: 0.5,
+                start: 4.5,
+              },
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  it("moves the following clips when a joined clip's transition length changes", async () => {
+    const joined: Clip = {
+      ...next,
+      start: 4.5,
+      fadeIn: 0.5,
+      transitionIn: { type: "dissolve", duration: 0.5 },
+    };
+    const third: Clip = { ...clip, id: "clip3", start: 8.5, duration: 2 };
+    const { command } = open({ ...project, clips: [clip, joined, third] }, joined);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    const length = screen.getByLabelText("전환 길이");
+    fireEvent.change(length, { target: { value: "1" } });
+    fireEvent.blur(length);
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: {
+              id: "clip2",
+              patch: {
+                transitionIn: { type: "dissolve", duration: 1 },
+                fadeIn: 1,
+                start: 4,
+              },
+            },
+          },
+          { method: "edit.update", params: { id: "clip3", patch: { start: 8 } } },
+        ],
+      }),
+    );
+  });
+
+  it("imports a sticker as image media, places it at the playhead and scales it down", async () => {
+    const media = {
+      id: "sticker-media",
+      name: "abc-sticker-star.png",
+      path: "/imports/abc-sticker-star.png",
+      kind: "image" as const,
+      duration: 5,
+      width: 512,
+      height: 512,
+      hasAudio: false,
+    };
+    const uploaded: Project = { ...project, revision: 8, media: [...project.media, media] };
+    const placed: Clip = { ...clip, id: "sticker-clip", mediaId: media.id, kind: "image" };
+    const added: Project = { ...uploaded, revision: 9, clips: [clip, placed] };
+    vi.mocked(uploadFile).mockResolvedValue(uploaded);
+    const fetched = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(["png"], { type: "image/png" }),
+    });
+    vi.stubGlobal("fetch", fetched);
+    try {
+      const { command, onSelect } = open(project, null, vi.fn().mockResolvedValue(added));
+      fireEvent.click(screen.getByRole("button", { name: "스티커" }));
+      fireEvent.click(screen.getByRole("button", { name: "별 스티커 추가" }));
+      await waitFor(() => expect(onSelect).toHaveBeenCalledWith("sticker-clip"));
+      expect(fetched.mock.calls[0][0]).toMatch(/stickers\/sticker-star\.png$/);
+      const [file, projectId] = vi.mocked(uploadFile).mock.calls[0];
+      expect(file.name).toBe("sticker-star.png");
+      expect(projectId).toBe("project1");
+      // One command, so one undo step.
+      expect(command).toHaveBeenCalledTimes(1);
+      expect(command).toHaveBeenCalledWith("edit.add", {
+        mediaId: "sticker-media",
+        start: 2,
+        duration: 3,
+        name: "별 스티커",
+        transform: { scale: 0.35 },
+        expectedRevision: 8,
+      });
+      expect(onSelect).toHaveBeenCalledWith("sticker-clip");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reuses a sticker already in the project and reports a failed download", async () => {
+    vi.mocked(uploadFile).mockClear();
+    const media = { ...project.media[0], id: "m2", name: "x-sticker-heart.png", kind: "image" as const };
+    const value = { ...project, media: [...project.media, media] };
+    const fetched = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(["<html>"], { type: "text/html" }),
+    });
+    vi.stubGlobal("fetch", fetched);
+    try {
+      const { command } = open(value, null);
+      fireEvent.click(screen.getByRole("button", { name: "스티커" }));
+      fireEvent.click(screen.getByRole("button", { name: "하트 스티커 추가" }));
+      await waitFor(() =>
+        expect(command).toHaveBeenCalledWith(
+          "edit.add",
+          expect.objectContaining({ mediaId: "m2", expectedRevision: 7 }),
+        ),
+      );
+      expect(fetched).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "별 스티커 추가" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "스티커 이미지를 불러오지 못했습니다.",
+      );
+      expect(uploadFile).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("Inspector animation, transitions and styles", () => {
+  const inspect = (selected: Clip, value: Project = { ...project, clips: [selected] }, playhead = 2) => {
+    const command = vi.fn().mockResolvedValue(value);
+    const preview = vi.fn();
+    render(
+      <PreviewDraftContext.Provider value={preview}>
+        <Inspector project={value} selected={selected} onCommand={command} playhead={playhead} />
+      </PreviewDraftContext.Provider>,
+    );
+    return { command, preview };
+  };
+  const patched = (command: ReturnType<typeof vi.fn>) =>
+    (command.mock.calls.slice(-1)[0][1] as { patch: Record<string, unknown> }).patch;
+  const text: Clip = {
+    ...clip,
+    kind: "text",
+    mediaId: undefined,
+    text: {
+      content: "제목",
+      fontSize: 64,
+      color: "#ffffff",
+      fontFamily: "Arial",
+      bold: false,
+      align: "center",
+      background: "transparent",
+    },
+  };
+
+  it("records the animated value at the playhead and removes that keyframe again", async () => {
+    const animated: Clip = {
+      ...clip,
+      keyframes: [
+        { property: "transform.scale", time: 0, value: 1, easing: "easeIn" },
+        { property: "transform.scale", time: 2, value: 2 },
+      ],
+    };
+    const { command } = inspect(animated);
+    fireEvent.click(screen.getByRole("button", { name: "애니메이션" }));
+    // Playhead 2 is clip-local 1: half way through an ease-in from 1 to 2.
+    fireEvent.click(screen.getByRole("button", { name: "크기 키프레임 추가" }));
+    await waitFor(() => expect(command).toHaveBeenCalled());
+    expect(patched(command).keyframes).toEqual([
+      { property: "transform.scale", time: 0, value: 1, easing: "easeIn" },
+      { property: "transform.scale", time: 1, value: 1.25 },
+      { property: "transform.scale", time: 2, value: 2 },
+    ]);
+    expect(command.mock.calls[0][1]).toMatchObject({ id: "clip1", expectedRevision: 7 });
+  });
+
+  it("moves, retimes, eases and deletes a keyframe", async () => {
+    const animated: Clip = {
+      ...clip,
+      keyframes: [
+        { property: "transform.x", time: 0, value: 0 },
+        { property: "transform.x", time: 3, value: 100 },
+      ],
+    };
+    const { command } = inspect(animated, undefined, 1);
+    fireEvent.click(screen.getByRole("button", { name: "애니메이션" }));
+    expect(screen.getByRole("button", { name: "위치 X 키프레임 삭제" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.change(screen.getByLabelText("위치 X 키프레임 1 가속"), {
+      target: { value: "easeInOut" },
+    });
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(1));
+    expect(patched(command).keyframes).toEqual([
+      { property: "transform.x", time: 0, value: 0, easing: "easeInOut" },
+      { property: "transform.x", time: 3, value: 100 },
+    ]);
+    expect(screen.getByLabelText("위치 X 키프레임 2 가속")).toBeDisabled();
+    const time = screen.getByLabelText("위치 X 키프레임 2 시간");
+    fireEvent.change(time, { target: { value: "9" } });
+    fireEvent.blur(time);
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(2));
+    // Bounded by the clip length.
+    expect(patched(command).keyframes).toEqual([
+      { property: "transform.x", time: 0, value: 0 },
+      { property: "transform.x", time: 4, value: 100 },
+    ]);
+    const value = screen.getByLabelText("위치 X 키프레임 2 값");
+    fireEvent.change(value, { target: { value: "250" } });
+    fireEvent.blur(value);
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(3));
+    expect(patched(command).keyframes).toContainEqual({
+      property: "transform.x",
+      time: 3,
+      value: 250,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "위치 X 키프레임 2 삭제" }));
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(4));
+    expect(patched(command).keyframes).toEqual([{ property: "transform.x", time: 0, value: 0 }]);
+  });
+
+  it("keyframes volume for clips with sound and nothing visual for audio clips", () => {
+    const audio: Clip = { ...clip, kind: "audio" };
+    inspect(audio);
+    fireEvent.click(screen.getByRole("button", { name: "애니메이션" }));
+    expect(screen.getByRole("button", { name: "볼륨 키프레임 추가" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "크기 키프레임 추가" })).toBeNull();
+    expect(screen.queryByText("인 · 아웃 애니메이션")).toBeNull();
+  });
+
+  it("applies an in animation preset as editable keyframes and removes it", async () => {
+    const { command } = inspect(clip);
+    fireEvent.click(screen.getByRole("button", { name: "애니메이션" }));
+    fireEvent.click(screen.getByRole("button", { name: "인 애니메이션 확대" }));
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(1));
+    expect(patched(command).keyframes).toEqual([
+      { property: "transform.scale", time: 0, value: 0.6, easing: "easeOut" },
+      { property: "transform.opacity", time: 0, value: 0, easing: "easeOut" },
+      { property: "transform.scale", time: 0.5, value: 1 },
+      { property: "transform.opacity", time: 0.5, value: 1 },
+    ]);
+  });
+
+  it("shows the active preset and clears only that edge", async () => {
+    const animated: Clip = {
+      ...clip,
+      keyframes: [
+        { property: "transform.x", time: 3.5, value: 0, easing: "easeIn" },
+        { property: "transform.x", time: 4, value: 1920 },
+        { property: "transform.opacity", time: 0, value: 0, easing: "easeOut" },
+        { property: "transform.opacity", time: 0.5, value: 1 },
+      ],
+    };
+    const { command } = inspect(animated);
+    fireEvent.click(screen.getByRole("button", { name: "애니메이션" }));
+    expect(screen.getByRole("button", { name: "인 애니메이션 페이드" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "아웃" }));
+    expect(screen.getByRole("button", { name: "아웃 애니메이션 오른쪽" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "아웃 애니메이션 없음" }));
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(1));
+    expect(patched(command).keyframes).toEqual(animated.keyframes.slice(2));
+  });
+
+  it("sets a transition per edge and treats a legacy fade length as a fade", async () => {
+    const legacy: Clip = { ...clip, fadeOut: 0.8 };
+    const { command, preview } = inspect(legacy);
+    expect(screen.getByLabelText("퇴장 전환")).toHaveValue("fade");
+    expect(screen.getByLabelText("등장 전환")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("등장 전환"), { target: { value: "wipeUp" } });
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { transitionIn: { type: "wipeUp", duration: 0.5 }, fadeIn: 0.5 },
+      }),
+    );
+    const length = screen.getByRole("spinbutton", { name: "퇴장 길이" });
+    fireEvent.change(length, { target: { value: "1.2" } });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      transitionOut: { type: "fade", duration: 1.2 },
+      fadeOut: 1.2,
+    });
+    fireEvent.blur(length);
+    await waitFor(() =>
+      expect(command).toHaveBeenLastCalledWith(
+        "edit.update",
+        expect.objectContaining({
+          patch: { transitionOut: { type: "fade", duration: 1.2 }, fadeOut: 1.2 },
+        }),
+      ),
+    );
+  });
+
+  it("separates an overlapped clip when its in transition is removed", async () => {
+    const previous: Clip = { ...clip, id: "clip0", start: 0, duration: 3 };
+    const joined: Clip = {
+      ...clip,
+      start: 2.5,
+      fadeIn: 0.5,
+      transitionIn: { type: "dissolve", duration: 0.5 },
+    };
+    const later: Clip = { ...clip, id: "clip9", start: 6.5 };
+    const { command } = inspect(joined, { ...project, clips: [previous, joined, later] });
+    expect(screen.queryByRole("button", { name: "앞 클립과 겹쳐 전환" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("등장 전환"), { target: { value: "" } });
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: { id: "clip1", patch: { transitionIn: null, fadeIn: 0, start: 3 } },
+          },
+          { method: "edit.update", params: { id: "clip9", patch: { start: 7 } } },
+        ],
+      }),
+    );
+  });
+
+  it("keeps the overlap equal to a joined clip's in transition and resets both edges", async () => {
+    const previous: Clip = { ...clip, id: "clip0", start: 0, duration: 3 };
+    const joined: Clip = {
+      ...clip,
+      start: 2.5,
+      fadeIn: 0.5,
+      transitionIn: { type: "dissolve", duration: 0.5 },
+      fadeOut: 0.4,
+      transitionOut: { type: "fade", duration: 0.4 },
+    };
+    const later: Clip = { ...clip, id: "clip9", start: 6.5 };
+    const { command } = inspect(joined, { ...project, clips: [previous, joined, later] });
+    const length = screen.getByRole("spinbutton", { name: "등장 길이" });
+    fireEvent.change(length, { target: { value: "1" } });
+    fireEvent.blur(length);
+    await waitFor(() =>
+      expect(command).toHaveBeenLastCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: {
+              id: "clip1",
+              patch: { transitionIn: { type: "dissolve", duration: 1 }, fadeIn: 1, start: 2 },
+            },
+          },
+          { method: "edit.update", params: { id: "clip9", patch: { start: 6 } } },
+        ],
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "전환 초기화" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenLastCalledWith("edit.batch", {
+        expectedRevision: 7,
+        commands: [
+          {
+            method: "edit.update",
+            params: {
+              id: "clip1",
+              patch: {
+                transitionIn: null,
+                fadeIn: 0,
+                transitionOut: null,
+                fadeOut: 0,
+                start: 3,
+              },
+            },
+          },
+          { method: "edit.update", params: { id: "clip9", patch: { start: 7 } } },
+        ],
+      }),
+    );
+  });
+
+  it("sets the blend mode", async () => {
+    const { command } = inspect(clip);
+    fireEvent.change(screen.getByLabelText("블렌드 모드"), { target: { value: "screen" } });
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { blendMode: "screen" },
+      }),
+    );
+  });
+
+  it("previews and commits text outline, shadow, spacing and italics", async () => {
+    const { command, preview } = inspect(text);
+    fireEvent.click(screen.getByRole("button", { name: "기울임" }));
+    await waitFor(() => expect(patched(command).text).toMatchObject({ italic: true }));
+    fireEvent.click(screen.getByRole("button", { name: "텍스트 스타일" }));
+    const width = screen.getByRole("spinbutton", { name: "외곽선 두께" });
+    fireEvent.change(width, { target: { value: "6" } });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      text: { ...text.text, outline: { color: "#000000", width: 6 } },
+    });
+    expect(command).toHaveBeenCalledTimes(1);
+    fireEvent.blur(width);
+    await waitFor(() =>
+      expect(patched(command).text).toMatchObject({ outline: { color: "#000000", width: 6 } }),
+    );
+    const spacing = screen.getByRole("spinbutton", { name: "자간" });
+    fireEvent.change(spacing, { target: { value: "80" } });
+    fireEvent.blur(spacing);
+    await waitFor(() => expect(patched(command).text).toMatchObject({ letterSpacing: 50 }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "그림자" }));
+    await waitFor(() =>
+      expect(patched(command).text).toMatchObject({
+        shadow: { color: "#000000", x: 0, y: 4, blur: 8 },
+      }),
+    );
+  });
+
+  it("previews crop, mask, HSL and EQ sliders before committing", async () => {
+    const masked: Clip = {
+      ...clip,
+      mask: { type: "circle", x: 0.5, y: 0.5, width: 1, height: 1, feather: 0 },
+    };
+    const { command, preview } = inspect(masked);
+    fireEvent.click(screen.getByRole("button", { name: "자르기" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "크롭 너비" }), {
+      target: { value: "50" },
+    });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      crop: { x: 0, y: 0, width: 0.5, height: 1 },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "마스크" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "가장자리 부드럽게" }), {
+      target: { value: "40" },
+    });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      mask: { ...masked.mask, feather: 0.4 },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "이퀄라이저" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "저음" }), {
+      target: { value: "6" },
+    });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      audio: {
+        normalize: false,
+        denoise: false,
+        voiceEnhance: false,
+        eq: { bass: 6, mid: 0, treble: 0 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "조정" }));
+    fireEvent.click(screen.getByRole("button", { name: "HSL" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "HSL 채도" }), {
+      target: { value: "30" },
+    });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      color: { ...clip.color, hsl: { red: { hue: 0, saturation: 0.3, lightness: 0 } } },
+    });
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it("resets brightness and colour groups independently", async () => {
+    const graded: Clip = {
+      ...clip,
+      color: { brightness: 0.2, contrast: 1.3, saturation: 0.5, temperature: 0.4, hue: 20 },
+    };
+    const { command } = inspect(graded);
+    fireEvent.click(screen.getByRole("button", { name: "조정" }));
+    fireEvent.click(screen.getByRole("button", { name: "색상 초기화" }));
+    await waitFor(() =>
+      expect(patched(command)).toEqual({
+        color: { brightness: 0.2, contrast: 1.3, saturation: 1, temperature: 0, hue: 0 },
+        filter: "none",
+      }),
+    );
   });
 });

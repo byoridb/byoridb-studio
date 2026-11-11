@@ -47,13 +47,13 @@ const animates = (property: string) => (key: Clip["keyframes"][number]) =>
   key.property === property || key.property === `transform.${property}`;
 
 /**
- * A canvas move/scale edits what is on screen. An animated property is written
+ * A canvas move/scale/rotate edits what is on screen. An animated property is written
  * as a keyframe at the playhead (replacing one within half a frame); a static
  * property is written to the transform.
  */
 export function canvasTransformPatch(
   clip: Clip,
-  values: Partial<Record<"x" | "y" | "scale", number>>,
+  values: Partial<Record<"x" | "y" | "scale" | "rotation", number>>,
   time: number,
   fps: number,
 ): Partial<Clip> {
@@ -61,7 +61,7 @@ export function canvasTransformPatch(
   const transform = { ...clip.transform };
   let keyframes = clip.keyframes || [];
   let animated = false;
-  for (const [property, value] of Object.entries(values) as ["x" | "y" | "scale", number][]) {
+  for (const [property, value] of Object.entries(values) as ["x" | "y" | "scale" | "rotation", number][]) {
     const matches = animates(property);
     const existing = keyframes.filter(matches);
     if (!existing.length) { transform[property] = value; continue; }
@@ -90,4 +90,77 @@ export function waveformBars(peaks: number[], limit = 240): number[] {
   if (peaks.length <= limit) return peaks;
   return Array.from({ length: limit }, (_, index) =>
     Math.max(...peaks.slice(Math.floor((index * peaks.length) / limit), Math.floor(((index + 1) * peaks.length) / limit))));
+}
+
+export interface ClipJunction {
+  /** The earlier clip and the one that follows (or overlaps) it on the same track. */
+  before: Clip;
+  after: Clip;
+}
+
+/** Neighbouring clips of one track that touch or overlap: where a transition can sit. */
+export function clipJunctions(clips: Clip[], fps: number): ClipJunction[] {
+  const ordered = [...clips].sort((a, b) => a.start - b.start);
+  const junctions: ClipJunction[] = [];
+  for (let index = 1; index < ordered.length; index++) {
+    const before = ordered[index - 1], after = ordered[index];
+    if (after.start <= before.start + before.duration + 0.5 / Math.max(1, fps) && after.start > before.start)
+      junctions.push({ before, after });
+  }
+  return junctions;
+}
+
+/**
+ * The longest transition a junction can hold: half of the shorter clip, so the
+ * transitions at both ends of one clip never meet. The Library and Inspector
+ * (clipPresets) build their batches from junctionTransitionCommands, so share it.
+ */
+export const maxTransitionDuration = (junction: ClipJunction, _fps?: number) =>
+  Math.min(junction.before.duration, junction.after.duration) / 2;
+
+/** edit.batch accepts at most this many commands (editor.rs). */
+export const BATCH_LIMIT = 500;
+
+/** Why a junction's transition cannot be edited as one batch, or null when it can. */
+export function junctionTransitionBlocked(project: Project, junction: ClipJunction): string | null {
+  const { before, after } = junction;
+  let moved = 1;
+  for (const clip of project.clips)
+    if (clip.trackId === after.trackId && clip.id !== after.id && clip.id !== before.id && clip.start > after.start - epsilon) moved++;
+  return moved > BATCH_LIMIT
+    ? `이 뒤로 같은 트랙에 클립이 ${moved - 1}개 있어 한 번에 옮길 수 없습니다(최대 ${BATCH_LIMIT - 1}개). 트랙을 나누거나 뒤쪽 접점부터 전환을 넣어 주세요.`
+    : null;
+}
+
+/**
+ * Set, change or remove the transition between two neighbouring clips as one
+ * batch: the later clip (and everything after it on the track) moves so that
+ * the two clips overlap by exactly the transition duration, and the later clip
+ * carries the transition as its transitionIn.
+ */
+export function junctionTransitionCommands(
+  project: Project,
+  junction: ClipJunction,
+  transition: { type: string; duration: number } | null,
+): ClipEditCommand[] {
+  const { before, after } = junction;
+  const frame = frameDuration(project);
+  const duration = transition
+    ? Math.max(frame, Math.min(maxTransitionDuration(junction, project.fps), Math.round(transition.duration / frame) * frame))
+    : 0;
+  const overlap = Math.max(0, before.start + before.duration - after.start);
+  const shift = overlap - duration;
+  const commands: ClipEditCommand[] = [];
+  if (Math.abs(shift) > epsilon)
+    for (const clip of project.clips)
+      if (clip.trackId === after.trackId && clip.id !== after.id && clip.start > after.start - epsilon && clip.id !== before.id)
+        commands.push({ method: "edit.update", params: { id: clip.id, patch: { start: Math.max(0, clip.start + shift) } } });
+  const next = transition && duration > 0 ? { type: transition.type, duration } : null;
+  const patch: Record<string, unknown> = {};
+  if (Math.abs(shift) > epsilon) patch.start = Math.max(0, after.start + shift);
+  const current = after.transitionIn ?? null;
+  if ((current?.type ?? null) !== (next?.type ?? null) || Math.abs((current?.duration ?? 0) - (next?.duration ?? 0)) > epsilon)
+    patch.transitionIn = next;
+  if (Object.keys(patch).length) commands.unshift({ method: "edit.update", params: { id: after.id, patch } });
+  return commands;
 }

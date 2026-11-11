@@ -1,0 +1,57 @@
+Byori Studio
+Copyright 2026 Byori Team
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software
+--------------------
+
+Byori Studio is built with, and its application bundle contains compiled code
+from, open source libraries. Each remains under its own license; the full
+dependency lists with exact versions are package-lock.json and
+src-tauri/Cargo.lock. Direct dependencies:
+
+  Desktop shell and service (Rust)
+    Tauri, tauri-build                MIT OR Apache-2.0
+    Tokio, Axum, Tower, tower-http    MIT
+    Serde, serde_json                 MIT OR Apache-2.0
+    reqwest                           MIT OR Apache-2.0
+    futures-util, uuid, semver, sha2  MIT OR Apache-2.0
+    tracing, tracing-subscriber       MIT
+    rfd, plist                        MIT
+    dirs                              MIT OR Apache-2.0
+    image                             MIT OR Apache-2.0
+    fontdue                           MIT OR Apache-2.0 OR Zlib
+
+  User interface (JavaScript)
+    React, React DOM                  MIT
+    @tauri-apps/api                   MIT OR Apache-2.0
+    lucide-react (Lucide icons)       ISC
+
+External programs
+-----------------
+
+Byori Studio does not include the following programs. It runs the copies
+installed on the user's computer, under their own licenses:
+
+  FFmpeg and ffprobe (media probing, preview frames, proxies, rendering)
+  Python 3 (the local MCP bridge in scripts/)
+  OpenAI Whisper (optional automatic captions)
+  macOS "say" (system text-to-speech)
+  Claude Code, Codex CLI and Gemini CLI (optional editing agents)
+  Node.js with the mcp-remote package (optional Higgsfield connection)
+  ByoriDB (optional creative memory database)
+
+Demonstration media
+-------------------
+
+The files in public/demo are bundled only for the explicitly labelled example
+project. Their origin is recorded in public/demo/SOURCES.md:
+
+  coast.jpg, mountain.jpg, lake.jpg
+    Photographs downloaded from Unsplash (images.unsplash.com; the exact URLs
+    are listed in SOURCES.md) and used under the Unsplash License,
+    https://unsplash.com/license.
+  ambient.wav
+    Synthesized locally with FFmpeg's sine source. It contains no recorded
+    music or third-party material.

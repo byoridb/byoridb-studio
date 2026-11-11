@@ -52,10 +52,19 @@ export class MediaPlayback {
   private clockHeld = false;
   private waitingSince: number | null = null;
   private playRequest = 0;
+  /** Playing without sound because the engine refused an unprimed element. */
+  private silenced = false;
   private listeners: [string, EventListener][] = [];
 
-  constructor(private element: HTMLMediaElement, private onError: (message: string) => void) {
+  constructor(
+    private element: HTMLMediaElement,
+    private onError: (message: string) => void,
+    /** A problem that does not stop playback. */
+    private onNotice?: (message: string) => void,
+  ) {
     transports.add(this);
+    // An ended element is paused by the browser: a later seek must play it again.
+    this.listen("ended", () => { if (!this.pending) this.requested = false; });
     this.listen("loadedmetadata", () => { this.seekWhenReady = true; this.synchronize(); });
     this.listen("canplay", () => { this.waiting = false; this.synchronize(); });
     this.listen("playing", () => { this.waiting = false; });
@@ -137,7 +146,7 @@ export class MediaPlayback {
     const el = this.element;
     // Use volume for user/track silence. Setting muted then unmuting outside a gesture
     // can cause WebKit to stop a previously started element.
-    if (el.muted) el.muted = false;
+    if (el.muted !== this.silenced) el.muted = this.silenced;
     const volume = state.active ? Math.max(0, Math.min(1, state.volume)) : 0;
     if (el.volume !== volume) el.volume = volume;
     const rate = Math.max(.0625, Math.min(16, state.speed));
@@ -188,8 +197,21 @@ export class MediaPlayback {
       this.pending = false;
       this.requested = false;
       if (this.disposed || !this.shouldPlay()) return;
-      if (error instanceof Error && error.name === "AbortError") return;
-      this.fail(error instanceof Error && error.name === "NotAllowedError"
+      // A DOMException of another realm is not `instanceof Error`: go by its name.
+      const name = (error as { name?: unknown } | null)?.name;
+      if (name === "AbortError") return;
+      const refused = name === "NotAllowedError";
+      // Elements mounted after the play gesture were never primed. An engine that
+      // grants playback per element refuses their sound, but not a muted start:
+      // keep the timeline running and play this one silently.
+      if (refused && !this.silenced) {
+        this.silenced = true;
+        this.element.muted = true;
+        this.onNotice?.("브라우저가 소리 자동 재생을 막아 이 클립은 소리 없이 재생합니다. 재생을 멈췄다가 다시 누르면 소리가 납니다.");
+        this.play();
+        return;
+      }
+      this.fail(refused
         ? "소리 재생을 시작하려면 재생 버튼을 다시 눌러주세요."
         : "미디어 재생에 실패했습니다. 다시 재생하거나 정밀 재생을 선택해 주세요.");
     });
@@ -198,6 +220,9 @@ export class MediaPlayback {
   prime() {
     if (!this.snapshot || !this.element.getAttribute("src")) return;
     if (this.element.volume !== 0) this.element.volume = 0;
+    // Inside the gesture the element may sound again.
+    this.silenced = false;
+    if (this.element.muted) this.element.muted = false;
     this.play(true);
     // React's playback update follows this same gesture. Inactive elements remain
     // silent and pause when the pending play resolves, but retain their permission.

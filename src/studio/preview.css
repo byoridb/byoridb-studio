@@ -27,3 +27,72 @@
   font-size: 11px;
   line-height: 1.5;
 }
+.layer-wipe {
+  flex: none;
+}
+.layer-frame {
+  position: relative;
+  flex: none;
+  overflow: hidden;
+}
+.layer-frame > img,
+.layer-frame > video {
+  display: block;
+  pointer-events: none;
+  user-select: none;
+}
+.player-viewport.zoomed {
+  display: block;
+  overflow: auto;
+}
+.composition-frame {
+  position: relative;
+  flex: none;
+}
+.player-viewport.zoomed > .composition-frame {
+  width: max-content;
+  margin: 20px auto;
+}
+.player-viewport:fullscreen {
+  background: #000;
+}
+.player-viewport:fullscreen .composition {
+  box-shadow: none;
+}
+.player-loop {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.player-loop > button {
+  min-width: 20px;
+  height: 22px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted, #a7adb7);
+}
+.player-loop > button.active {
+  color: var(--accent, #37d7cb);
+  background: #263b3a;
+}
+.player-volume {
+  width: 64px;
+  accent-color: var(--accent, #37d7cb);
+}
+.player-zoom {
+  height: 22px;
+  border: 1px solid #41464f;
+  border-radius: 4px;
+  background: #292c31;
+  color: var(--text, #f0f2f5);
+  font: inherit;
+  font-size: 10px;
+  padding: 1px 3px;
+}
+.player-zoom:focus-visible,
+.player-volume:focus-visible,
+.player-loop > button:focus-visible {
+  outline: 2px solid var(--accent, #37d7cb);
+  outline-offset: 1px;
+}

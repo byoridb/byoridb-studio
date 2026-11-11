@@ -241,3 +241,48 @@ it("does not turn a ready peer into a second buffering source when holding the c
   expect(peer.writes.seeks).toEqual([]);
   expect(peer.play).toHaveBeenCalledTimes(2);
 });
+
+it("plays an element refused outside the play gesture without sound, and restores sound on the next gesture", async () => {
+  const { element, play, error, transport } = source();
+  const notice = vi.fn();
+  (transport as unknown as { onNotice: typeof notice }).onNotice = notice;
+  play.mockImplementation(() => element.muted
+    ? Promise.resolve()
+    : Promise.reject(new DOMException("blocked", "NotAllowedError")));
+  transport.update(state);
+  await vi.waitFor(() => expect(play).toHaveBeenCalledTimes(2));
+  await Promise.resolve();
+  expect(element.muted).toBe(true);
+  expect(notice).toHaveBeenCalledTimes(1);
+  expect(error).not.toHaveBeenCalled();
+  expect(transport.participates()).toBe(true);
+  // Later frames keep it muted instead of unmuting it outside a gesture.
+  transport.update({ ...state, time: 2.1, target: 7.1 });
+  expect(element.muted).toBe(true);
+  play.mockImplementation(() => Promise.resolve());
+  element.setAttribute("src", "http://studio/sound");
+  transport.prime();
+  expect(element.muted).toBe(false);
+  transport.update({ ...state, time: 2.2, target: 7.2 });
+  expect(element.muted).toBe(false);
+});
+
+it("still stops when even a muted start is refused", async () => {
+  const { play, error, transport } = source();
+  play.mockImplementation(() => Promise.reject(new DOMException("blocked", "NotAllowedError")));
+  transport.update(state);
+  await vi.waitFor(() => expect(error).toHaveBeenCalledTimes(1));
+  expect(play).toHaveBeenCalledTimes(2);
+});
+
+it("plays again after the element ended and the clock seeks back", async () => {
+  const { element, media, play, transport } = source();
+  transport.update({ ...state, seekEpoch: 0 });
+  await Promise.resolve();
+  expect(play).toHaveBeenCalledTimes(1);
+  media.paused = true;
+  element.dispatchEvent(new Event("ended"));
+  transport.update({ ...state, time: 0, target: 0, seekEpoch: 1 });
+  expect(play).toHaveBeenCalledTimes(2);
+  expect(media.position).toBe(0);
+});

@@ -1,17 +1,17 @@
-.custom-assets { border-top: 1px solid var(--border, #34373c); margin-top: 18px; padding-top: 12px; }
+.custom-assets { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 12px; }
 .custom-assets-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .custom-assets-heading h3 { margin: 0; font-size: 12px; font-weight: 500; }
-.custom-assets-heading h3 span { margin-left: 5px; color: #a7adb7; font-size: 10px; }
+.custom-assets-heading h3 span { margin-left: 5px; color: var(--muted); font-size: 10px; }
 .custom-assets-heading .panel-action-button { padding: 5px 7px; font-size: 11px; }
 .save-preset-form, .asset-path-details form { display: flex; gap: 5px; margin: 8px 0; }
-.save-preset-form input, .asset-path-details input { min-width: 0; flex: 1; border: 1px solid #41464f; background: #292c31; color: #f0f2f5; padding: 6px 8px; border-radius: 4px; font-size: 11px; }
-.save-preset-form button, .asset-path-details form button, .asset-icon-button { display: grid; place-items: center; background: #292c31; border: 1px solid #41464f; border-radius: 4px; color: #c9d1dc; padding: 6px; flex-shrink: 0; }
-.custom-assets button:hover:enabled { background-color: #34383f; }
+.save-preset-form input, .asset-path-details input { min-width: 0; flex: 1; border: 1px solid var(--control-border); background: var(--control-bg); color: var(--text); padding: 6px 8px; border-radius: 4px; font-size: 11px; }
+.save-preset-form button, .asset-path-details form button, .asset-icon-button { display: grid; place-items: center; background: var(--control-bg); border: 1px solid var(--control-border); border-radius: 4px; color: var(--secondary-ink); padding: 6px; flex-shrink: 0; }
+.custom-assets button:hover:enabled { background-color: var(--control-hover); }
 .custom-assets button:disabled { opacity: .45; cursor: default; }
-.asset-path-details { margin: 8px 0; font-size: 10px; color: #a7adb7; }
+.asset-path-details { margin: 8px 0; font-size: 10px; color: var(--muted); }
 .asset-path-details summary { cursor: pointer; }
-.custom-asset-row { display: flex; align-items: center; gap: 5px; padding: 5px 0; border-bottom: 1px solid #2c2f34; }
-.custom-asset-apply { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; border: 0; border-radius: 4px; text-align: left; padding: 8px; background: #25272b; color: #e5e9ef; font-size: 12px; overflow-wrap: anywhere; }
-.font-sample small { display: block; margin-top: 4px; color: #a7adb7; font-size: 13px; }
-.asset-notice { font-size: 11px; color: #70e1d4; line-height: 1.5; }
+.custom-asset-row { display: flex; align-items: center; gap: 5px; padding: 5px 0; border-bottom: 1px solid var(--control-bg); }
+.custom-asset-apply { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; border: 0; border-radius: 4px; text-align: left; padding: 8px; background: var(--panel-raised); color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.font-sample small { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; }
+.asset-notice { font-size: 11px; color: var(--action-hover); line-height: 1.5; }
 .inspector-font-add { justify-content: center; margin: 0 0 8px; width: 100%; }

@@ -59,9 +59,11 @@ export async function rpc<T = unknown>(
     throw new Error(body.error || `요청 실패 (${response.status})`);
   return body.result as T;
 }
-export function assetUrl(id: string, thumbnail = false): string {
+/** `true` serves the thumbnail, `"proxy"` the lighter playback copy (404 when none exists). */
+export function assetUrl(id: string, variant: boolean | "proxy" = false): string {
   if (!connection) return "";
-  return `${connection.url}/assets/${encodeURIComponent(id)}${thumbnail ? "/thumbnail" : ""}?token=${encodeURIComponent(connection.token)}`;
+  const suffix = variant === "proxy" ? "/proxy" : variant ? "/thumbnail" : "";
+  return `${connection.url}/assets/${encodeURIComponent(id)}${suffix}?token=${encodeURIComponent(connection.token)}`;
 }
 export async function uploadFile(
   file: File,

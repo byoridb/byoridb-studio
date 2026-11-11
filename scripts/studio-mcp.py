@@ -12,7 +12,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 # One definition of the agent-facing tools, shared with the service's server-side allowlist.
-TOOLS = json.loads(Path(__file__).with_name('studio-tools.json').read_text(encoding='utf-8'))['tools']
+DEFINITION = json.loads(Path(__file__).with_name('studio-tools.json').read_text(encoding='utf-8'))
+TOOLS = DEFINITION['tools']
+VERSION = DEFINITION.get('version', '0')
 
 
 def connection_path():
@@ -55,7 +57,7 @@ def handle(message):
     params = message.get('params') or {}
     if method == 'initialize':
         return {'protocolVersion': params.get('protocolVersion', '2024-11-05'),
-                'capabilities': {'tools': {}}, 'serverInfo': {'name': 'byori-studio', 'version': '0.1.0'},
+                'capabilities': {'tools': {}}, 'serverInfo': {'name': 'byori-studio', 'version': VERSION},
                 'instructions': 'This is the live video editor. Use project.get before editing. Editing commands update the UI and are undoable. Use exact IDs and expectedRevision. Memory is backed by ByoriDB. A successful tool result is required before claiming an action occurred.'}
     if method == 'ping':
         return {}

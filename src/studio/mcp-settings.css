@@ -1,10 +1,10 @@
-.mcp-endpoint { display: flex; align-items: center; gap: 7px; color: #a7adb7; font-size: 11px; margin: 10px 0 12px; overflow-wrap: anywhere; }
-.mcp-toggle { display: flex; align-items: center; gap: 8px; margin: 10px 0 14px; color: #f0f2f5; font-size: 12px; }
-.mcp-toggle input { accent-color: #37d7cb; width: 14px; height: 14px; }
+.mcp-endpoint { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; margin: 10px 0 12px; overflow-wrap: anywhere; }
+.mcp-toggle { display: flex; align-items: center; gap: 8px; margin: 10px 0 14px; color: var(--text); font-size: 12px; }
+.mcp-toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
 .mcp-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .mcp-actions button, .mcp-settings > button { display: inline-flex; align-items: center; gap: 6px; }
-.mcp-remove { color: #a7adb7; font-size: 11px; }
-.mcp-progress { color: #d0dceb !important; line-height: 1.6; }
-.mcp-connected { display: flex; align-items: center; gap: 5px; color: #70e1d4 !important; }
+.mcp-remove { color: var(--muted); font-size: 11px; }
+.mcp-progress { color: var(--secondary-ink) !important; line-height: 1.6; }
+.mcp-connected { display: flex; align-items: center; gap: 5px; color: var(--action-hover) !important; }
 .mcp-settings .status-detail { line-height: 1.6; }
-.mcp-settings .status-detail a { display: inline-flex; align-items: center; gap: 3px; color: #70e1d4; }
+.mcp-settings .status-detail a { display: inline-flex; align-items: center; gap: 3px; color: var(--action-hover); }

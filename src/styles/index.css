@@ -14,6 +14,19 @@
   --text: #f0f2f5;
   --muted: #a7adb7;
   --accent: #37d7cb;
+  /* DESIGN.md control, action and track tokens. */
+  --control-bg: #292c31;
+  --control-border: #41464f;
+  --control-hover: #34383f;
+  --action-fill: #45cfc1;
+  --action-ink: #102f2b;
+  --action-hover: #70e1d4;
+  --secondary-fill: #303a47;
+  --secondary-ink: #d0dceb;
+  --video-track: #24505a;
+  --image-track: #345764;
+  --audio-track: #294736;
+  --text-track: #71572f;
 }
 
 * {

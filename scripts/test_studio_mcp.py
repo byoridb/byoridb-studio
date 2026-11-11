@@ -34,6 +34,25 @@ class ToolBoundaryTests(unittest.TestCase):
             self.assertNotIn(method, methods)
         self.assertEqual(len(methods), sum(len(t['methods']) for t in mcp.TOOLS))
 
+    def test_second_round_commands_and_fields_are_described(self):
+        edit = next(t for t in mcp.TOOLS if t['name'] == 'studio_edit')
+        self.assertIn('edit.freeze', edit['methods'])
+        for term in ['edit.freeze {id,time', 'transitionIn', 'wipeLeft', 'blendMode', 'easeInOut', 'hold',
+                     'letterSpacing', 'lineHeight', 'outline', 'shadow']:
+            self.assertIn(term, edit['description'])
+        export = next(t for t in mcp.TOOLS if t['name'] == 'studio_export')
+        for term in ['codec', 'hevc', 'hardware', 'bitrate']:
+            self.assertIn(term, export['description'])
+
+    def test_release_version_is_declared_once(self):
+        root = Path(__file__).resolve().parent.parent
+        check = subprocess.run(['node', str(root / 'scripts/check-version.mjs')], capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        version = json.loads((root / 'package.json').read_text())['version']
+        self.assertEqual(check.stdout.strip(), 'version ' + version)
+        self.assertEqual(json.loads((root / 'src-tauri/tauri.conf.json').read_text())['version'], '../package.json')
+        self.assertEqual(mcp.handle({'method': 'initialize'})['serverInfo']['version'], version)
+
     def test_cli_honors_isolated_home(self):
         cli = Path(__file__).with_name('studio-cli.py')
         with tempfile.TemporaryDirectory() as home:

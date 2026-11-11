@@ -11,6 +11,9 @@ export interface Media {
   thumbnail?: string;
   waveform?: number[];
   missing?: boolean;
+  proxy?: boolean;
+  codec?: string;
+  fps?: number;
 }
 export interface Track {
   id: string;
@@ -20,10 +23,13 @@ export interface Track {
   hidden: boolean;
   locked: boolean;
 }
+export type Easing = "linear" | "easeIn" | "easeOut" | "easeInOut" | "hold";
 export interface Keyframe {
   property: string;
   time: number;
   value: number;
+  /** Applies from this keyframe to the next one; absent means linear. */
+  easing?: Easing;
 }
 export type CurvePoint = [number, number];
 export type CurveChannel = "master" | "red" | "green" | "blue";
@@ -50,6 +56,28 @@ export interface ColorAdjustment {
   };
   lut?: { path?: string; name?: string; enabled: boolean };
 }
+export type TransitionType =
+  | "fade"
+  | "dissolve"
+  | "wipeLeft"
+  | "wipeRight"
+  | "wipeUp"
+  | "wipeDown"
+  | "slideLeft"
+  | "slideRight"
+  | "zoom";
+export interface Transition {
+  type: TransitionType;
+  duration: number;
+}
+export type BlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "add";
 export interface Clip {
   id: string;
   mediaId?: string;
@@ -84,10 +112,16 @@ export interface Clip {
     bold: boolean;
     align: string;
     background: string;
+    italic?: boolean;
+    letterSpacing?: number;
+    lineHeight?: number;
+    outline?: { color: string; width: number };
+    shadow?: { color: string; x: number; y: number; blur: number };
   };
   filter?: string;
-  transitionIn?: { type: "fade"; duration: number } | null;
-  transitionOut?: { type: "fade"; duration: number } | null;
+  transitionIn?: Transition | null;
+  transitionOut?: Transition | null;
+  blendMode?: BlendMode;
   keyframes: Keyframe[];
   crop?: { x: number; y: number; width: number; height: number };
   mask?: {
@@ -152,6 +186,8 @@ export interface Job {
   state: string;
   progress?: number;
   path?: string;
+  /** export.status: the video encoder in use; changes if hardware encoding fell back. */
+  encoder?: string;
   logs?: { at: string; stream: string; text: string }[] | string[];
   result?: string;
   error?: string;

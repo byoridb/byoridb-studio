@@ -52,3 +52,51 @@
   outline: 2px solid #37d7cb;
   outline-offset: 2px;
 }
+.selection-overlay .selection-rotate {
+  left: 50%;
+  top: -19px;
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  border: 1px solid #173b37;
+  border-radius: 50%;
+  background: #e6fffb;
+  cursor: grab;
+}
+.selection-overlay .selection-rotate::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 1px;
+  height: 8px;
+  background: #b7fff7;
+  pointer-events: none;
+}
+.selection-overlay .selection-rotate:active {
+  cursor: grabbing;
+}
+.snap-guide {
+  position: absolute;
+  z-index: 9;
+  background: var(--accent, #37d7cb);
+  pointer-events: none;
+}
+.snap-guide.vertical {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+.snap-guide.horizontal {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+/* The editor's generic button hover must not paint over the selected picture or its handles. */
+.studio-app .selection-overlay .selection-move:hover:not(:disabled) {
+  background-color: transparent;
+}
+.studio-app .selection-overlay .selection-handle:hover:not(:disabled),
+.studio-app .selection-overlay .selection-rotate:hover:not(:disabled) {
+  background-color: #e6fffb;
+}

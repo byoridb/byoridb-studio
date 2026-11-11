@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -27,10 +27,24 @@ import {
   ArrowLeftToLine,
   ArrowRightToLine,
 } from "lucide-react";
-import type { Clip, Command, Project, Track } from "./types";
+import type { Clip, Command, Project, Track, TransitionType } from "./types";
 import { durationOf, timecode } from "./types";
 import { assetUrl } from "./api";
-import { clipEditCommands, trimClipPreview, waveformBars, waveformRange, type ClipEditAction } from "./clipEditing";
+import {
+  clipEditCommands,
+  clipJunctions,
+  BATCH_LIMIT,
+  junctionTransitionBlocked,
+  junctionTransitionCommands,
+  maxTransitionDuration,
+  trimClipPreview,
+  waveformBars,
+  waveformRange,
+  type ClipEditAction,
+  type ClipJunction,
+} from "./clipEditing";
+import { transitionCatalog } from "./clipPresets";
+import { playbackClock, useClockTime, useClockValue } from "./playbackClock";
 import {
   canEditSelection,
   clipGroup,
@@ -80,18 +94,96 @@ const ClipVisual = memo(function ClipVisual({ kind, thumbnail, waveform, from = 
   return <div className="clip-text-preview">{text}</div>;
 });
 
-const RulerTicks = memo(function RulerTicks({ length, step, zoom }: {
-  length: number;
+const RulerTicks = memo(function RulerTicks({ first, last, step, zoom }: {
+  first: number;
+  last: number;
   step: number;
   zoom: number;
 }) {
-  return <>{Array.from({ length: Math.ceil(length / step) + 1 }, (_, index) => (
-    <span key={index} style={{ left: index * step * zoom }}>
-      {Math.floor((index * step) / 60).toString().padStart(2, "0")}
-      :{((index * step) % 60).toString().padStart(2, "0")}
-    </span>
-  ))}</>;
+  return <>{Array.from({ length: Math.max(0, last - first + 1) }, (_, offset) => {
+    const index = first + offset;
+    return (
+      <span key={index} style={{ left: index * step * zoom }}>
+        {Math.floor((index * step) / 60).toString().padStart(2, "0")}
+        :{((index * step) % 60).toString().padStart(2, "0")}
+      </span>
+    );
+  })}</>;
 });
+
+/** The only timeline parts that follow the playback clock frame by frame. */
+function Playhead({ zoom, fixed, scrub }: { zoom: number; fixed?: number; scrub: Record<string, unknown> }) {
+  const clock = useClockTime();
+  return (
+    <div className="playhead" style={{ left: (fixed ?? clock) * zoom }}>
+      <div className="playhead-handle" title="드래그해서 탐색" {...scrub} />
+    </div>
+  );
+}
+function ClockTimecode({ fps, fixed }: { fps: number; fixed?: number }) {
+  const clock = useClockTime();
+  return <>{timecode(fixed ?? clock, fps)}</>;
+}
+
+/** The names the Library and Inspector use (clipPresets.transitionCatalog). */
+const transitionLabels = Object.fromEntries(
+  transitionCatalog.map((item) => [item.id, item.name]),
+) as Record<TransitionType, string>;
+
+interface MenuItem {
+  label: string;
+  hint?: string;
+  disabled?: boolean;
+  separator?: boolean;
+  run: () => void;
+}
+function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: MenuItem[]; onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    ref.current?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
+    const outside = (event: Event) => {
+      if (!ref.current?.contains(event.target as Node)) onClose();
+    };
+    window.addEventListener("pointerdown", outside, true);
+    window.addEventListener("blur", onClose);
+    window.addEventListener("resize", onClose);
+    return () => {
+      window.removeEventListener("pointerdown", outside, true);
+      window.removeEventListener("blur", onClose);
+      window.removeEventListener("resize", onClose);
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+  // Keep the menu inside the window.
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    if (rect.right > window.innerWidth) element.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+    if (rect.bottom > window.innerHeight) element.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  }, [x, y]);
+  return (
+    <div className="context-menu" role="menu" ref={ref} style={{ left: x, top: y }}
+      onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        event.stopPropagation();
+        if (event.key === "Escape" || event.key === "Tab") { event.preventDefault(); onClose(); return; }
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault();
+        const buttons = Array.from(ref.current?.querySelectorAll<HTMLElement>("button:not(:disabled)") ?? []);
+        const index = buttons.indexOf(document.activeElement as HTMLElement);
+        buttons[(index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+      }}>
+      {items.map((item) => (
+        <button key={item.label} role="menuitem" className={item.separator ? "separated" : ""} disabled={item.disabled}
+          onClick={() => { onClose(); item.run(); }}>
+          {item.label}{item.hint && <kbd>{item.hint}</kbd>}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function TrackName({ track, onRename }: { track: Track; onRename: (name: string) => void }) {
   const [name, setName] = useState(track.name);
@@ -113,7 +205,8 @@ function TrackName({ track, onRename }: { track: Track; onRename: (name: string)
 }
 interface TimelineProps {
   project: Project;
-  time: number;
+  /** A fixed playhead for embedding; by default the timeline follows the playback clock. */
+  time?: number;
   onTime: (value: number) => void;
   selectedId: string | null;
   selectedIds: string[];
@@ -123,7 +216,20 @@ interface TimelineProps {
   onCommand: Command;
   history: { canUndo: boolean; canRedo: boolean };
   playing?: boolean;
+  /** The player's repeated range, drawn on the ruler. */
+  loop?: { start: number; end: number } | null;
+  /** Clipboard actions owned by the editor: copy (or cut) the selection, paste at a time. */
+  onCopy?: (cut: boolean) => void;
+  onPaste?: (at: number) => void;
+  canPaste?: boolean;
 }
+type MenuTarget =
+  | { kind: "clip"; id: string }
+  | { kind: "track"; id: string }
+  | { kind: "empty"; trackId: string; time: number };
+/** Clips are drawn only inside the scrolled window plus this margin on each side. */
+const OVERSCAN = 600;
+const VIEW_STEP = 300;
 const MIN_ZOOM = 0.1, MAX_ZOOM = 180;
 const clampZoom = (value: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
 const sliderOf = (zoom: number) => Math.round(Math.log(zoom) * 100);
@@ -132,7 +238,7 @@ const EDGE = 36;
 const DRAG_THRESHOLD = 4;
 export default function Timeline({
   project,
-  time,
+  time: fixedTime,
   onTime,
   selectedId,
   selectedIds,
@@ -142,9 +248,18 @@ export default function Timeline({
   onCommand,
   history,
   playing = false,
+  loop = null,
+  onCopy,
+  onPaste,
+  canPaste = false,
 }: TimelineProps) {
+  const now = () => fixedTime ?? playbackClock.get();
   const [zoom, setZoom] = useState(68);
   const [markerEdit, setMarkerEdit] = useState<string | null>(null);
+  const [transitionEdit, setTransitionEdit] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; target: MenuTarget } | null>(null);
+  // The scrolled window, in coarse steps so scrolling re-renders only now and then.
+  const [view, setView] = useState({ left: 0, width: 0 });
   const workspace = useRef<HTMLDivElement>(null);
   const labels = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -159,13 +274,53 @@ export default function Timeline({
   const editGuideId = useId();
   const editable = canEditSelection(project, selectedIds);
   const selection = selectedClips(project, selectedIds);
-  const cuts = clipEditCommands(project, selectedIds, time, "split");
+  const cutCount = useClockValue((clock) =>
+    clipEditCommands(project, selectedIds, fixedTime ?? clock, "split").length);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const { clipsByTrack, junctionsByTrack } = useMemo(() => {
+    const clipsByTrack = new Map<string, Clip[]>();
+    for (const clip of project.clips) {
+      const list = clipsByTrack.get(clip.trackId);
+      if (list) list.push(clip);
+      else clipsByTrack.set(clip.trackId, [clip]);
+    }
+    const junctionsByTrack = new Map<string, ClipJunction[]>();
+    for (const [trackId, clips] of clipsByTrack)
+      junctionsByTrack.set(trackId, clipJunctions(clips, project.fps));
+    return { clipsByTrack, junctionsByTrack };
+  }, [project.clips, project.fps]);
   const selectionKind = selection.length && selection.every((clip) => trackKindForClip(clip) === trackKindForClip(selection[0]))
     ? trackKindForClip(selection[0]) : null;
   const duration = durationOf(project);
   const length = Math.max(duration + 3, 15);
   const width = Math.max(800, length * zoom);
   const step = RULER_STEPS.find((seconds) => seconds * zoom >= 56) ?? RULER_STEPS[RULER_STEPS.length - 1];
+  // Before the first measurement (and in tests without layout) assume one window width.
+  const viewWidth = view.width || (typeof window === "undefined" ? 1280 : window.innerWidth);
+  const visibleFrom = (view.left - OVERSCAN) / zoom;
+  const visibleTo = (view.left + viewWidth + OVERSCAN) / zoom;
+  const inView = (start: number, end: number) => end >= visibleFrom && start <= visibleTo;
+  useLayoutEffect(() => {
+    const element = workspace.current;
+    if (!element) return;
+    let frame = 0;
+    const read = () => {
+      frame = 0;
+      const next = { left: Math.floor(element.scrollLeft / VIEW_STEP) * VIEW_STEP, width: Math.ceil((element.clientWidth + VIEW_STEP) / VIEW_STEP) * VIEW_STEP };
+      if (!element.clientWidth) next.width = 0;
+      setView((previous) => previous.left === next.left && previous.width === next.width ? previous : next);
+    };
+    const schedule = () => { frame ||= requestAnimationFrame(read); };
+    read();
+    element.addEventListener("scroll", schedule, { passive: true });
+    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(schedule) : null;
+    observer?.observe(element);
+    return () => {
+      cancelAnimationFrame(frame);
+      element.removeEventListener("scroll", schedule);
+      observer?.disconnect();
+    };
+  }, []);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
   // ⌘/Ctrl + wheel zooms around the pointer; React's wheel listener is passive.
@@ -190,13 +345,18 @@ export default function Timeline({
   }, [zoom]);
   // Playback keeps the playhead in view by paging the timeline.
   useLayoutEffect(() => {
-    const element = workspace.current;
-    if (!playing || !element) return;
-    const view = element.clientWidth - labelsWidth();
-    const x = time * zoom;
-    if (view > 0 && (x < element.scrollLeft || x > element.scrollLeft + view - 24))
-      element.scrollLeft = Math.max(0, x - 24);
-  }, [playing, time, zoom]);
+    if (!playing) return;
+    const follow = () => {
+      const element = workspace.current;
+      if (!element) return;
+      const viewport = element.clientWidth - labelsWidth();
+      const x = now() * zoom;
+      if (viewport > 0 && (x < element.scrollLeft || x > element.scrollLeft + viewport - 24))
+        element.scrollLeft = Math.max(0, x - 24);
+    };
+    follow();
+    return playbackClock.subscribe(follow);
+  }, [playing, fixedTime, zoom]);
   const fitZoom = () => {
     const view = (workspace.current?.clientWidth ?? 0) - labelsWidth() - 24;
     setZoom(clampZoom((view > 0 ? view : 800) / Math.max(duration, 1)));
@@ -207,7 +367,7 @@ export default function Timeline({
       () => undefined,
     );
   const editAtPlayhead = async (action: ClipEditAction) => {
-    const commands = clipEditCommands(project, selectedIds, time, action);
+    const commands = clipEditCommands(project, selectedIds, now(), action);
     const result = commands.length === 1
       ? await run(commands[0].method, commands[0].params)
       : commands.length > 1 ? await run("edit.batch", { commands }) : undefined;
@@ -242,7 +402,7 @@ export default function Timeline({
     let best: number | null = null;
     for (const point of [
       0,
-      time,
+      now(),
       ...project.markers.map((marker) => marker.time),
       ...project.clips
         .filter((c) => !excluded.includes(c.id))
@@ -464,13 +624,72 @@ export default function Timeline({
   };
   const trimming = drag && drag.mode !== "move"
     ? { ...drag.origin, ...drag.previews[drag.id] } : null;
+  // The transition editor closes when the pointer goes anywhere else.
+  useEffect(() => {
+    if (!transitionEdit) return;
+    const outside = (event: Event) => {
+      if (!(event.target as Element | null)?.closest?.(".transition-popover, .clip-junction")) setTransitionEdit(null);
+    };
+    window.addEventListener("pointerdown", outside, true);
+    return () => window.removeEventListener("pointerdown", outside, true);
+  }, [transitionEdit]);
+  const applyTransition = (junction: ClipJunction, transition: { type: string; duration: number } | null) => {
+    const commands = junctionTransitionCommands(project, junction, transition);
+    if (commands.length && commands.length <= BATCH_LIMIT) void run("edit.batch", { commands });
+  };
+  const openMenu = (event: React.MouseEvent, target: MenuTarget) => {
+    event.preventDefault();
+    event.stopPropagation();
+    // A keyboard-opened menu has no pointer position: anchor it to the element.
+    const rect = event.currentTarget.getBoundingClientRect();
+    const keyboard = !event.clientX && !event.clientY;
+    setMenu({ x: keyboard ? rect.left + 12 : event.clientX, y: keyboard ? rect.top + 12 : event.clientY, target });
+  };
+  const menuItems = (target: MenuTarget): MenuItem[] => {
+    const addTracks: MenuItem[] = (["video", "audio", "text"] as const).map((kind, index) => ({
+      label: `${trackNames[kind]} 트랙 추가`, separator: index === 0, run: () => void createTrack(kind),
+    }));
+    const removeTrack = (id: string): MenuItem => {
+      const track = project.tracks.find((item) => item.id === id);
+      return { label: "트랙 삭제", disabled: !track || track.locked, run: () => void run("edit.trackDelete", { id }) };
+    };
+    if (target.kind === "track") return [...addTracks.map((item, index) => ({ ...item, separator: index === 0 ? false : item.separator })), { ...removeTrack(target.id), separator: true }];
+    if (target.kind === "empty")
+      return [
+        { label: "여기에 붙여넣기", hint: "⌘V", disabled: !canPaste || !onPaste, run: () => onPaste?.(target.time) },
+        { label: "마커 추가", hint: "M", run: () => void run("edit.marker", { time: target.time, label: `마커 ${project.markers.length + 1}` }) },
+        ...addTracks,
+        removeTrack(target.trackId),
+      ];
+    const clip = project.clips.find((item) => item.id === target.id);
+    const at = frame(now());
+    const frozen = !!clip && clip.kind === "video" && editable &&
+      at - clip.start >= 1 / project.fps - 1e-7 && clip.start + clip.duration - at >= 1 / project.fps - 1e-7;
+    return [
+      { label: "복사", hint: "⌘C", disabled: !onCopy || !selectedIds.length, run: () => onCopy?.(false) },
+      { label: "잘라내기", hint: "⌘X", disabled: !onCopy || !editable, run: () => onCopy?.(true) },
+      { label: "재생 헤드에 붙여넣기", hint: "⌘V", disabled: !canPaste || !onPaste, run: () => onPaste?.(now()) },
+      { label: "복제", hint: "⌘D", disabled: !editable, run: () => void duplicate() },
+      { label: "재생 헤드에서 나누기", hint: "⌘B", separator: true, disabled: !cutCount, run: () => void editAtPlayhead("split") },
+      {
+        label: "재생 헤드에 정지 프레임 넣기", disabled: !frozen,
+        run: () => void run("edit.freeze", { id: target.id, time: at }).then((result) => {
+          const ids = newClipIds(project, result);
+          const still = (result as Project | undefined)?.clips?.find((item) => ids.includes(item.id) && item.kind === "image");
+          if (still) onSelection([still.id], still.id);
+        }),
+      },
+      { label: "삭제", hint: "Delete", separator: true, disabled: !editable, run: () => void remove() },
+      { label: "간격을 당기며 삭제", hint: "⇧Delete", disabled: !editable, run: () => void remove(true) },
+    ];
+  };
   const editGuide = !selection.length
     ? "클립을 선택하고 재생 헤드를 자를 위치로 옮기세요"
     : !editable
       ? "트랙 잠금을 해제하면 클립을 편집할 수 있어요"
-      : !cuts.length
+      : !cutCount
         ? "재생 헤드를 클립 안으로 옮기세요 · 양쪽 1프레임 이상"
-        : `${cuts.length > 1 ? `${cuts.length}개 클립 · ` : ""}재생 헤드에서 자르기 · 양끝 손잡이로 길이 조절`;
+        : `${cutCount > 1 ? `${cutCount}개 클립 · ` : ""}재생 헤드에서 자르기 · 양끝 손잡이로 길이 조절`;
   return (
     <section className="timeline-panel" aria-label="타임라인">
       <div className="timeline-toolbar">
@@ -536,7 +755,7 @@ export default function Timeline({
             title="마커 추가 (M)"
             onClick={() =>
               void run("edit.marker", {
-                time,
+                time: now(),
                 label: `마커 ${project.markers.length + 1}`,
               })
             }
@@ -601,15 +820,15 @@ export default function Timeline({
         </div>
       </div>
       <div className="timeline-editbar" role="group" aria-label="클립 편집">
-        <button title="나누기 (⌘B)" aria-describedby={editGuideId} disabled={!cuts.length || !!drag}
+        <button title="나누기 (⌘B)" aria-describedby={editGuideId} disabled={!cutCount || !!drag}
           onClick={() => editAtPlayhead("split")}>
           <Scissors size={14} aria-hidden="true" /> 나누기 <kbd aria-hidden="true">⌘B</kbd>
         </button>
-        <button title="앞부분 자르기 (Q)" aria-describedby={editGuideId} disabled={!cuts.length || !!drag}
+        <button title="앞부분 자르기 (Q)" aria-describedby={editGuideId} disabled={!cutCount || !!drag}
           onClick={() => editAtPlayhead("trim-start")}>
           <ArrowLeftToLine size={14} aria-hidden="true" /> 앞부분 자르기 <kbd aria-hidden="true">Q</kbd>
         </button>
-        <button title="뒷부분 자르기 (W)" aria-describedby={editGuideId} disabled={!cuts.length || !!drag}
+        <button title="뒷부분 자르기 (W)" aria-describedby={editGuideId} disabled={!cutCount || !!drag}
           onClick={() => editAtPlayhead("trim-end")}>
           <ArrowRightToLine size={14} aria-hidden="true" /> 뒷부분 자르기 <kbd aria-hidden="true">W</kbd>
         </button>
@@ -622,11 +841,12 @@ export default function Timeline({
       <div className="timeline-workspace" ref={workspace}>
         <div className="track-labels" ref={labels}>
           <div className="track-label-spacer">
-            {timecode(time, project.fps)}
+            <ClockTimecode fps={project.fps} fixed={fixedTime} />
           </div>
           {project.tracks.map((track, index) => (
             <div className={`track-label ${track.kind} ${selectedTrackId === track.id ? "active-track" : ""}`} key={track.id}
-              onClick={() => onTrackSelect?.(track.id)}>
+              onClick={() => onTrackSelect?.(track.id)}
+              onContextMenu={(event) => { onTrackSelect?.(track.id); openMenu(event, { kind: "track", id: track.id }); }}>
               <div className="track-name">
                 <button className="track-select-button" aria-label={`${track.name} 트랙 선택`} title={`${trackNames[track.kind]} 트랙 선택`}
                   aria-pressed={selectedTrackId === track.id}>
@@ -696,12 +916,15 @@ export default function Timeline({
         <div className="timeline-scroll">
           <div className="timeline-content" ref={content} style={{ width }}>
             <div className="timeline-ruler" {...scrub}>
-              <RulerTicks length={length} step={step} zoom={zoom} />
+              <RulerTicks first={Math.max(0, Math.floor(visibleFrom / step))} last={Math.min(Math.ceil(length / step), Math.ceil(visibleTo / step))} step={step} zoom={zoom} />
+              {loop && loop.end > loop.start && (
+                <div className="timeline-loop" title="반복 구간" style={{ left: loop.start * zoom, width: (loop.end - loop.start) * zoom }} />
+              )}
               {project.markers.map((marker) => (
                 <button
                   className="timeline-marker"
                   key={marker.id}
-                  title={`${marker.label} · 더블클릭해서 이름 변경·삭제`}
+                  title={`${marker.label} · Enter 또는 더블클릭해서 이름 변경·삭제`}
                   aria-label={`마커 ${marker.label}`}
                   aria-expanded={markerEdit === marker.id}
                   style={{ left: marker.time * zoom }}
@@ -711,6 +934,12 @@ export default function Timeline({
                     onTime(marker.time);
                   }}
                   onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    setMarkerEdit(marker.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== "F2") return;
+                    event.preventDefault();
                     event.stopPropagation();
                     setMarkerEdit(marker.id);
                   }}
@@ -749,10 +978,12 @@ export default function Timeline({
                 data-track-id={track.id}
                 aria-label={`${track.name} 트랙`}
                 onPointerDown={(event) => {
+                  if (event.button === 2) return;
                   seek(event);
                   onSelection([], null);
                   onTrackSelect?.(track.id);
                 }}
+                onContextMenu={(event) => { onTrackSelect?.(track.id); openMenu(event, { kind: "empty", trackId: track.id, time: frame(timeAt(event.clientX)) }); }}
                 onDragOver={(event) => {
                   if (!track.locked) event.preventDefault();
                 }}
@@ -773,8 +1004,13 @@ export default function Timeline({
                   }
                 }}
               >
-                {project.clips
-                  .filter((clip) => clip.trackId === track.id)
+                {(clipsByTrack.get(track.id) ?? [])
+                  .filter((clip) => {
+                    const preview = drag?.previews[clip.id];
+                    const start = preview?.start ?? clip.start;
+                    return inView(Math.min(start, clip.start), Math.max(start + (preview?.duration ?? clip.duration), clip.start + clip.duration)) ||
+                      selectedSet.has(clip.id) || clip.id === drag?.id;
+                  })
                   .map((original) => {
                     const clip = {
                       ...original,
@@ -786,7 +1022,7 @@ export default function Timeline({
                     return (
                       <div
                         key={clip.id}
-                        className={`timeline-clip ${clip.kind} ${selectedIds.includes(clip.id) ? "selected" : ""} ${clip.id === selectedId ? "primary-selection" : ""} ${media?.missing ? "missing" : ""}`}
+                        className={`timeline-clip ${clip.kind} ${selectedSet.has(clip.id) ? "selected" : ""} ${clip.id === selectedId ? "primary-selection" : ""} ${media?.missing ? "missing" : ""}`}
                         title={media?.missing ? "원본 파일을 찾을 수 없습니다" : undefined}
                         style={{
                           left: clip.start * zoom,
@@ -797,11 +1033,15 @@ export default function Timeline({
                           } : {}),
                         }}
                         onPointerCancel={() => setActiveDrag(null)}
+                        onContextMenu={(event) => {
+                          if (!selectedSet.has(original.id)) onSelection(clipGroup(project, original.id), original.id);
+                          openMenu(event, { kind: "clip", id: original.id });
+                        }}
                       >
                         <div className="clip-body" role="button" tabIndex={0}
-                          aria-pressed={selectedIds.includes(clip.id)}
+                          aria-pressed={selectedSet.has(clip.id)}
                           aria-label={`${clip.name}, ${clip.start.toFixed(1)}초, ${clip.duration.toFixed(1)}초`}
-                          onPointerDown={(event) => begin(event, original, "move")}
+                          onPointerDown={(event) => { if (event.button !== 2) begin(event, original, "move"); }}
                           onPointerMove={move}
                           onPointerUp={finish}
                           onKeyDown={(event) => {
@@ -840,7 +1080,7 @@ export default function Timeline({
                           aria-label={`${clip.name} 시작점 트림`}
                           title="시작점 트림 · 드래그 또는 ← →로 1프레임 조절"
                           disabled={track.locked}
-                          tabIndex={selectedIds.includes(clip.id) ? 0 : -1}
+                          tabIndex={selectedSet.has(clip.id) ? 0 : -1}
                           onPointerDown={(event) =>
                             begin(event, original, "left")
                           }
@@ -854,7 +1094,7 @@ export default function Timeline({
                           aria-label={`${clip.name} 끝점 트림`}
                           title="끝점 트림 · 드래그 또는 ← →로 1프레임 조절"
                           disabled={track.locked}
-                          tabIndex={selectedIds.includes(clip.id) ? 0 : -1}
+                          tabIndex={selectedSet.has(clip.id) ? 0 : -1}
                           onPointerDown={(event) =>
                             begin(event, original, "right")
                           }
@@ -866,6 +1106,70 @@ export default function Timeline({
                       </div>
                     );
                   })}
+                {!drag && (junctionsByTrack.get(track.id) ?? [])
+                  .filter(({ after }) => inView(after.start, after.start + after.duration))
+                  .map((junction) => {
+                    const { before, after } = junction;
+                    const transition = after.transitionIn?.duration ? after.transitionIn : null;
+                    const overlap = Math.max(0, Math.min(before.start + before.duration, after.start + after.duration) - after.start);
+                    const limit = maxTransitionDuration(junction, project.fps);
+                    const types = (track.kind === "audio" ? ["fade"] : Object.keys(transitionLabels)) as TransitionType[];
+                    const blocked = junctionTransitionBlocked(project, junction);
+                    const open = transitionEdit === after.id && !blocked;
+                    return (
+                      <Fragment key={`junction-${after.id}`}>
+                        {overlap > 0 && <i className={`clip-overlap ${transition ? "has-transition" : ""}`} aria-hidden="true" style={{ left: after.start * zoom, width: Math.max(2, overlap * zoom) }} />}
+                        <button
+                          className={`clip-junction ${transition ? "has-transition" : ""}`}
+                          style={{ left: (after.start + overlap / 2) * zoom }}
+                          aria-label={`${before.name} → ${after.name} 전환${transition ? ` · ${transitionLabels[transition.type] ?? transition.type}` : ""}`}
+                          aria-expanded={open}
+                          title={blocked ?? (transition
+                            ? `${transitionLabels[transition.type] ?? transition.type} · ${transition.duration.toFixed(2)}초 · 눌러서 변경`
+                            : overlap > 0 ? "겹친 구간 · 눌러서 전환 추가" : "전환 추가")}
+                          disabled={track.locked || !!blocked}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          onClick={(event) => { event.stopPropagation(); setTransitionEdit(open ? null : after.id); }}
+                        >
+                          {transition ? <MoveHorizontal size={10} aria-hidden="true" /> : <Plus size={10} aria-hidden="true" />}
+                        </button>
+                        {open && (
+                          <div className="transition-popover" role="group" aria-label="클립 사이 전환" style={{ left: after.start * zoom }}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => {
+                              event.stopPropagation();
+                              if (event.key === "Escape") setTransitionEdit(null);
+                            }}>
+                            <select aria-label="전환 종류" autoFocus value={transition?.type ?? ""}
+                              onChange={(event) => {
+                                const type = event.target.value;
+                                if (!type) { applyTransition(junction, null); setTransitionEdit(null); }
+                                else applyTransition(junction, { type, duration: transition?.duration ?? Math.min(0.5, limit) });
+                              }}>
+                              <option value="">전환 없음</option>
+                              {types.map((type) => <option key={type} value={type} disabled={limit < 1 / project.fps}>{transitionLabels[type]}</option>)}
+                            </select>
+                            <label>
+                              <input aria-label="전환 길이(초)" type="number" min={+(1 / project.fps).toFixed(3)} max={+limit.toFixed(2)} step={0.1}
+                                key={transition?.duration ?? 0} defaultValue={transition ? +transition.duration.toFixed(2) : ""} disabled={!transition}
+                                onBlur={(event) => {
+                                  const value = Number(event.target.value);
+                                  if (transition && Number.isFinite(value) && value > 0 && Math.abs(value - transition.duration) > 1e-3)
+                                    applyTransition(junction, { type: transition.type, duration: value });
+                                }}
+                                onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+                              초
+                            </label>
+                            <button title="전환 제거" aria-label="전환 제거" disabled={!transition}
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => { applyTransition(junction, null); setTransitionEdit(null); }}>
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        )}
+                      </Fragment>
+                    );
+                  })}
               </div>
             ))}
             {!project.clips.length && (
@@ -873,9 +1177,7 @@ export default function Timeline({
                 소재를 여기로 드래그하거나 라이브러리에서 추가하세요
               </div>
             )}
-            <div className="playhead" style={{ left: time * zoom }}>
-              <div className="playhead-handle" title="드래그해서 탐색" {...scrub} />
-            </div>
+            <Playhead zoom={zoom} fixed={fixedTime} scrub={scrub} />
           </div>
         </div>
       </div>
@@ -883,13 +1185,14 @@ export default function Timeline({
         <span title="← → 프레임 이동 · ↑ ↓ 편집점 이동 · ⌥← → 선택 이동 · ⌥↑ ↓ 트랙 이동">
           {selectedIds.length > 1
             ? `${selectedIds.length}개 선택 · ⇧/⌘ 클릭으로 추가 선택`
-            : "위아래 드래그로 트랙 이동 · ⇧/⌘ 클릭 다중 선택 · ⌘C/X/V 복사·잘라내기·붙여넣기"}
+            : "위아래 드래그로 트랙 이동 · ⇧/⌘ 클릭 다중 선택 · 우클릭 메뉴 · ⌘C/X/V 복사·잘라내기·붙여넣기"}
         </span>
         <span>
           {project.fps} fps <span className="small-divider">·</span> 전체{" "}
           {duration.toFixed(2)}초
         </span>
       </div>
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.target)} onClose={() => setMenu(null)} />}
     </section>
   );
 }

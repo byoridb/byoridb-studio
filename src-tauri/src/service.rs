@@ -1,5 +1,6 @@
 use crate::{
     editor::Editor,
+    media,
     preview::PreviewFrames,
     runtime::{agent_methods, Runtime},
 };
@@ -14,8 +15,20 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path as FsPath, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 use tower::ServiceExt;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -53,6 +66,8 @@ struct ServiceState {
     connection: Connection,
     root: PathBuf,
     origins: Arc<Vec<String>>,
+    /// Wakes the background media worker after something may have been imported.
+    media_work: Arc<Notify>,
 }
 
 pub struct StudioService {
@@ -60,6 +75,8 @@ pub struct StudioService {
     root: PathBuf,
     runtime: Option<Arc<Runtime>>,
     task: Option<JoinHandle<()>>,
+    media_worker: Option<JoinHandle<()>>,
+    media_cancel: Arc<AtomicBool>,
 }
 impl StudioService {
     /// Stops child processes and revokes access. Safe to call more than once;
@@ -68,6 +85,11 @@ impl StudioService {
         let Some(runtime) = self.runtime.as_ref() else {
             return;
         };
+        // Stops a proxy transcode in progress; its unfinished file is removed.
+        self.media_cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.media_worker.as_ref() {
+            worker.abort();
+        }
         runtime.shutdown();
         let file = self.root.join("connection.json");
         let ours = std::fs::read(&file)
@@ -217,6 +239,8 @@ impl StudioService {
                         root,
                         runtime: None,
                         task: None,
+                        media_worker: None,
+                        media_cancel: Arc::default(),
                     })
                 }
             };
@@ -232,6 +256,17 @@ impl StudioService {
             editor.clone(),
         )?);
         let origins = allowed_origins(host);
+        // Before anything can upload or import: no request is running yet.
+        let root_for_cleanup = root.clone();
+        let _ = tokio::task::spawn_blocking(move || remove_orphaned_media_files(&root_for_cleanup)).await;
+        let media_work = Arc::new(Notify::new());
+        let media_cancel = Arc::new(AtomicBool::new(false));
+        let media_worker = tokio::spawn(media_worker(
+            editor.clone(),
+            root.clone(),
+            media_work.clone(),
+            media_cancel.clone(),
+        ));
         let state = ServiceState {
             previews: Arc::new(PreviewFrames::default()),
             editor,
@@ -239,6 +274,7 @@ impl StudioService {
             connection: connection.clone(),
             root: root.clone(),
             origins: Arc::new(origins.clone()),
+            media_work,
         };
         let cors = CorsLayer::new()
             .allow_origin(AllowOrigin::list(
@@ -270,6 +306,7 @@ impl StudioService {
             .route("/upload", post(upload))
             .route("/assets/{id}", get(asset))
             .route("/assets/{id}/thumbnail", get(thumbnail))
+            .route("/assets/{id}/proxy", get(proxy))
             .layer(DefaultBodyLimit::disable())
             .layer(cors)
             .with_state(state);
@@ -287,7 +324,180 @@ impl StudioService {
             root,
             runtime: Some(runtime),
             task: Some(task),
+            media_worker: Some(media_worker),
+            media_cancel,
         })
+    }
+}
+
+/// Background media work that follows an import, so importing itself stays quick:
+/// waveforms first, then one proxy at a time. Nothing here changes a revision or
+/// touches the user's files. It ends when the service drops the task.
+async fn media_worker(
+    editor: Arc<Mutex<Editor>>,
+    root: PathBuf,
+    wake: Arc<Notify>,
+    cancel: Arc<AtomicBool>,
+) {
+    // Work that failed or was refused is not retried until the next start.
+    let mut attempted = HashSet::new();
+    loop {
+        if !media_work_step(&editor, &root, &cancel, &mut attempted).await {
+            // Imports made by speech jobs and agents arrive without a wake-up.
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        }
+    }
+}
+/// Does the next piece of pending work; false when there is none.
+async fn media_work_step(
+    editor: &Arc<Mutex<Editor>>,
+    root: &FsPath,
+    cancel: &Arc<AtomicBool>,
+    attempted: &mut HashSet<String>,
+) -> bool {
+    let decode = |path: PathBuf, duration: f64| async move { media::waveform(&path, duration).await };
+    if waveform_work(editor, attempted, decode).await {
+        return true; // look for newly imported media before starting a long proxy
+    }
+    let next = {
+        let mut editor = editor.lock().await;
+        let Ok(project) = editor.dispatch("project.get", json!({})).await else {
+            return false;
+        };
+        let mut next = None;
+        for item in project["media"].as_array().into_iter().flatten() {
+            let (Some(id), Some(source)) = (item["id"].as_str(), item["path"].as_str()) else {
+                continue;
+            };
+            let Some(output) = editor.proxy_path(id) else {
+                continue;
+            };
+            if output.is_file() {
+                if proxy_is_of(&output, source) {
+                    continue;
+                }
+                // Relinked (or undone) since: the proxy shows another file.
+                let _ = std::fs::remove_file(&output);
+            }
+            let key = format!("proxy:{id}:{source}");
+            if next.is_none()
+                && item["missing"] != true
+                && media::needs_proxy(item)
+                && !attempted.contains(&key)
+            {
+                next = Some((key, item.clone(), output));
+            }
+        }
+        next
+    };
+    let Some((key, item, output)) = next else {
+        return false;
+    };
+    attempted.insert(key.clone());
+    // Noted first, so a proxy never exists without saying what it was made from. If
+    // the media is relinked meanwhile, the next pass sees the mismatch and rebuilds.
+    let noted = std::fs::create_dir_all(root.join("proxies")).and_then(|_| {
+        std::fs::write(proxy_source_note(&output), item["path"].as_str().unwrap_or(""))
+    });
+    let built = match noted {
+        Ok(()) => media::build_proxy(root, &item, cancel.clone()).await.map(|_| ()),
+        Err(error) => Err(error.to_string()),
+    };
+    match built {
+        Ok(()) => {
+            attempted.remove(&key);
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(proxy_source_note(&output));
+            tracing::warn!("{key}: {error}");
+        }
+    }
+    true
+}
+/// Computes the waveforms that are still missing; false when there were none to try.
+async fn waveform_work<F>(
+    editor: &Arc<Mutex<Editor>>,
+    attempted: &mut HashSet<String>,
+    decode: impl Fn(PathBuf, f64) -> F,
+) -> bool
+where
+    F: std::future::Future<Output = Option<Vec<f32>>>,
+{
+    let waveforms = editor.lock().await.pending_waveforms();
+    let mut worked = false;
+    for (id, path, duration) in waveforms {
+        let key = format!("waveform:{id}:{}", path.display());
+        if !attempted.insert(key.clone()) {
+            continue;
+        }
+        worked = true;
+        // An empty waveform records that this file has no readable audio.
+        let peaks = decode(path.clone(), duration).await;
+        match editor.lock().await.set_waveform(&id, &path, peaks) {
+            // Recorded (an empty one too), so it is pending again only after a reprobe
+            // or relink. Or the media went away meanwhile (undo, another project) and
+            // nothing was recorded. Either way, compute it when it is pending again.
+            Ok(_) => {
+                attempted.remove(&key);
+            }
+            // Not retried: a save that keeps failing would decode in a loop.
+            Err(error) => tracing::warn!("waveform for {id}: {error}"),
+        }
+    }
+    worked
+}
+/// Next to each proxy, the source file it was made from.
+fn proxy_source_note(output: &FsPath) -> PathBuf {
+    output.with_extension("source")
+}
+fn proxy_is_of(output: &FsPath, source: &str) -> bool {
+    std::fs::read_to_string(proxy_source_note(output)).is_ok_and(|noted| noted == source)
+}
+/// Removes proxies in `proxies/` that no project mentions any more. Runs once at
+/// startup, when the saved projects are the only references (there is no undo
+/// history yet). A proxy is kept when its media id appears anywhere in a project
+/// file, including an unreadable autosave that was set aside.
+///
+/// Only proxies, because they can be rebuilt. Uploads in `imports/` and results
+/// in `speech/` are the only copy of that media, and a project file saved outside
+/// this folder may still point at them, so they are never deleted automatically.
+fn remove_orphaned_media_files(root: &FsPath) {
+    let mut references = String::new();
+    let mut files = vec![root.join("current.json")];
+    let listed = |folder: PathBuf| -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect()
+    };
+    files.extend(listed(root.join("projects")));
+    files.extend(listed(root.to_owned()).into_iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("current.json.corrupt-"))
+    }));
+    for file in files.iter().filter(|file| file.is_file()) {
+        match std::fs::read(file) {
+            Ok(bytes) => references.push_str(&String::from_utf8_lossy(&bytes)),
+            // Without every project the references are incomplete: delete nothing.
+            Err(_) => return,
+        }
+    }
+    for path in listed(root.join("proxies")) {
+        // "<media id>.mp4", its ".source" note, or an unfinished ".partial.mp4".
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let orphan = name.ends_with(".partial.mp4")
+            || match name.rsplit_once('.') {
+                Some((id, "mp4" | "source")) => !references.contains(&format!("\"{id}\"")),
+                _ => false,
+            };
+        if orphan {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -473,6 +683,11 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
             return (StatusCode::FORBIDDEN, Json(json!({"error":error}))).into_response();
         }
         request.project_id = Some(project);
+        // Each agent job is its own preview client: it replaces only its own
+        // earlier frame request, never the player's or the export dialog's.
+        if request.method == "preview.frame" {
+            request.params["client"] = json!(preview_client(bearer(&headers).unwrap_or("")));
+        }
     }
     tracing::debug!("rpc {}", request.method);
     let result = if request.method == "preview.frame" {
@@ -505,10 +720,30 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
         }
         editor.dispatch(&request.method, request.params).await
     };
+    if result.is_ok() && brings_media(&request.method) {
+        state.media_work.notify_one();
+    }
     match result {
         Ok(value) => Json(json!({"result":value})).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
     }
+}
+
+/// Commands after which the open project may hold media that still needs a
+/// waveform or a proxy.
+fn brings_media(method: &str) -> bool {
+    method.starts_with("media.")
+        || method.starts_with("history.")
+        || matches!(
+            method,
+            "edit.batch" | "edit.freeze" | "project.open" | "project.demo"
+        )
+}
+/// A preview client name for an agent token that does not reveal the token.
+fn preview_client(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    format!("agent-{}", digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 fn clean_filename(name: &str) -> String {
@@ -593,7 +828,10 @@ async fn upload(
         }
     }.await;
     match result {
-        Ok(value) => Json(json!({"result":value})).into_response(),
+        Ok(value) => {
+            state.media_work.notify_one();
+            Json(json!({"result":value})).into_response()
+        }
         Err((status, error)) => {
             let _ = tokio::fs::remove_file(path).await;
             (status, Json(json!({"error":error}))).into_response()
@@ -610,7 +848,7 @@ async fn asset(
     Query(query): Query<HashMap<String, String>>,
     request: Request<Body>,
 ) -> Response {
-    serve_asset(state, id, query, request, false).await
+    serve_asset(state, id, query, request, Asset::Source).await
 }
 async fn thumbnail(
     State(state): State<ServiceState>,
@@ -618,14 +856,29 @@ async fn thumbnail(
     Query(query): Query<HashMap<String, String>>,
     request: Request<Body>,
 ) -> Response {
-    serve_asset(state, id, query, request, true).await
+    serve_asset(state, id, query, request, Asset::Thumbnail).await
+}
+/// The lighter copy used for fast playback. 404 until it has been made.
+async fn proxy(
+    State(state): State<ServiceState>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request: Request<Body>,
+) -> Response {
+    serve_asset(state, id, query, request, Asset::Proxy).await
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Asset {
+    Source,
+    Thumbnail,
+    Proxy,
 }
 async fn serve_asset(
     state: ServiceState,
     id: String,
     query: HashMap<String, String>,
     request: Request<Body>,
-    thumbnail: bool,
+    kind: Asset,
 ) -> Response {
     if !permitted_origin(request.headers(), &state.origins)
         || !(query.get("token") == Some(&state.connection.token)
@@ -634,7 +887,13 @@ async fn serve_asset(
         return denied();
     }
     tracing::debug!("asset {id}");
-    let path = state.editor.lock().await.asset_path(&id, thumbnail);
+    let path = {
+        let editor = state.editor.lock().await;
+        match kind {
+            Asset::Proxy => editor.proxy_path(&id).filter(|path| path.is_file()),
+            _ => editor.asset_path(&id, kind == Asset::Thumbnail),
+        }
+    };
     match path {
         Some(path) => match ServeFile::new(path).oneshot(request).await {
             Ok(r) => r.into_response(),
@@ -892,6 +1151,238 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
+    fn startup_removes_only_unreferenced_proxies() {
+        let root = temp_root("orphans");
+        for folder in ["imports", "proxies", "projects"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        // Speech results: narration in use, a recent unapplied one, and an old one.
+        let (narration, recent, stale) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (job, age_days) in [(narration, 30), (recent, 1), (stale, 30)] {
+            let folder = root.join(format!("speech/{job}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("voice.aiff"), "x").unwrap();
+            let at = std::time::SystemTime::now() - Duration::from_secs(age_days * 24 * 3600);
+            std::fs::File::open(&folder).unwrap().set_modified(at).unwrap();
+        }
+        let touch = |relative: String| {
+            std::fs::write(root.join(&relative), "x").unwrap();
+            root.join(relative)
+        };
+        let (open, stored, set_aside, gone) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let kept = [
+            touch(format!("imports/{open}-열린 영상.mp4")),
+            touch(format!("imports/{stored}-b.mp4")),
+            touch(format!("imports/{set_aside}-c.mp4")),
+            touch("imports/not-an-upload.txt".into()),
+            touch("proxies/media-open.mp4".into()),
+            touch("proxies/media-open.source".into()),
+            touch("proxies/media-stored.mp4".into()),
+            touch("proxies/notes.txt".into()),
+            // Referenced by nothing here, but a project file saved elsewhere may
+            // point at it and this is the only copy.
+            touch(format!("imports/{gone}-d.mp4")),
+        ];
+        let removed = [
+            touch("proxies/media-gone.mp4".into()),
+            touch("proxies/media-gone.source".into()),
+            // A longer id must not be kept because a shorter one is in use.
+            touch("proxies/media-open2.mp4".into()),
+            touch(format!("proxies/.media-open.{gone}.partial.mp4")),
+        ];
+        let media = |id: &str, upload: Uuid| json!({"media":[{"id":id,"path":root.join(format!("imports/{upload}-x.mp4"))}]}).to_string();
+        std::fs::write(root.join("current.json"), media("media-open", open)).unwrap();
+        std::fs::write(root.join("projects/p.json"), media("media-stored", stored)).unwrap();
+        std::fs::write(
+            root.join("projects/narrated.json"),
+            json!({"media":[{"id":"media-voice","path":root.join(format!("speech/{narration}/voice.aiff"))}]}).to_string(),
+        )
+        .unwrap();
+        // An autosave that could not be parsed still protects what it mentions.
+        std::fs::write(root.join("current.json.corrupt-1"), format!("{{ broken {set_aside}")).unwrap();
+        remove_orphaned_media_files(&root);
+        for path in &kept {
+            assert!(path.is_file(), "{path:?} was removed");
+        }
+        for path in &removed {
+            assert!(!path.exists(), "{path:?} was kept");
+        }
+        assert!(root.join(format!("speech/{narration}/voice.aiff")).is_file());
+        assert!(root.join(format!("speech/{recent}")).is_dir(), "recent results stay importable");
+        assert!(root.join(format!("speech/{stale}/voice.aiff")).is_file(), "may be a saved project's narration");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn agent_preview_clients_are_distinct_and_do_not_reveal_tokens() {
+        let (a, b) = (preview_client("token-a"), preview_client("token-b"));
+        assert_ne!(a, b);
+        assert_eq!(a, preview_client("token-a"));
+        assert!(a.starts_with("agent-") && !a.contains("token"));
+        assert!(brings_media("media.importAndAdd") && brings_media("history.undo"));
+        assert!(!brings_media("project.get") && !brings_media("export.status"));
+    }
+    /// Imports stay quick: the waveform and the proxy arrive afterwards without a
+    /// new revision, and the proxy follows the media item when it is relinked.
+    #[tokio::test]
+    async fn imported_media_gets_its_waveform_and_proxy_in_the_background() {
+        let root = temp_root("background");
+        let sources = temp_root("background-sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let make = |name: &str, size: &str, tone: u32| {
+            let path = sources.join(name);
+            let made = std::process::Command::new(media::executable("ffmpeg"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc=size={size}:rate=10:duration=1"))
+                .args(["-f", "lavfi", "-i"])
+                .arg(format!("sine=frequency={tone}:duration=1"))
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            path.canonicalize().unwrap()
+        };
+        let wide = make("wide.mp4", "1924x64", 440);
+        let other = make("other.mp4", "64x1924", 880);
+        let small = make("small.mp4", "320x180", 440);
+        let original = std::fs::read(&wide).unwrap();
+
+        let service = StudioService::start_on(root.clone(), Host::Service, 0).await.unwrap();
+        let url = service.connection.url.clone();
+        let client = reqwest::Client::new();
+        let rpc = |method: &str, params: Value| {
+            let request = client
+                .post(format!("{url}/rpc"))
+                .bearer_auth(&service.connection.token)
+                .json(&json!({"method":method,"params":params}));
+            async move {
+                let body: Value = request.send().await.unwrap().json().await.unwrap();
+                assert!(body.get("error").is_none(), "{body}");
+                body["result"].clone()
+            }
+        };
+        let imported = rpc("media.import", json!({"paths":[wide, small]})).await;
+        let revision = imported["revision"].clone();
+        let (wide_id, small_id) = (
+            imported["media"][0]["id"].as_str().unwrap().to_owned(),
+            imported["media"][1]["id"].as_str().unwrap().to_owned(),
+        );
+        let proxy = |id: &str| {
+            client
+                .get(format!("{url}/assets/{id}/proxy"))
+                .bearer_auth(&service.connection.token)
+                .header("range", "bytes=0-15")
+                .send()
+        };
+        let settled = |ready: fn(&Value) -> bool| {
+            let rpc = &rpc;
+            async move {
+                for _ in 0..300 {
+                    let project = rpc("project.get", json!({})).await;
+                    if ready(&project) {
+                        return project;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                panic!("background media work did not finish");
+            }
+        };
+        let project = settled(|p| {
+            p["media"][0]["proxy"] == true && p["media"].as_array().unwrap().iter().all(|m| m["waveform"].is_array())
+        })
+        .await;
+        assert_eq!(project["revision"], revision, "derived state is not an edit");
+        assert!(project["media"][0]["waveform"].as_array().unwrap().iter().any(|v| v.as_f64().unwrap() > 0.0));
+        assert!(project["media"][1].get("proxy").is_none(), "small H.264 plays as it is");
+        assert_eq!(rpc("history.status", json!({})).await["canUndo"], true);
+        rpc("history.undo", json!({})).await;
+        assert_eq!(rpc("history.status", json!({})).await["canUndo"], false, "only the import is undoable");
+        rpc("history.redo", json!({})).await;
+
+        let served = proxy(&wide_id).await.unwrap();
+        assert_eq!(served.status(), 206);
+        assert_eq!(served.bytes().await.unwrap().len(), 16);
+        assert_eq!(proxy(&small_id).await.unwrap().status(), 404);
+        assert_eq!(proxy("unknown").await.unwrap().status(), 404);
+        let unauthenticated = client.get(format!("{url}/assets/{wide_id}/proxy")).send().await.unwrap();
+        assert_eq!(unauthenticated.status(), 401);
+        let file = root.join("proxies").join(format!("{wide_id}.mp4"));
+        let probed = media::probe_info(&file, &root).await.unwrap();
+        assert_eq!((probed["width"].as_u64(), probed["hasAudio"].as_bool()), (Some(1280), Some(true)));
+        assert_eq!(std::fs::read(&wide).unwrap(), original, "the source is only read");
+
+        // Relinked to another file: the old proxy must not stand in for it.
+        std::fs::remove_file(&wide).unwrap();
+        rpc("media.relink", json!({"id":wide_id,"path":other})).await;
+        for _ in 0..300 {
+            let note = std::fs::read_to_string(root.join("proxies").join(format!("{wide_id}.source")));
+            if note.is_ok_and(|noted| FsPath::new(&noted) == other) && file.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let rebuilt = media::probe_info(&file, &root).await.unwrap();
+        assert_eq!(rebuilt["height"].as_u64(), Some(1280), "the proxy shows the relinked file");
+
+        // Stopping the service stops the worker; unreferenced files go at the next start.
+        std::fs::write(root.join("proxies/media-removed.mp4"), "x").unwrap();
+        drop(service);
+        let again = StudioService::start_on(root.clone(), Host::Service, 0).await.unwrap();
+        assert!(!root.join("proxies/media-removed.mp4").exists());
+        assert!(file.is_file());
+        drop(again);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&sources).unwrap();
+    }
+    /// Undo while a waveform is being decoded drops the result; after redo the
+    /// media must get its waveform without restarting the service.
+    #[tokio::test]
+    async fn waveform_is_computed_again_when_the_media_returns() {
+        let root = temp_root("waveform-retry");
+        let sources = temp_root("waveform-retry-sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let tone = sources.join("tone.wav");
+        let made = std::process::Command::new(media::executable("ffmpeg"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .arg(&tone)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let tone = tone.canonicalize().unwrap();
+        let editor = Arc::new(Mutex::new(Editor::new(root.clone()).unwrap()));
+        editor.lock().await.dispatch("media.import", json!({"paths":[tone]})).await.unwrap();
+        assert_eq!(editor.lock().await.pending_waveforms().len(), 1);
+
+        let mut attempted = HashSet::new();
+        let undo_meanwhile = |_: PathBuf, _: f64| async {
+            editor.lock().await.dispatch("history.undo", json!({})).await.unwrap();
+            Some(vec![0.5])
+        };
+        assert!(waveform_work(&editor, &mut attempted, undo_meanwhile).await);
+        editor.lock().await.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(editor.lock().await.pending_waveforms().len(), 1, "the dropped result was not kept");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(media_work_step(&editor, &root, &cancel, &mut attempted).await);
+        let project = editor.lock().await.dispatch("project.get", json!({})).await.unwrap();
+        let peaks = project["media"][0]["waveform"].as_array().expect("waveform after redo");
+        assert!(peaks.iter().any(|v| v.as_f64().unwrap() > 0.0));
+        // Recorded now, so it is not decoded again.
+        let never = |_: PathBuf, _: f64| async { panic!("decoded twice") };
+        assert!(!waveform_work(&editor, &mut attempted, never).await);
+        // A reprobe makes it pending again, and it is decoded in this same run.
+        let id = project["media"][0]["id"].clone();
+        editor.lock().await.dispatch("media.reprobe", json!({"ids":[id]})).await.unwrap();
+        assert_eq!(editor.lock().await.pending_waveforms().len(), 1);
+        let again = |_: PathBuf, _: f64| async { Some(vec![0.25]) };
+        assert!(waveform_work(&editor, &mut attempted, again).await);
+        let project = editor.lock().await.dispatch("project.get", json!({})).await.unwrap();
+        assert_eq!(project["media"][0]["waveform"], json!([0.25]));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&sources).unwrap();
+    }
+    #[test]
     fn upload_names_cannot_escape() {
         assert_eq!(clean_filename("../../a.mp4"), "a.mp4");
         assert_eq!(clean_filename("C:\\folder\\x.mp4"), "x.mp4");
@@ -913,6 +1404,7 @@ mod tests {
             connection,
             root,
             origins: Arc::new(allowed_origins(Host::Service)),
+            media_work: Arc::new(Notify::new()),
         }
     }
     fn upload_headers() -> HeaderMap {

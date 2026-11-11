@@ -18,12 +18,25 @@ fn read(root: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(json!({"version":1,"fonts":[],"presets":[]}));
     }
-    let value: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+    let mut value: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| format!("추가 소재 목록을 읽을 수 없습니다: {e}"))?;
     if value["version"] != 1 || !value["fonts"].is_array() || !value["presets"].is_array() {
         return Err("추가 소재 목록의 형식이 올바르지 않습니다.".into());
     }
+    value["presets"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .for_each(normalize_filter);
     Ok(value)
+}
+
+// Presets from older builds may name a filter id that no longer exists
+// (cinema, original, vivid, soft); their colour values carry the look.
+fn normalize_filter(preset: &mut Value) {
+    if let Some(filter) = preset.pointer_mut("/patch/filter") {
+        *filter = json!(editor::legacy_filter(filter));
+    }
 }
 
 fn write(root: &Path, value: &Value) -> Result<(), String> {
@@ -167,6 +180,7 @@ pub async fn save_preset(
 }
 
 fn insert_preset(root: &Path, mut preset: Value) -> Result<Value, String> {
+    normalize_filter(&mut preset);
     editor::validate_preset(&preset)?;
     preset["version"] = json!(1);
     preset["id"] = json!(media::id("preset"));
@@ -284,6 +298,51 @@ mod tests {
     use super::*;
     fn root() -> PathBuf {
         std::env::temp_dir().join(media::id("studio-catalog-test"))
+    }
+
+    #[tokio::test]
+    async fn legacy_filter_ids_are_normalized_when_listed_and_imported() {
+        let dir = root();
+        let preset = |filter: &str| {
+            json!({"version":1,"id":format!("preset-{filter}"),"name":filter,"kind":"filter","target":"visual",
+            "sourceDuration":4.0,"patch":{"filter":filter,"color":{"brightness":0.1,"contrast":1.2,"saturation":0.9,"temperature":0.0}}})
+        };
+        let old = ["cinema", "original", "vivid", "soft", "warm"];
+        media::atomic_json(
+            &dir.join("catalog/index.json"),
+            &json!({"version":1,"fonts":[],"presets":old.map(preset)}),
+        )
+        .unwrap();
+        let listed = list(&dir).unwrap();
+        let filters: Vec<&str> = listed["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["patch"]["filter"].as_str().unwrap())
+            .collect();
+        assert_eq!(filters, ["cinematic", "none", "none", "none", "warm"]);
+        assert_eq!(listed["presets"][2]["patch"]["color"]["contrast"], 1.2);
+        assert_eq!(
+            find(&dir, "presets", "preset-cinema").unwrap()["patch"]["filter"],
+            "cinematic"
+        );
+
+        let file = dir.join("old.json");
+        media::atomic_json(&file, &preset("vivid")).unwrap();
+        let imported = import_preset(&dir, &file).await.unwrap();
+        assert_eq!(imported["patch"]["filter"], "none");
+        assert_eq!(imported["patch"]["color"]["saturation"], 0.9);
+        // The catalog on disk is normalized by that write too.
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("catalog/index.json")).unwrap())
+                .unwrap();
+        assert!(stored["presets"].as_array().unwrap().iter().all(|p| [
+            "cinematic",
+            "none",
+            "warm"
+        ]
+        .contains(&p["patch"]["filter"].as_str().unwrap())));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

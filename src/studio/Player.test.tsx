@@ -191,6 +191,9 @@ describe("responsive preview", () => {
     const later = { ...audio, start: 10 };
     const props = { project: { ...project, clips: [later] }, time: 0, playing: false, onTime: vi.fn(), onPlaying: vi.fn(), selectedId: null, onSelect: vi.fn(), onCommand: vi.fn() };
     const { container, rerender } = render(<Player {...props} />);
+    // Far from the playhead there is no element at all; it mounts shortly before its cut.
+    expect(container.querySelector("audio")).toBeNull();
+    rerender(<Player {...props} time={6} />);
     const el = container.querySelector("audio")!;
     expect(el.preload).toBe("metadata");
     rerender(<Player {...props} time={8} />);
@@ -226,6 +229,51 @@ describe("responsive preview", () => {
     await act(async () => {});
     expect(screen.getByRole("alert")).toHaveTextContent("재생");
     expect(onPlaying).toHaveBeenCalledWith(false);
+  });
+  it("plays an unprimed element silently and keeps the timeline running", async () => {
+    // Only a muted start is allowed, as for an element mounted after the play gesture.
+    vi.mocked(HTMLMediaElement.prototype.play).mockImplementation(function (this: HTMLMediaElement) {
+      return this.muted ? Promise.resolve() : Promise.reject(new DOMException("blocked", "NotAllowedError"));
+    });
+    const onPlaying = vi.fn();
+    const { container } = render(<Player project={{ ...project, clips: [audio] }} time={0} playing onTime={vi.fn()} onPlaying={onPlaying} selectedId={null} onSelect={vi.fn()} onCommand={vi.fn()} />);
+    await act(async () => {});
+    await act(async () => {});
+    expect(container.querySelector("audio")!.muted).toBe(true);
+    expect(screen.getByRole("alert")).toHaveTextContent("소리 없이");
+    expect(onPlaying).not.toHaveBeenCalled();
+  });
+  it("wraps a repeat when the rendered preview ends before the clock", async () => {
+    const props = { project, time: 4.9, playing: true, onPlaying: vi.fn(), selectedId: null, onSelect: vi.fn(), onCommand: vi.fn(), playbackUrl: "http://studio/rendered.mp4" };
+    const onTime = vi.fn();
+    const { container, rerender } = render(<Player {...props} onTime={onTime} loop={{ start: 1, end: 5 }} />);
+    await act(async () => {});
+    const rendered = container.querySelector<HTMLVideoElement>(".rendered-preview")!;
+    const plays = vi.mocked(HTMLMediaElement.prototype.play).mock.calls.length;
+    fireEvent.ended(rendered);
+    expect(onTime).toHaveBeenCalledWith(1);
+    expect(props.onPlaying).not.toHaveBeenCalled();
+    // The browser paused the ended element: the wrap seek starts it again.
+    rerender(<Player {...props} onTime={onTime} loop={{ start: 1, end: 5 }} time={1} seekEpoch={1} />);
+    expect(vi.mocked(HTMLMediaElement.prototype.play).mock.calls.length).toBe(plays + 1);
+    await act(async () => {});
+    rerender(<Player {...props} onTime={onTime} time={4.9} seekEpoch={2} />);
+    fireEvent.ended(container.querySelector<HTMLVideoElement>(".rendered-preview")!);
+    expect(props.onPlaying).toHaveBeenCalledWith(false);
+  });
+  it("crops a wipe on the clip's own box even when the clip has a hard-edged mask", () => {
+    const masked: Clip = { ...visual, kind: "image", transitionIn: { type: "wipeLeft", duration: 1 }, mask: { type: "rectangle", x: 0.5, y: 0.5, width: 0.6, height: 0.6, feather: 0 } };
+    const media = [{ id: "m", kind: "image" as const, name: "Tall.png", path: "/tall.png", duration: 0, width: 1080, height: 1920, hasAudio: false }];
+    const { container } = render(<Player project={{ ...project, media, clips: [masked] }} time={0.5} playing={false} onTime={vi.fn()} onPlaying={vi.fn()} selectedId={null} onSelect={vi.fn()} onCommand={vi.fn()} />);
+    const layer = container.querySelector<HTMLElement>(".composition-layer")!;
+    const wipe = layer.querySelector<HTMLElement>(".layer-wipe")!;
+    const frame = wipe.querySelector<HTMLElement>(".layer-frame")!;
+    expect(layer.style.clipPath).toBe("");
+    expect(wipe.style.clipPath).not.toBe("");
+    expect(frame.style.clipPath).not.toBe("");
+    expect(frame.style.clipPath).not.toBe(wipe.style.clipPath);
+    // The wipe box is exactly the picture's frame.
+    expect(wipe.children).toHaveLength(1);
   });
   it("treats an audio asset as sound even if a legacy clip still says video", async () => {
     const legacy: Project = { ...project, clips: [visual], media: [{ id: "m", kind: "audio", name: "Song.mp3", path: "/song.mp3", duration: 5, width: 0, height: 0, hasAudio: true }] };
@@ -310,7 +358,7 @@ describe("responsive preview", () => {
     expect(rpc).toHaveBeenCalledTimes(3);
     expect(rpc).toHaveBeenLastCalledWith(
       "preview.frame",
-      { time: 2, width: 640, expectedRevision: 1 },
+      { time: 2, width: 640, expectedRevision: 1, client: "player" },
       "p",
     );
     expect(result.current?.url).toBe("http://studio/latest");

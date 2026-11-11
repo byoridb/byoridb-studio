@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { Download, FolderOpen, LoaderCircle, X } from "lucide-react";
+import {
+  ChevronDown,
+  Download,
+  FolderOpen,
+  LoaderCircle,
+  X,
+} from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { assetUrl, rpc, savePath } from "./api";
 import { durationOf, type Job, type Project } from "./types";
@@ -8,6 +14,14 @@ import { usePoll } from "./usePoll";
 import "./panels.css";
 
 const audioFormats = ["mp3", "wav"];
+const codecFormats = ["mp4", "mov"];
+const even = (value: number) => Math.round(value / 2) * 2;
+const resolutionNames: Record<number, string> = {
+  720: "HD",
+  1080: "FHD",
+  1440: "QHD",
+  2160: "4K",
+};
 export default function ExportDialog({
   project,
   onClose,
@@ -19,7 +33,17 @@ export default function ExportDialog({
   const [path, setPath] = useState(
     `~/Movies/Byori Studio/${project.name.replace(/[\\/:*?"<>|]/g, "_")}.mp4`,
   );
-  const [height, setHeight] = useState(project.height);
+  // Resolutions are named by the short side, so 1080p means the same for a vertical project.
+  const projectShort = Math.min(project.width, project.height);
+  const [short, setShort] = useState(projectShort);
+  const size = {
+    width: even((project.width / projectShort) * short),
+    height: even((project.height / projectShort) * short),
+  };
+  const [advanced, setAdvanced] = useState(false);
+  const [codec, setCodec] = useState("h264");
+  const [hardware, setHardware] = useState(true);
+  const [bitrate, setBitrate] = useState("");
   const [fps, setFps] = useState(project.fps);
   const [quality, setQuality] = useState(18);
   const [job, setJob] = useState<Job | null>(null);
@@ -37,7 +61,7 @@ export default function ExportDialog({
     const timer = setTimeout(() => {
       void rpc<{ assetId: string }>(
         "preview.frame",
-        { time: range ? startTime : 0, width: 640 },
+        { time: range ? startTime : 0, width: 640, client: "export" },
         project.id,
       )
         .then((result) => {
@@ -66,6 +90,8 @@ export default function ExportDialog({
     500,
   );
   const audioOnly = audioFormats.includes(format);
+  const codecChoice = codecFormats.includes(format);
+  const kbps = Number(bitrate);
   const start = async () => {
     setBusy(true);
     setError("");
@@ -79,6 +105,8 @@ export default function ExportDialog({
         )
       )
         throw new Error("내보낼 구간의 시작과 끝을 확인하세요.");
+      if (!audioOnly && bitrate.trim() && !(kbps >= 100 && kbps <= 200000))
+        throw new Error("비트레이트는 100~200000 kbps 사이로 입력하세요.");
       const j = await rpc<{ id: string }>(
         "export.start",
         {
@@ -87,12 +115,11 @@ export default function ExportDialog({
           ...(audioOnly
             ? {}
             : {
-                width:
-                  Math.round(((project.width / project.height) * height) / 2) *
-                  2,
-                height,
+                ...size,
                 fps,
-                crf: quality,
+                ...(bitrate.trim() ? { bitrate: Math.round(kbps) } : { crf: quality }),
+                ...(codecChoice && codec !== "h264" ? { codec } : {}),
+                ...(codecChoice && !hardware ? { hardware: false } : {}),
               }),
           // Only a path confirmed by the native save dialog may replace a file.
           ...(pickedPath && path === pickedPath ? { overwrite: true } : {}),
@@ -218,14 +245,15 @@ export default function ExportDialog({
               해상도
               <select
                 disabled={active || audioOnly}
-                value={height}
-                onChange={(e) => setHeight(+e.target.value)}
+                value={short}
+                onChange={(e) => setShort(+e.target.value)}
               >
-                {Array.from(new Set([720, 1080, 1440, 2160, project.height]))
-                  .sort((a, b) => a - b)
+                {Array.from(new Set([720, 1080, 1440, 2160, projectShort]))
+                  .sort((x, y) => x - y)
                   .map((h) => (
                     <option key={h} value={h}>
-                      {h}p{h === project.height ? " · 프로젝트" : ""}
+                      {resolutionNames[h] ? `${resolutionNames[h]} ` : ""}
+                      {h}p{h === projectShort ? " · 프로젝트" : ""}
                     </option>
                   ))}
               </select>
@@ -237,8 +265,8 @@ export default function ExportDialog({
                 value={fps}
                 onChange={(e) => setFps(+e.target.value)}
               >
-                {Array.from(new Set([24, 25, 30, 50, 60, project.fps]))
-                  .sort((a, b) => a - b)
+                {Array.from(new Set([24, 30, 60, project.fps]))
+                  .sort((x, y) => x - y)
                   .map((f) => (
                     <option key={f} value={f}>
                       {f} fps{f === project.fps ? " · 프로젝트" : ""}
@@ -249,7 +277,7 @@ export default function ExportDialog({
             <label>
               품질
               <select
-                disabled={active || audioOnly}
+                disabled={active || audioOnly || !!bitrate.trim()}
                 value={quality}
                 onChange={(e) => setQuality(+e.target.value)}
               >
@@ -269,6 +297,70 @@ export default function ExportDialog({
                 <option value="range">구간 지정</option>
               </select>
             </label>
+            {!audioOnly && (
+              <p className="export-hint export-size">
+                {size.width}×{size.height} · {fps} fps
+              </p>
+            )}
+            <button
+              className="export-advanced-toggle"
+              aria-expanded={advanced}
+              disabled={audioOnly}
+              onClick={() => setAdvanced((open) => !open)}
+            >
+              <ChevronDown size={13} className={advanced ? "" : "collapsed"} />
+              고급 설정
+            </button>
+            {advanced && !audioOnly && (
+              <div className="export-advanced">
+                <label>
+                  코덱
+                  <select
+                    aria-label="코덱"
+                    disabled={active || !codecChoice}
+                    value={codecChoice ? codec : "vp9"}
+                    onChange={(e) => setCodec(e.target.value)}
+                  >
+                    {codecChoice ? (
+                      <>
+                        <option value="h264">H.264 · 호환성 우선</option>
+                        <option value="hevc">HEVC (H.265) · 작은 파일</option>
+                      </>
+                    ) : (
+                      <option value="vp9">VP9</option>
+                    )}
+                  </select>
+                </label>
+                <label>
+                  비트레이트 (kbps)
+                  <input
+                    aria-label="비트레이트"
+                    type="number"
+                    min={100}
+                    max={200000}
+                    step={500}
+                    placeholder="자동 (품질 기준)"
+                    value={bitrate}
+                    disabled={active}
+                    onChange={(e) => setBitrate(e.target.value)}
+                  />
+                </label>
+                <label className="export-check">
+                  <input
+                    type="checkbox"
+                    checked={codecChoice && hardware}
+                    disabled={active || !codecChoice}
+                    onChange={(e) => setHardware(e.target.checked)}
+                  />
+                  하드웨어 가속 인코딩
+                </label>
+                <p className="export-hint">
+                  {codecChoice
+                    ? "하드웨어 가속을 쓸 수 없거나 실패하면 소프트웨어 인코더로 자동 전환합니다. 비트레이트를 입력하면 품질 설정 대신 사용합니다."
+                    : "WebM은 VP9 소프트웨어 인코더로 내보냅니다."}
+                </p>
+              </div>
+            )}
             {audioOnly && (
               <p className="export-hint">
                 오디오 형식은 소리만 내보내므로 해상도·프레임레이트·품질을
@@ -334,6 +426,11 @@ export default function ExportDialog({
             </div>
             <progress value={job.progress || 0} max={1} />
             {job.path && <p>{job.path}</p>}
+            {job.encoder && (
+              <p>
+                인코더: {job.encoder.includes("videotoolbox") ? "하드웨어" : "소프트웨어"} ({job.encoder})
+              </p>
+            )}
             {job.error && <p className="inline-error">{job.error}</p>}
           </div>
         )}

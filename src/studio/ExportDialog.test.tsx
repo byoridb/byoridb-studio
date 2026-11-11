@@ -205,3 +205,80 @@ it("offers the project frame rate so the shown value matches what is exported", 
   fireEvent.click(screen.getByRole("button", { name: "내보내기" }));
   await waitFor(() => expect(started()[0][1]).toMatchObject({ fps: 120 }));
 });
+
+it("sends encoder options only when they differ from the defaults", async () => {
+  vi.mocked(rpc).mockResolvedValue({ id: "render" });
+  render(<ExportDialog project={project} onClose={vi.fn()} />);
+  await waitFor(() =>
+    expect(rpc).toHaveBeenCalledWith(
+      "preview.frame",
+      expect.objectContaining({ client: "export" }),
+      "export-test",
+    ),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "내보내기" }));
+  await waitFor(() =>
+    expect(rpc).toHaveBeenCalledWith(
+      "export.start",
+      {
+        path: expect.any(String),
+        format: "mp4",
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        crf: 18,
+      },
+      "export-test",
+    ),
+  );
+});
+
+it("exports HEVC without hardware encoding at a fixed bitrate", async () => {
+  vi.mocked(rpc).mockResolvedValue({ id: "render" });
+  render(<ExportDialog project={project} onClose={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "고급 설정" }));
+  fireEvent.change(screen.getByLabelText("코덱"), { target: { value: "hevc" } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "하드웨어 가속 인코딩" }));
+  fireEvent.change(screen.getByLabelText("비트레이트"), { target: { value: "50" } });
+  fireEvent.click(screen.getByRole("button", { name: "내보내기" }));
+  expect(await screen.findByText(/비트레이트는 100~200000 kbps/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("비트레이트"), { target: { value: "8000" } });
+  expect(screen.getByLabelText("품질")).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "내보내기" }));
+  await waitFor(() =>
+    expect(rpc).toHaveBeenCalledWith(
+      "export.start",
+      expect.objectContaining({ codec: "hevc", hardware: false, bitrate: 8000 }),
+      "export-test",
+    ),
+  );
+  const sent = vi.mocked(rpc).mock.calls.find(([m]) => m === "export.start")![1];
+  expect(sent).not.toHaveProperty("crf");
+});
+
+it("names resolutions by the short side and drops encoder options for WebM", async () => {
+  vi.mocked(rpc).mockResolvedValue({ id: "render" });
+  render(
+    <ExportDialog
+      project={{ ...project, width: 1080, height: 1920 }}
+      onClose={vi.fn()}
+    />,
+  );
+  fireEvent.change(screen.getByLabelText("해상도"), { target: { value: "720" } });
+  expect(screen.getByText("720×1280 · 30 fps")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "고급 설정" }));
+  fireEvent.change(screen.getByLabelText("코덱"), { target: { value: "hevc" } });
+  fireEvent.change(screen.getByLabelText("형식"), { target: { value: "webm" } });
+  expect(screen.getByLabelText("코덱")).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "내보내기" }));
+  await waitFor(() =>
+    expect(rpc).toHaveBeenCalledWith(
+      "export.start",
+      expect.objectContaining({ format: "webm", width: 720, height: 1280 }),
+      "export-test",
+    ),
+  );
+  const sent = vi.mocked(rpc).mock.calls.find(([m]) => m === "export.start")![1];
+  expect(sent).not.toHaveProperty("codec");
+  expect(sent).not.toHaveProperty("hardware");
+});

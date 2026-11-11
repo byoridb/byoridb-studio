@@ -23,11 +23,27 @@ import {
   WandSparkles,
   X,
 } from "lucide-react";
-import { assetUrl, pickFiles, savePath } from "./api";
-import type { Clip, Command, Media, Project } from "./types";
+import { assetUrl, pickFiles, savePath, uploadFile } from "./api";
+import {
+  incomingTransitionCommands,
+  joinTransitionCommands,
+  overlapWithPrevious,
+  previousClip,
+  stickerUrl,
+  stickers,
+  textDefaults,
+  textPresets,
+  transitionOf,
+  transitionPatch,
+  transitionsFor,
+  type Edge,
+  type StickerAsset,
+} from "./clipPresets";
+import type { Clip, Command, Media, Project, TransitionType } from "./types";
 import SpeechPanel from "./SpeechPanel";
 import { FontLibrary, PresetLibrary } from "./CustomAssets";
 import { usePreviewDraft } from "./previewDraft";
+import { textStyle } from "./fastPreview";
 import "./panels.css";
 
 export interface LibraryProps {
@@ -37,6 +53,8 @@ export interface LibraryProps {
   onImport: () => void;
   onSelect: (clipId: string) => void;
   playhead?: number;
+  /** The live playhead at the moment of an action; `playhead` holds still during playback. */
+  now?: () => number;
   targetTrackId?: string | null;
 }
 type Tab =
@@ -59,14 +77,6 @@ const tabs: { id: Tab; label: string; icon: typeof Film }[] = [
   { id: "filters", label: "필터", icon: Sparkles },
 ];
 const audioDefaults = { normalize: false, denoise: false, voiceEnhance: false };
-const textDefaults = {
-  fontSize: 64,
-  color: "#ffffff",
-  fontFamily: "Arial",
-  bold: false,
-  align: "center",
-  background: "transparent",
-};
 // Ids and values mirror the editor's built-in filter presets; the editor owns
 // the applied values, these copies only drive thumbnails and hover previews.
 const filters = [
@@ -100,52 +110,6 @@ const filters = [
     name: "빈티지",
     color: { brightness: 0.03, contrast: 0.9, saturation: 0.75, temperature: 0.3 },
   },
-];
-const textPresets = [
-  {
-    label: "제목을 입력하세요",
-    name: "타이틀",
-    style: { fontSize: 92, bold: true },
-  },
-  {
-    label: "작은 순간, 오래 남는 기억",
-    name: "시네마",
-    style: { fontSize: 46, fontFamily: "Georgia" },
-  },
-  {
-    label: "오늘의 기록",
-    name: "하이라이트",
-    style: { fontSize: 66, bold: true, color: "#ffe76a" },
-  },
-  {
-    label: "여기에 자막을 입력하세요",
-    name: "자막",
-    style: { fontSize: 40, background: "#18191de6" },
-  },
-  {
-    label: "CHAPTER 01",
-    name: "챕터",
-    style: { fontSize: 44, bold: true },
-  },
-  {
-    label: "이야기가 시작되는 곳",
-    name: "미니멀",
-    style: { fontSize: 38 },
-  },
-];
-const badgePresets = [
-  { label: "NEW", color: "#191b20", background: "#d5fb72" },
-  { label: "REC", color: "#ffffff", background: "#dd4a51" },
-  { label: "LIVE", color: "#ffffff", background: "#7956d8" },
-  { label: "01", color: "#ffffff", background: "#305b8f" },
-  { label: "TIP", color: "#161a1d", background: "#40d3c6" },
-  { label: "DAY 1", color: "#1b1b1b", background: "#f0cf91" },
-];
-const fadePresets = [
-  { name: "없음", in: 0, out: 0 },
-  { name: "페이드 인", in: 0.5, out: 0 },
-  { name: "페이드 아웃", in: 0, out: 0.5 },
-  { name: "인 + 아웃", in: 0.5, out: 0.5 },
 ];
 const motionPresets = [
   { name: "천천히 확대", label: "108%", start: 1, end: 1.08 },
@@ -198,6 +162,7 @@ export function Library({
   onImport,
   onSelect,
   playhead = 0,
+  now,
   targetTrackId,
 }: LibraryProps) {
   const preview = usePreviewDraft();
@@ -241,17 +206,19 @@ export function Library({
   const [notice, setNotice] = useState("");
   const [captionPath, setCaptionPath] = useState("");
   const [brokenThumbs, setBrokenThumbs] = useState<string[]>([]);
+  const [edge, setEdge] = useState<Edge>("in");
+  const [transitionLength, setTransitionLength] = useState(0.5);
   const query = search.trim().toLowerCase();
   const matches = (name: string) => name.toLowerCase().includes(query);
   const builtInMatches =
     tab === "text"
       ? textPresets.filter((p) => matches(p.name)).length
       : tab === "stickers"
-        ? badgePresets.filter((p) => matches(p.label)).length
+        ? stickers.filter((p) => matches(p.name)).length
         : tab === "filters"
           ? filters.filter((p) => matches(p.name)).length
           : tab === "transitions"
-            ? fadePresets.filter((p) => matches(p.name)).length
+            ? transitionsFor(selected).filter((p) => matches(p.name)).length
             : [...motionPresets, ...maskPresets].filter((p) => matches(p.name))
                 .length;
   const pathInput = useRef<HTMLInputElement>(null);
@@ -320,11 +287,11 @@ export function Library({
       await run(media.id, "edit.add", {
         mediaId: media.id,
         trackId: track.id,
-        start: playhead,
+        start: now?.() ?? playhead,
       });
     } else
       await run(media.id, "edit.add", {
-        mediaId: media.id, start: playhead,
+        mediaId: media.id, start: now?.() ?? playhead,
         ...(targetTrack?.kind === (media.kind === "audio" ? "audio" : "video") ? { trackId: targetTrack.id } : {}),
       });
   };
@@ -360,7 +327,7 @@ export function Library({
   };
   const addText = (label: string, style: Record<string, unknown> = {}) =>
     run(label, "edit.add", {
-      start: playhead,
+      start: now?.() ?? playhead,
       duration: 3,
       ...(targetTrack?.kind === "text" ? { trackId: targetTrack.id } : {}),
       text: { ...textDefaults, content: label, ...style },
@@ -373,6 +340,84 @@ export function Library({
           expectedRevision: project.revision,
         })
       : undefined;
+  const addSticker = async (sticker: StickerAsset) => {
+    setPending(sticker.id);
+    setError("");
+    setNotice("");
+    try {
+      let media = project.media.find(
+        (m) => m.kind === "image" && !m.missing && m.name.endsWith(sticker.file),
+      );
+      let revision = project.revision;
+      if (!media) {
+        const response = await fetch(stickerUrl(sticker));
+        const image = response.ok ? await response.blob() : null;
+        if (!image || !image.type.startsWith("image/"))
+          throw new Error("스티커 이미지를 불러오지 못했습니다.");
+        const updated = await uploadFile(
+          new File([image], sticker.file, { type: "image/png" }),
+          project.id,
+        );
+        media = updated.media.find(
+          (m) => !project.media.some((old) => old.id === m.id),
+        );
+        revision = updated.revision;
+        if (!media) throw new Error("스티커를 소재로 가져오지 못했습니다.");
+      }
+      // A sticker starts as an overlay, not a full-frame image.
+      const added = (await onCommand("edit.add", {
+        mediaId: media.id,
+        start: now?.() ?? playhead,
+        duration: 3,
+        name: `${sticker.name} 스티커`,
+        transform: { scale: 0.35 },
+        expectedRevision: revision,
+        ...(targetTrack?.kind === "video" ? { trackId: targetTrack.id } : {}),
+      })) as Project;
+      const clip = added.clips.find(
+        (c) => c.mediaId === media!.id && !project.clips.some((old) => old.id === c.id),
+      );
+      if (clip) onSelect(clip.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(null);
+    }
+  };
+  const transitions = transitionsFor(selected);
+  const currentTransition = selected ? transitionOf(selected, edge) : null;
+  const joined = selected ? overlapWithPrevious(project, selected) > 0 : false;
+  const canJoin =
+    !!selected && edge === "in" && !joined && !!previousClip(project, selected);
+  const applyTransition = (type: TransitionType | null) =>
+    selected &&
+    // A joined clip overlaps the previous one by exactly its in transition.
+    (edge === "in" && joined
+      ? batchSelected(
+          `transition-${type}`,
+          incomingTransitionCommands(
+            project,
+            selected,
+            type && { type, duration: transitionLength },
+          ),
+        )
+      : patchSelected(
+          `transition-${type}`,
+          transitionPatch(selected, edge, type, transitionLength),
+        ));
+  const batchSelected = (
+    key: string,
+    commands: { method: string; params: Record<string, unknown> }[],
+  ) =>
+    commands.length
+      ? run(key, "edit.batch", { commands, expectedRevision: project.revision })
+      : undefined;
+  const previewTransition = (type: TransitionType | null) =>
+    selected &&
+    preview(
+      selected.id,
+      type ? transitionPatch(selected, edge, type, transitionLength) : null,
+    );
   const setCurrentTab = (value: Tab) => {
     setTab(value);
     setSearch("");
@@ -475,11 +520,11 @@ export function Library({
             <span className="category-label">컬러 프리셋</span>
           )}
           {tab === "transitions" && (
-            <span className="category-label">페이드</span>
+            <span className="category-label">등장 · 퇴장</span>
           )}
           {tab === "effects" && <span className="category-label">모션</span>}
           {tab === "stickers" && (
-            <span className="category-label">텍스트 배지</span>
+            <span className="category-label">도형 · 기호</span>
           )}
           <div className="library-category-bottom">
             <Folder size={14} />
@@ -711,21 +756,26 @@ export function Library({
               <FontLibrary project={project} selected={selected} onCommand={onCommand} query={query} />
               <h3 className="library-section-title">텍스트 프리셋</h3>
               <div className="text-preset-grid">
-                {textPresets.map((item, i) => matches(item.name) && (
+                {textPresets.map((item) => matches(item.name) && (
                   <button
-                    className={`text-preset text-preset-${i}`}
+                    className="text-preset"
                     disabled={pending !== null}
                     key={item.name}
                     onClick={() => void addText(item.label, item.style)}
                   >
-                    <span
-                      style={{
-                        fontFamily: item.style.fontFamily,
-                        fontWeight: item.style.bold ? 700 : 400,
-                        color: item.style.color,
-                      }}
-                    >
-                      Aa
+                    <span>
+                      <i
+                        style={{
+                          ...textStyle(
+                            { ...textDefaults, content: "", ...item.style },
+                            0.3,
+                            project.width,
+                          ),
+                          fontStyle: item.style.italic ? "italic" : "normal",
+                        }}
+                      >
+                        Aa
+                      </i>
                     </span>
                     <small>{item.name}</small>
                   </button>
@@ -739,32 +789,31 @@ export function Library({
           )}
           {tab === "stickers" && (
             <>
-              <h3 className="library-section-title">텍스트 배지</h3>
-              <div className="badge-preset-grid">
-                {badgePresets.map((b) => matches(b.label) && (
+              <h3 className="library-section-title">
+                스티커 <span>{builtInMatches}</span>
+              </h3>
+              <div className="sticker-grid">
+                {stickers.map((sticker) => matches(sticker.name) && (
                   <button
-                    key={b.label}
+                    key={sticker.id}
+                    className="sticker-tile"
                     disabled={pending !== null}
-                    className="badge-preset"
-                    onClick={() =>
-                      void addText(b.label, {
-                        color: b.color,
-                        background: b.background,
-                        bold: true,
-                        fontSize: 56,
-                      })
-                    }
+                    aria-label={`${sticker.name} 스티커 추가`}
+                    title={sticker.name}
+                    onClick={() => void addSticker(sticker)}
                   >
-                    <span style={{ color: b.color, background: b.background }}>
-                      {b.label}
-                    </span>
-                    <small>{b.label}</small>
+                    {pending === sticker.id ? (
+                      <LoaderCircle size={18} className="panel-spin" />
+                    ) : (
+                      <img src={stickerUrl(sticker)} alt="" draggable={false} />
+                    )}
                   </button>
                 ))}
               </div>
               <p className="panel-help">
-                편집 가능한 텍스트 배지입니다. 색상·크기·내용을 자유롭게
-                바꿔보세요.
+                스티커는 이미지 소재로 프로젝트에 추가되어 재생 위치에
+                놓입니다. 크기와 위치는 미리보기 화면이나 속성 패널에서
+                조절하세요.
               </p>
             </>
           )}
@@ -822,37 +871,129 @@ export function Library({
           )}
           {tab === "transitions" && (
             <>
-              <h3 className="library-section-title">페이드 전환</h3>
-              <p className="panel-hint">
-                선택한 클립의 시작과 끝을 부드럽게 연결합니다.
-              </p>
-              <div className="effect-preset-grid">
-                {fadePresets.map((effect, i) => matches(effect.name) && (
-                  <button
-                    key={effect.name}
-                    disabled={!selected || pending !== null}
-                    onClick={() =>
-                      void patchSelected(effect.name, {
-                        fadeIn: Math.min(
-                          effect.in,
-                          (selected?.duration || 1) / 2,
-                        ),
-                        fadeOut: Math.min(
-                          effect.out,
-                          (selected?.duration || 1) / 2,
-                        ),
-                      })
+              <h3 className="library-section-title">
+                전환 <span>{builtInMatches}</span>
+              </h3>
+              {!selected && (
+                <p className="panel-hint">
+                  전환을 적용할 클립을 타임라인에서 선택하세요.
+                </p>
+              )}
+              <div className="transition-controls">
+                <div className="segmented" role="group" aria-label="전환 위치">
+                  {(
+                    [
+                      ["in", "등장"],
+                      ["out", "퇴장"],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <button
+                      key={id}
+                      className={edge === id ? "active" : ""}
+                      aria-pressed={edge === id}
+                      onClick={() => {
+                        setEdge(id);
+                        const existing = selected && transitionOf(selected, id);
+                        if (existing) setTransitionLength(existing.duration);
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <label>
+                  길이
+                  <input
+                    aria-label="전환 길이"
+                    type="number"
+                    min={0.1}
+                    max={Math.max(0.1, selected?.duration ?? 10)}
+                    step={0.1}
+                    value={transitionLength}
+                    onChange={(e) =>
+                      setTransitionLength(
+                        Math.max(0.1, Number(e.target.value) || 0.1),
+                      )
                     }
+                    onBlur={() => {
+                      if (
+                        currentTransition &&
+                        Math.abs(currentTransition.duration - transitionLength) > 1e-6
+                      )
+                        void applyTransition(currentTransition.type);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") e.currentTarget.blur();
+                    }}
+                  />
+                  <small>초</small>
+                </label>
+              </div>
+              <div className="effect-preset-grid">
+                {transitions.map((item) => matches(item.name) && (
+                  <button
+                    key={item.id}
+                    className={currentTransition?.type === item.id ? "active" : ""}
+                    aria-pressed={currentTransition?.type === item.id}
+                    disabled={!selected || pending !== null}
+                    onMouseEnter={() => previewTransition(item.id)}
+                    onMouseLeave={() => previewTransition(null)}
+                    onFocus={() => previewTransition(item.id)}
+                    onBlur={() => previewTransition(null)}
+                    onClick={() => void applyTransition(item.id)}
                   >
-                    <span className={`transition-art transition-art-${i}`}>
-                      <i />
+                    <span className={`transition-art ${edge} ${item.id}`}>
+                      <i
+                        style={
+                          representative
+                            ? { backgroundImage: `url(${JSON.stringify(assetUrl(representative.id, true))})` }
+                            : undefined
+                        }
+                      />
+                      {currentTransition?.type === item.id && (
+                        <span className="preset-check">
+                          <Check size={12} />
+                        </span>
+                      )}
                     </span>
-                    <small>{effect.name}</small>
+                    <small>{item.name}</small>
                   </button>
                 ))}
               </div>
+              <button
+                className="panel-wide-button secondary"
+                disabled={!selected || !currentTransition || pending !== null}
+                onClick={() =>
+                  void applyTransition(null)
+                }
+              >
+                <Trash2 size={13} />
+                {edge === "in" ? "등장" : "퇴장"} 전환 제거
+              </button>
+              {canJoin && selected && (
+                <button
+                  className="panel-wide-button secondary"
+                  disabled={pending !== null}
+                  onClick={() =>
+                    void batchSelected(
+                      "transition-join",
+                      joinTransitionCommands(
+                        project,
+                        selected,
+                        currentTransition?.type ??
+                          (selected.kind === "audio" ? "fade" : "dissolve"),
+                        transitionLength,
+                      ),
+                    )
+                  }
+                >
+                  앞 클립과 겹쳐 전환
+                </button>
+              )}
               <p className="panel-help">
-                전환 길이는 속성 패널에서 조절할 수 있습니다.
+                {joined
+                  ? "이 클립은 앞 클립 위로 겹쳐 등장합니다. 전환을 제거하면 뒤 클립들이 원래 자리로 돌아갑니다."
+                  : "전환은 선택한 클립이 나타나고 사라지는 방식입니다. ‘앞 클립과 겹쳐 전환’은 이 클립과 뒤 클립들을 전환 길이만큼 앞으로 당깁니다."}
               </p>
             </>
           )}

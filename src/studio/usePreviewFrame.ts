@@ -9,6 +9,8 @@ export function usePreviewFrame(
   time: number,
   width: number,
   enabled: boolean,
+  /** Only an older request of the same client is cancelled by a newer one. */
+  client = "player",
 ) {
   const [frame, setFrame] = useState<Frame | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -38,7 +40,7 @@ export function usePreviewFrame(
       const request = { key, projectId: project.id, revision: project.revision };
       rpc<{ assetId: string; revision: number; projectId?: string }>(
         "preview.frame",
-        { time: at, width: pixels, expectedRevision: request.revision },
+        { time: at, width: pixels, expectedRevision: request.revision, client },
         request.projectId,
       ).then(
         (result) => {

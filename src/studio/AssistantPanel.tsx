@@ -37,6 +37,26 @@ interface Props {
 }
 const activeStates = ["queued", "running", "cancelling"];
 type ConceptKey = keyof Project["concept"];
+type MemoryNote = Note & { projectId?: string };
+const stateNames: Record<string, string> = {
+  queued: "대기 중",
+  running: "진행 중",
+  cancelling: "중단 중",
+  completed: "완료",
+  failed: "실패",
+  cancelled: "중단됨",
+};
+const when = (value: number | string) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? ""
+    : date.toLocaleString("ko-KR", {
+        month: "numeric",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+};
 /** The job last shown, so a reopened panel can show how it ended. */
 let lastJob: { projectId: string; id: string } | null = null;
 
@@ -57,10 +77,16 @@ function Panel({
   const [chosen, setChosen] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [jobProvider, setJobProvider] = useState("");
+  /** A past run opened from the history while another job is still running. */
+  const [viewed, setViewed] = useState<{ job: Job; provider: string } | null>(
+    null,
+  );
   const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [notes, setNotes] = useState<Note[]>([]);
+  const [notes, setNotes] = useState<MemoryNote[]>([]);
+  const [scope, setScope] = useState<"project" | "all">("project");
+  const [history, setHistory] = useState<AgentSummary[]>([]);
   const [search, setSearch] = useState("");
   const [note, setNote] = useState("");
   const [draft, setDraft] = useState<Partial<Project["concept"]>>({});
@@ -115,6 +141,8 @@ function Panel({
     };
   }, [project.id]);
   const active = !!job && activeStates.includes(job.state);
+  const shown = viewed?.job ?? job;
+  const shownActive = !viewed && active;
   const poll = usePoll(
     active ? job.id : null,
     async () => {
@@ -151,19 +179,68 @@ function Panel({
       setBusy(false);
     }
   };
+  const memoryRequest = useRef(0);
   const findMemory = async () => {
+    const request = ++memoryRequest.current;
     setBusy(true);
     setError("");
     try {
-      const result = await rpc<{ items: Note[] }>("memory.search", {
+      const result = await rpc<{ items: MemoryNote[] }>("memory.search", {
         text: search,
-        limit: 20,
+        limit: 100,
+        ...(scope === "project" ? { projectId: project.id } : {}),
       });
-      setNotes(result.items);
+      if (request === memoryRequest.current) setNotes(result.items ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+  const connected = !!runtime?.byoridb.connected;
+  // Opening the tab (or changing its scope) shows what is already remembered.
+  useEffect(() => {
+    if (tab === "memory" && connected) void findMemory();
+  }, [tab, scope, connected]);
+  useEffect(() => {
+    if (tab !== "memory") return;
+    let live = true;
+    void rpc<AgentSummary[]>("agent.list")
+      .then((list) => {
+        if (live)
+          setHistory(
+            Array.isArray(list)
+              ? list.filter((item) => item.projectId === project.id)
+              : [],
+          );
+      })
+      .catch(() => {
+        // The history is supplementary; memory stays usable without it.
+      });
+    return () => {
+      live = false;
+    };
+  }, [tab, project.id, job?.state]);
+  const shownNotes =
+    scope === "all"
+      ? notes
+      : notes.filter((n) => !n.projectId || n.projectId === project.id);
+  const openRun = async (item: AgentSummary) => {
+    setError("");
+    try {
+      const full = await rpc<Job>("agent.status", { id: item.id });
+      if (active && job.id !== item.id) {
+        // The running job keeps its place (polling, 중단, lastJob); this is read-only.
+        setViewed({ job: full, provider: item.provider });
+      } else {
+        setViewed(null);
+        setJob(full);
+        setJobProvider(item.provider);
+        lastJob = { projectId: project.id, id: item.id };
+      }
+      setTab("assistant");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
   const remember = async () => {
@@ -283,43 +360,48 @@ function Panel({
                 </span>
               </div>
             )}
-            {job && (
+            {shown && (
               <div className="agent-run">
                 <div className="agent-run-heading">
-                  {active ? (
+                  {shownActive ? (
                     <LoaderCircle className="spin" size={16} />
-                  ) : job.state === "completed" ? (
+                  ) : shown.state === "completed" ? (
                     <Check size={16} />
                   ) : (
                     <Circle size={14} />
                   )}
                   <strong>
-                    {cancelling && active
+                    {cancelling && shownActive
                       ? "작업을 중단하는 중"
-                      : active
+                      : shownActive
                       ? "편집 작업 진행 중"
-                      : job.state === "completed"
+                      : shown.state === "completed"
                         ? "작업 완료"
-                        : job.state === "cancelled"
+                        : shown.state === "cancelled"
                           ? "작업 중단"
                           : "작업 결과"}
                   </strong>
-                  <span>{providerName(jobProvider || job.provider || "")}</span>
+                  <span>{providerName((viewed ? viewed.provider : jobProvider) || shown.provider || "")}</span>
                 </div>
                 <div className="agent-logs">
-                  {job.logs?.map((log, i) => (
+                  {shown.logs?.map((log, i) => (
                     <p key={i}>{typeof log === "string" ? log : log.text}</p>
                   ))}
                 </div>
-                {job.result && <p className="agent-result">{job.result}</p>}
-                {job.error && <div className="inline-error">{job.error}</div>}
-                {poll.stalled && (
+                {shown.result && <p className="agent-result">{shown.result}</p>}
+                {shown.error && <div className="inline-error">{shown.error}</div>}
+                {!viewed && poll.stalled && (
                   <div className="inline-error" role="alert">
                     작업 상태를 확인하지 못했습니다. {poll.error}
                     <button onClick={poll.retry}>다시 시도</button>
                   </div>
                 )}
-                {!active && (
+                {viewed && (
+                  <button className="subtle-button" onClick={() => setViewed(null)}>
+                    현재 작업으로 돌아가기
+                  </button>
+                )}
+                {!viewed && !active && (
                   <button
                     className="subtle-button"
                     onClick={() => {
@@ -470,7 +552,26 @@ function Panel({
               : "ByoriDB 연결 필요"}
             <button onClick={onSettings}>설정</button>
           </div>
-          <h3>다음 편집을 위한 기억</h3>
+          <div className="memory-heading">
+            <h3>다음 편집을 위한 기억</h3>
+            <div className="memory-scope" role="group" aria-label="기억 범위">
+              {(
+                [
+                  ["project", "이 프로젝트"],
+                  ["all", "전체"],
+                ] as const
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  className={scope === id ? "selected" : ""}
+                  aria-pressed={scope === id}
+                  onClick={() => setScope(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="memory-search">
             <Search size={14} />
             <input
@@ -487,12 +588,15 @@ function Panel({
             </button>
           </div>
           <div className="memory-list">
-            {notes.length ? (
-              notes.map((n, i) => (
+            {shownNotes.length ? (
+              shownNotes.map((n, i) => (
                 <article key={n.id || i}>
                   <div>
                     <History size={13} />
                     <span>{n.kind || "피드백"}</span>
+                    {scope === "all" && n.projectId === project.id && (
+                      <em>이 프로젝트</em>
+                    )}
                   </div>
                   <p>{n.body}</p>
                 </article>
@@ -500,7 +604,13 @@ function Panel({
             ) : (
               <div className="memory-empty">
                 <BookOpen size={24} />
-                <p>편집의 이유를 남겨두세요.</p>
+                <p>
+                  {!connected
+                    ? "ByoriDB에 연결하면 기억을 볼 수 있습니다."
+                    : search.trim()
+                      ? "검색 결과가 없습니다."
+                      : "편집의 이유를 남겨두세요."}
+                </p>
                 <span>필요할 때 검색해서 다음 작업에 활용할 수 있습니다.</span>
               </div>
             )}
@@ -518,6 +628,24 @@ function Panel({
           >
             <Plus size={14} /> ByoriDB에 기억하기
           </button>
+          {history.length > 0 && (
+            <div className="agent-history">
+              <h3>에이전트 작업 이력</h3>
+              {history.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => void openRun(item)}
+                  title="작업 내용 보기"
+                >
+                  <span>{providerName(item.provider)}</span>
+                  <small>{when(item.startedAt)}</small>
+                  <em className={item.state}>
+                    {stateNames[item.state] ?? item.state}
+                  </em>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </aside>

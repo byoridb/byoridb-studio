@@ -9,6 +9,8 @@ interface McpStatus {
   phase: "unchecked" | "connecting" | "cancelling" | "connected" | "failed" | "cancelled";
   url: string;
   toolCount: number;
+  /** The Higgsfield tools the agents are actually given. */
+  allowedTools?: string[];
   checkedAt?: number | null;
   error?: string | null;
   bridgeAvailable: boolean;
@@ -67,6 +69,7 @@ export default function McpSettings() {
       </div>
       {active && <p className="mcp-progress" role="status">브라우저에서 Higgsfield 로그인을 완료해주세요. 첫 연결은 연결 구성요소를 준비하는 시간이 필요합니다.</p>}
       {status.phase === "connected" && <p className="mcp-connected" role="status"><Check size={13} /> 도구 {status.toolCount}개 확인 · {status.checkedAt ? new Date(status.checkedAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) : "방금"}</p>}
+      {status.phase === "connected" && status.allowedTools?.length === 0 && <p className="inline-error" role="alert">연결됐지만 에이전트가 쓸 수 있는 Higgsfield 도구가 없습니다. 서버의 도구 이름이 바뀌었을 수 있습니다.</p>}
       <p className="status-detail">변경 사항은 다음 에이전트 작업부터 적용됩니다. 연결 삭제 시 Studio에 저장된 로그인도 지웁니다.</p>
     </> : <button className="secondary-button" disabled={busy || !status} onClick={() => void run("runtime.mcpSave", { enabled: true })}><Plus size={14} /> Higgsfield 추가</button>}
     {status && !status.bridgeAvailable && <p className="inline-error">연결하려면 Node.js와 npx를 설치해주세요.</p>}

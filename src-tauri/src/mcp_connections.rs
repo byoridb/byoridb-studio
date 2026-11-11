@@ -25,7 +25,10 @@ pub const HIGGSFIELD_URL: &str = "https://mcp.higgsfield.ai/mcp";
 const BRIDGE_PACKAGE: &str = "mcp-remote@0.15.2";
 // Headless sessions cannot relay a per-generation quote/approval interaction yet.
 // Keep paid and account-mutating tools out of all three CLI adapters.
+// The server's tool names have changed between versions, so these are candidates:
+// only the ones the connected server actually lists are passed to an agent.
 pub const READ_ONLY_TOOLS: &[&str] = &[
+    "models_explore",
     "models_list",
     "models_get",
     "models_search",
@@ -33,6 +36,21 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "balance",
     "get_preferences",
 ];
+
+/// The read-only tools the server really offers, in allowlist order.
+fn available_tools(listed: &[String]) -> Vec<String> {
+    let (found, missing): (Vec<&str>, Vec<&str>) = READ_ONLY_TOOLS
+        .iter()
+        .partition(|tool| listed.iter().any(|name| name == *tool));
+    if !missing.is_empty() {
+        tracing::info!(
+            "Higgsfield MCP does not offer {}; using {}",
+            missing.join(", "),
+            if found.is_empty() { "no tools".to_owned() } else { found.join(", ") }
+        );
+    }
+    found.into_iter().map(String::from).collect()
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -43,6 +61,8 @@ struct State {
     config: Option<Config>,
     phase: &'static str,
     tools: usize,
+    /// Allowlisted tools found on the server at the last successful check.
+    allowed: Vec<String>,
     checked_at: Option<u64>,
     error: Option<String>,
     cancel: Option<watch::Sender<bool>>,
@@ -67,11 +87,13 @@ pub struct Bridge {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: serde_json::Map<String, Value>,
+    /// The only tools an agent may call through this bridge.
+    pub tools: Vec<String>,
     _lease: Option<Arc<AgentLease>>,
 }
 impl Bridge {
     pub fn server(&self) -> Value {
-        json!({"command":self.command,"args":self.args,"env":self.env,"trust":true,"includeTools":READ_ONLY_TOOLS})
+        json!({"command":self.command,"args":self.args,"env":self.env,"trust":true,"includeTools":self.tools})
     }
     fn process(&self) -> Command {
         let mut command = Command::new(&self.command);
@@ -124,6 +146,7 @@ impl McpConnections {
                 config,
                 phase: "unchecked",
                 tools: 0,
+                allowed: Vec::new(),
                 checked_at: None,
                 error: None,
                 cancel: None,
@@ -165,6 +188,7 @@ impl McpConnections {
                 state.config = None;
                 state.phase = "unchecked";
                 state.tools = 0;
+                state.allowed.clear();
                 state.checked_at = None;
                 state.error = None;
                 drop(state);
@@ -185,7 +209,7 @@ impl McpConnections {
     }
     pub async fn status(&self) -> Value {
         let state = self.state.lock().await;
-        json!({"id":"higgsfield","name":"Higgsfield","url":HIGGSFIELD_URL,"added":state.config.is_some(),"enabled":state.config.as_ref().is_some_and(|c|c.enabled),"phase":state.phase,"toolCount":state.tools,"checkedAt":state.checked_at,"error":state.error,"bridgeAvailable":find_executable("npx").is_some()&&find_executable("node").is_some(),"bridgePackage":BRIDGE_PACKAGE})
+        json!({"id":"higgsfield","name":"Higgsfield","url":HIGGSFIELD_URL,"added":state.config.is_some(),"enabled":state.config.as_ref().is_some_and(|c|c.enabled),"phase":state.phase,"toolCount":state.tools,"allowedTools":state.allowed,"checkedAt":state.checked_at,"error":state.error,"bridgeAvailable":find_executable("npx").is_some()&&find_executable("node").is_some(),"bridgePackage":BRIDGE_PACKAGE})
     }
     fn bridge(&self) -> Result<Bridge, String> {
         let npx=find_executable("npx").ok_or("Higgsfield 연결에는 Node.js와 npx가 필요합니다. Node.js를 설치한 뒤 다시 연결해주세요.")?;
@@ -209,6 +233,7 @@ impl McpConnections {
                 "180".into(),
             ],
             env,
+            tools: Vec::new(),
             _lease: None,
         })
     }
@@ -218,10 +243,12 @@ impl McpConnections {
             return Ok(None);
         }
         // An optional connection that has not authenticated must not prevent editing.
-        if state.phase != "connected" {
+        // Nor one whose server offers none of the tools Studio allows.
+        if state.phase != "connected" || state.allowed.is_empty() {
             return Ok(None);
         }
         let mut bridge = self.bridge()?;
+        bridge.tools = state.allowed.clone();
         self.active_agents.fetch_add(1, Ordering::SeqCst);
         bridge._lease = Some(Arc::new(AgentLease(self.active_agents.clone())));
         Ok(Some(bridge))
@@ -239,6 +266,7 @@ impl McpConnections {
         state.phase = "connecting";
         state.error = None;
         state.tools = 0;
+        state.allowed.clear();
         state.cancel = Some(cancel);
         drop(state);
         let all = self.state.clone();
@@ -249,9 +277,10 @@ impl McpConnections {
             state.cancel = None;
             state.checked_at = Some(now_ms());
             match result {
-                Ok(count) => {
+                Ok(listed) => {
                     state.phase = "connected";
-                    state.tools = count;
+                    state.tools = listed.len();
+                    state.allowed = available_tools(&listed);
                 }
                 Err(error) if *rx.borrow() => {
                     state.phase = "cancelled";
@@ -272,7 +301,7 @@ async fn probe(
     mut command: Command,
     cancel: &mut watch::Receiver<bool>,
     children: &ProcessGroups,
-) -> Result<usize, String> {
+) -> Result<Vec<String>, String> {
     let mut child = command
         .spawn()
         .map_err(|_| "연결 프로그램을 실행하지 못했습니다. Node.js 설치 상태를 확인해주세요.")?;
@@ -282,7 +311,7 @@ async fn probe(
     let output = child.stdout.take().ok_or("연결 출력을 열 수 없습니다")?;
     let mut reader = BufReader::new(output);
     let exchange = async {
-        send(&mut input,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"byori-studio","version":"0.1.0"}}})).await?;
+        send(&mut input,json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"byori-studio","version":env!("CARGO_PKG_VERSION")}}})).await?;
         let init = receive(&mut reader, 1).await?;
         if !init["capabilities"].is_object() {
             return Err("MCP 초기화 응답을 확인할 수 없습니다".into());
@@ -300,7 +329,12 @@ async fn probe(
         let tools = receive(&mut reader, 2).await?;
         tools["tools"]
             .as_array()
-            .map(Vec::len)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
             .ok_or_else(|| "MCP 도구 목록을 확인할 수 없습니다".to_owned())
     };
     let result = tokio::select! {
@@ -395,13 +429,17 @@ mod tests {
     async fn probe_requires_real_handshake_and_tools_without_exposing_remote_errors() {
         let python = find_executable("python3").unwrap();
         let mut good = Command::new(&python);
-        good.args(["-u","-c","import sys,json\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m: print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'capabilities':{'tools':{}}} if m['method']=='initialize' else {'tools':[{'name':'models_list'}]}}),flush=True)"]);
+        good.args(["-u","-c","import sys,json\nfor line in sys.stdin:\n m=json.loads(line)\n if 'id' in m: print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'capabilities':{'tools':{}}} if m['method']=='initialize' else {'tools':[{'name':'models_explore'},{'name':'generate_image'},{'name':'balance'}]}}),flush=True)"]);
         good.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let (_tx, mut rx) = watch::channel(false);
-        assert_eq!(probe(good, &mut rx, &ProcessGroups::default()).await.unwrap(), 1);
+        let listed = probe(good, &mut rx, &ProcessGroups::default()).await.unwrap();
+        assert_eq!(listed, ["models_explore", "generate_image", "balance"]);
+        // Allowlisted names the server lacks are dropped, and nothing else gets in.
+        assert_eq!(available_tools(&listed), ["models_explore", "balance"]);
+        assert!(available_tools(&["generate_video".to_owned()]).is_empty());
         let mut bad = Command::new(python);
         bad.args(["-u","-c","print('{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"private-token-do-not-leak\"}}')"]);
         bad.stdin(Stdio::piped())
@@ -424,11 +462,12 @@ mod tests {
             command: PathBuf::from("npx"),
             args: vec![],
             env: serde_json::Map::new(),
+            tools: available_tools(&["models_list".into(), "generate_image".into()]),
             _lease: Some(lease),
         };
         assert!(m.dispatch("runtime.mcpRemove", json!({})).await.is_err());
         let allowed = bridge.server()["includeTools"].clone();
-        assert!(allowed.as_array().unwrap().contains(&json!("models_list")));
+        assert_eq!(allowed, json!(["models_list"]));
         assert!(!allowed
             .as_array()
             .unwrap()

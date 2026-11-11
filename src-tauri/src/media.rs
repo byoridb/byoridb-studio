@@ -1,13 +1,24 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{io::AsyncReadExt, process::Command};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(30);
-/// media.import probes while the editor is locked, so decoding is cut off early; the
+/// `probe` may run while the editor is locked, so its decoding is cut off early; the
 /// part of a very long or slow file decoded by then is kept.
 const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(15);
+/// `waveform` runs in the background, outside any lock, and may take its time.
+const BACKGROUND_WAVEFORM_TIMEOUT: Duration = Duration::from_secs(600);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Proxies are at most this long on their longer side.
+const PROXY_SIZE: u32 = 1280;
+/// Codecs a browser plays smoothly from the original file.
+const LIGHT_CODECS: [&str; 4] = ["h264", "vp8", "vp9", "av1"];
 const WAVEFORM_RATE: usize = 8000;
 
 pub fn now() -> u64 {
@@ -131,7 +142,7 @@ async fn read_peaks<R: tokio::io::AsyncRead + Unpin>(
 /// peaks spanning the media duration. Audio shorter than the container, or decoding
 /// stopped by the time limit, leaves the remaining buckets at zero so peaks never
 /// stretch along the timeline.
-async fn waveform(path: &Path, duration: f64) -> Option<Vec<f32>> {
+async fn decode_waveform(path: &Path, duration: f64, limit: Duration) -> Option<Vec<f32>> {
     let mut child = Command::new(executable("ffmpeg"))
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
@@ -144,7 +155,7 @@ async fn waveform(path: &Path, duration: f64) -> Option<Vec<f32>> {
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
-    let (mut peaks, complete) = read_peaks(stdout, duration, WAVEFORM_TIMEOUT).await;
+    let (mut peaks, complete) = read_peaks(stdout, duration, limit).await;
     if complete {
         if !child.wait().await.ok()?.success() {
             return None;
@@ -164,7 +175,95 @@ async fn waveform(path: &Path, duration: f64) -> Option<Vec<f32>> {
     )
 }
 
+/// The peaks of a media file's sound, for filling `Media.waveform` in the background.
+/// Touches no editor state. `None` when the file has no decodable audio.
+pub async fn waveform(path: &Path, duration: f64) -> Option<Vec<f32>> {
+    decode_waveform(path, duration, BACKGROUND_WAVEFORM_TIMEOUT).await
+}
+
+/// Probes a file, makes its thumbnail and decodes its waveform (bounded to 15 s of
+/// work). Callers that hold a lock use `probe_info` and compute `waveform` later.
 pub async fn probe(path: &Path, root: &Path) -> Result<Value, String> {
+    let mut asset = probe_info(path, root).await?;
+    let waveform = if asset["hasAudio"] == true {
+        decode_waveform(
+            Path::new(asset["path"].as_str().unwrap_or_default()),
+            numeric(asset.get("duration")),
+            WAVEFORM_TIMEOUT,
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    asset["waveform"] = json!(waveform);
+    Ok(asset)
+}
+
+/// Whether the stream is stored sideways: phones record portrait video as landscape
+/// frames plus a 90° or 270° rotation, which FFmpeg applies when decoding.
+fn stored_sideways(stream: &Value) -> bool {
+    let rotation = stream["side_data_list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|data| data.get("rotation"))
+        .or_else(|| stream["tags"].get("rotate"));
+    (numeric(rotation).round() as i64).rem_euclid(180) == 90
+}
+
+/// "30000/1001" or "25" as frames per second.
+fn frame_rate(value: Option<&Value>) -> Option<f64> {
+    let text = value?.as_str()?;
+    let (n, d) = text.split_once('/').unwrap_or((text, "1"));
+    let rate = n.parse::<f64>().ok()? / d.parse::<f64>().ok()?;
+    (rate.is_finite() && rate > 0.0 && rate <= 1000.0).then_some(rate)
+}
+
+/// The frame rate of a file's video when it is constant, for callers that need to
+/// know how far apart its frames are. `None` for variable or unreadable material.
+/// Remembered per file until the file changes.
+pub async fn constant_frame_rate(path: &Path) -> Option<f64> {
+    // Per file: its size and modification time when probed, and the rate found.
+    type Known = std::collections::HashMap<PathBuf, ((u64, Option<SystemTime>), Option<f64>)>;
+    static KNOWN: std::sync::OnceLock<std::sync::Mutex<Known>> = std::sync::OnceLock::new();
+    let info = std::fs::metadata(path).ok()?;
+    let stamp = (info.len(), info.modified().ok());
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some((seen, rate)) = known.lock().unwrap().get(path) {
+        if *seen == stamp {
+            return *rate;
+        }
+    }
+    let output = output_within(
+        Command::new(executable("ffprobe"))
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "json"])
+            .arg(path),
+        PROBE_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    let info: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let stream = &info["streams"][0];
+    let rate = match (
+        frame_rate(stream.get("r_frame_rate")),
+        frame_rate(stream.get("avg_frame_rate")),
+    ) {
+        // The two differ when frames are unevenly spaced.
+        (Some(base), Some(average)) if (base - average).abs() <= base * 0.01 => Some(average),
+        _ => None,
+    };
+    let mut known = known.lock().unwrap();
+    if known.len() >= 512 {
+        known.clear();
+    }
+    known.insert(path.to_path_buf(), (stamp, rate));
+    rate
+}
+
+/// Probes a file and makes its thumbnail. The result has no `waveform` field.
+pub async fn probe_info(path: &Path, root: &Path) -> Result<Value, String> {
     let path = path
         .canonicalize()
         .map_err(|e| format!("미디어 파일을 찾을 수 없습니다: {e}"))?;
@@ -257,17 +356,216 @@ pub async fn probe(path: &Path, root: &Path) -> Result<Value, String> {
             thumbnail_path = Some(thumbnail.to_string_lossy().to_string());
         }
     }
-    let waveform = if has_audio {
-        waveform(&path, duration).await.unwrap_or_default()
-    } else {
-        Vec::new()
+    // The size as it is shown, after the stream's rotation.
+    let (width, height) = video.map_or((0, 0), |stream| {
+        let size = (
+            numeric(stream.get("width")) as u32,
+            numeric(stream.get("height")) as u32,
+        );
+        if stored_sideways(stream) {
+            (size.1, size.0)
+        } else {
+            size
+        }
+    });
+    let mut asset = json!({"id":media_id,"name":path.file_name().unwrap_or_default().to_string_lossy(),"path":path,
+        "kind":kind,"duration":duration,"width":width,"height":height,"hasAudio":has_audio,
+        "thumbnail":thumbnail_path});
+    if let Some(video) = video.filter(|_| kind == "video") {
+        if let Some(codec) = video["codec_name"].as_str() {
+            asset["codec"] = json!(codec);
+        }
+    }
+    Ok(asset)
+}
+
+/// Writes the video frame shown at `source_time` (seconds into the file) as a PNG.
+/// A time at or past the last frame gives the last frame.
+pub async fn extract_frame(
+    media_path: &Path,
+    source_time: f64,
+    out_png: &Path,
+) -> Result<(), String> {
+    if !source_time.is_finite() || source_time < 0.0 {
+        return Err("프레임 위치가 올바르지 않습니다.".into());
+    }
+    if !media_path.is_file() {
+        return Err(format!(
+            "원본 미디어를 찾을 수 없습니다: {}",
+            media_path.display()
+        ));
+    }
+    let parent = out_png.parent().ok_or("저장 위치가 올바르지 않습니다.")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temporary = parent.join(format!(".{}.png", id("frame")));
+    let mut failure = String::new();
+    // The frame on screen at a time is the last one at or before it, as the renderer
+    // shows it, not the first one after it, which is what seeking alone returns.
+    // Decoding starts a little earlier and every frame up to the time overwrites the
+    // picture, so the last one stays. The reach grows for sparse frames and for times
+    // past the end of the file.
+    for back in [0.1, 0.5, 2.0, 10.0, f64::INFINITY] {
+        let time = (source_time - back).max(0.0);
+        let _ = std::fs::remove_file(&temporary);
+        let result = output_within(
+            Command::new(executable("ffmpeg"))
+                .args(["-y", "-v", "error", "-nostdin", "-ss", &format!("{time:.6}"), "-i"])
+                .arg(media_path)
+                // Timestamps count from the seek point; the millisecond absorbs its
+                // rounding to a stream tick.
+                .args(["-map", "0:v:0", "-vf", &format!("trim=end={:.6}", source_time - time + 0.001)])
+                .args(["-update", "1", "-c:v", "png", "-f", "image2"])
+                .arg(&temporary),
+            FRAME_TIMEOUT,
+        )
+        .await;
+        match result {
+            Ok(output) if output.status.success() => {
+                if std::fs::metadata(&temporary).is_ok_and(|m| m.len() > 0) {
+                    return std::fs::rename(&temporary, out_png).map_err(|e| {
+                        let _ = std::fs::remove_file(&temporary);
+                        e.to_string()
+                    });
+                }
+            }
+            Ok(output) => {
+                failure = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                break;
+            }
+            Err(e) => {
+                failure = e.to_string();
+                break;
+            }
+        }
+        if time == 0.0 {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&temporary);
+    Err(format!("프레임을 추출할 수 없습니다: {failure}"))
+}
+
+/// Whether a media item should get a proxy for fast playback: video that is larger
+/// than 1920 on its longer side, or in a codec browsers decode slowly or not at all.
+pub fn needs_proxy(media: &Value) -> bool {
+    media["kind"] == "video"
+        && (numeric(media.get("width")).max(numeric(media.get("height"))) > 1920.0
+            || media["codec"]
+                .as_str()
+                .is_some_and(|codec| !LIGHT_CODECS.contains(&codec)))
+}
+
+/// `<root>/proxies/<mediaId>.mp4`, whether or not the proxy exists yet.
+pub fn proxy_path(root: &Path, media_id: &str) -> PathBuf {
+    root.join("proxies").join(format!("{media_id}.mp4"))
+}
+
+/// Transcodes the media's source into its proxy (H.264, at most 1280 on the longer
+/// side, a keyframe every half second, AAC sound). The source is only read. The proxy
+/// appears under its final name once complete; setting `cancel` or a failure leaves
+/// nothing behind. An existing proxy is returned as is.
+pub async fn build_proxy(
+    root: &Path,
+    media: &Value,
+    cancel: Arc<AtomicBool>,
+) -> Result<PathBuf, String> {
+    let media_id = media["id"].as_str().unwrap_or_default();
+    if media_id.is_empty()
+        || !media_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("소재 ID가 올바르지 않습니다.".into());
+    }
+    let target = proxy_path(root, media_id);
+    if target.is_file() {
+        return Ok(target);
+    }
+    let directory = target.parent().unwrap();
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let temporary = directory.join(format!(".{media_id}.{}.partial.mp4", uuid::Uuid::new_v4()));
+    let source = PathBuf::from(media["path"].as_str().unwrap_or_default());
+    encode_proxy(&source, &temporary, cancel).await?;
+    std::fs::rename(&temporary, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        e.to_string()
+    })?;
+    Ok(target)
+}
+
+/// The transcode behind `build_proxy`, for callers that manage the file names
+/// themselves: writes the proxy of `source` to `output` (an .mp4 path). Cancelling,
+/// failing or dropping the future removes `output`.
+pub async fn encode_proxy(
+    source: &Path,
+    output: &Path,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!(
+            "원본 미디어를 찾을 수 없습니다: {}",
+            source.display()
+        ));
+    }
+    let scale = format!(
+        "scale=w='if(gte(iw,ih),min({PROXY_SIZE},iw),-2)':h='if(gte(iw,ih),-2,min({PROXY_SIZE},ih))',scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'"
+    );
+    // Removes the unfinished file on every way out but success.
+    struct Partial(PathBuf, bool);
+    impl Drop for Partial {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+    }
+    let mut partial = Partial(output.to_path_buf(), false);
+    let mut child = Command::new(executable("ffmpeg"))
+        .args(["-y", "-v", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", &scale])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"])
+        .args(["-pix_fmt", "yuv420p", "-force_key_frames", "expr:gte(t,n_forced*0.5)"])
+        .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2"])
+        .args(["-movflags", "+faststart", "-f", "mp4"])
+        .arg(output)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("FFmpeg를 실행할 수 없습니다: {e}"))?;
+    let mut stderr = child.stderr.take();
+    let errors = tokio::spawn(async move {
+        let mut text = Vec::new();
+        if let Some(stderr) = stderr.as_mut() {
+            let _ = stderr.take(64 * 1024).read_to_end(&mut text).await;
+            let _ = tokio::io::copy(stderr, &mut tokio::io::sink()).await;
+        }
+        String::from_utf8_lossy(&text).trim().to_string()
+    });
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.map_err(|e| e.to_string())?,
+            _ = interval.tick() => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err("프록시 생성을 취소했습니다.".into());
+                }
+            }
+        }
     };
-    Ok(
-        json!({"id":media_id,"name":path.file_name().unwrap_or_default().to_string_lossy(),"path":path,
-        "kind":kind,"duration":duration,"width":video.map(|s|numeric(s.get("width")) as u32).unwrap_or(0),
-        "height":video.map(|s|numeric(s.get("height")) as u32).unwrap_or(0),"hasAudio":has_audio,
-        "thumbnail":thumbnail_path,"waveform":waveform}),
-    )
+    let errors = errors.await.unwrap_or_default();
+    if cancel.load(Ordering::Relaxed) {
+        return Err("프록시 생성을 취소했습니다.".into());
+    }
+    if !status.success() || !std::fs::metadata(output).is_ok_and(|m| m.len() > 0) {
+        return Err(format!("프록시를 만들 수 없습니다: {errors}"));
+    }
+    partial.1 = true;
+    Ok(())
 }
 
 pub fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -599,5 +897,266 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn probe_info_skips_the_waveform_which_is_computed_separately() {
+        let root = std::env::temp_dir().join(id("studio-probe-info-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mp4 = root.join("tone.mp4");
+        ffmpeg(
+            &[
+                "-f", "lavfi", "-i", "testsrc=size=64x64:rate=25:duration=2",
+                "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*440*t):s=44100:d=2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            ],
+            &mp4,
+        )
+        .await;
+        let asset = probe_info(&mp4, &root).await.unwrap();
+        assert!(asset.get("waveform").is_none(), "{asset}");
+        assert_eq!(asset["kind"], "video");
+        assert_eq!(asset["codec"], "h264");
+        assert_eq!(constant_frame_rate(&mp4).await, Some(25.0));
+        assert_eq!(constant_frame_rate(&root.join("missing.mp4")).await, None);
+        assert!(Path::new(asset["thumbnail"].as_str().unwrap()).is_file());
+        let path = Path::new(asset["path"].as_str().unwrap());
+        let peaks = waveform(path, asset["duration"].as_f64().unwrap()).await.unwrap();
+        assert_eq!(peaks.len(), 128);
+        assert!(peaks[4..120].iter().all(|p| (0.35..=0.6).contains(p)), "{peaks:?}");
+        // The combined probe still returns the same peaks.
+        let full = probe(&mp4, &root).await.unwrap();
+        assert_eq!(full["waveform"], json!(peaks));
+        assert!(waveform(&root.join("missing.mp4"), 2.0).await.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn extract_frame_returns_the_frame_at_the_source_time() {
+        let root = std::env::temp_dir().join(id("studio-frame-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mp4 = root.join("red-then-blue.mp4");
+        // Red for the first second, blue for the second one.
+        ffmpeg(
+            &[
+                "-f", "lavfi", "-i", "color=red:size=64x64:rate=24:duration=1",
+                "-f", "lavfi", "-i", "color=blue:size=64x64:rate=24:duration=1",
+                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ],
+            &mp4,
+        )
+        .await;
+        let before = std::fs::read(&mp4).unwrap();
+        let png = root.join("frames/frame.png");
+        let pixel = |path: &Path| image::open(path).unwrap().to_rgb8().get_pixel(32, 32).0;
+        extract_frame(&mp4, 0.5, &png).await.unwrap();
+        let red = pixel(&png);
+        assert!(red[0] > 200 && red[2] < 60, "{red:?}");
+        extract_frame(&mp4, 1.5, &png).await.unwrap();
+        let blue = pixel(&png);
+        assert!(blue[2] > 200 && blue[0] < 60, "{blue:?}");
+        // The exact end of the file still gives its last frame.
+        std::fs::remove_file(&png).unwrap();
+        extract_frame(&mp4, 2.0, &png).await.unwrap();
+        assert!(pixel(&png)[2] > 200);
+        assert_eq!(image::open(&png).unwrap().width(), 64);
+        assert!(extract_frame(&root.join("missing.mp4"), 0.0, &png).await.is_err());
+        assert!(extract_frame(&mp4, -1.0, &png).await.is_err());
+        assert!(extract_frame(&mp4, f64::NAN, &png).await.is_err());
+        let wav = root.join("tone.wav");
+        ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=440:duration=1"], &wav).await;
+        let failed = root.join("frames/none.png");
+        assert!(extract_frame(&wav, 0.5, &failed).await.is_err());
+        assert!(!failed.exists());
+        // Nothing but the requested PNG is left, and the source is untouched.
+        let left: Vec<_> = std::fs::read_dir(root.join("frames"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("frame.png")]);
+        assert_eq!(std::fs::read(&mp4).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn extract_frame_returns_the_frame_on_screen_between_source_frames() {
+        let root = std::env::temp_dir().join(id("studio-frame-grid-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        // Frame N has luma 16 + 6N, so the picture tells which frame it is.
+        for (rate, time, frame) in [
+            // 24 fps: frame 2 (0.0833 s) is on screen at 0.1 s; frame 3 comes at 0.125 s.
+            ("24", 0.1, 2),
+            ("24", 0.125, 3),
+            ("24", 0.0, 0),
+            // 29.97 fps: frame 29 (0.9676 s) is on screen at 1 s; frame 30 comes at 1.001 s.
+            ("30000/1001", 1.0, 29),
+            // Two frames per second: the frame on screen is more than 0.1 s back.
+            ("2", 0.95, 1),
+        ] {
+            let mp4 = root.join(format!("ramp-{}.mp4", rate.replace('/', "-")));
+            if !mp4.exists() {
+                ffmpeg(
+                    &[
+                        "-f", "lavfi", "-i",
+                        &format!("color=black:size=64x64:rate={rate}:duration=1.5,format=gray,geq=lum='16+6*N'"),
+                        "-c:v", "libx264", "-crf", "4", "-pix_fmt", "yuv420p",
+                    ],
+                    &mp4,
+                )
+                .await;
+            }
+            let png = root.join("frame.png");
+            extract_frame(&mp4, time, &png).await.unwrap();
+            let value = image::open(&png).unwrap().to_rgb8().get_pixel(32, 32).0[0] as f64;
+            let found = ((value - 16.0) / 6.0).round() as i64;
+            assert_eq!(found, frame, "{rate} fps at {time}s (value {value})");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portrait_video_stored_sideways_reports_its_displayed_size() {
+        for (rotation, sideways) in [(90, true), (-90, true), (270, true), (180, false), (0, false)] {
+            let stream = json!({"side_data_list":[{"side_data_type":"Display Matrix","rotation":rotation}]});
+            assert_eq!(stored_sideways(&stream), sideways, "{rotation}");
+        }
+        assert!(stored_sideways(&json!({"tags":{"rotate":"90"}})));
+        assert!(!stored_sideways(&json!({"codec_type":"video"})));
+        let root = std::env::temp_dir().join(id("studio-rotation-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let landscape = root.join("landscape.mp4");
+        ffmpeg(
+            &[
+                "-f", "lavfi", "-i", "testsrc=size=128x64:rate=10:duration=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ],
+            &landscape,
+        )
+        .await;
+        // The same frames with a quarter turn recorded in the file, as phones write it.
+        let portrait = root.join("portrait.mp4");
+        ffmpeg(
+            &["-display_rotation", "90", "-i", landscape.to_str().unwrap(), "-c", "copy"],
+            &portrait,
+        )
+        .await;
+        let plain = probe_info(&landscape, &root).await.unwrap();
+        assert_eq!((plain["width"].as_u64(), plain["height"].as_u64()), (Some(128), Some(64)));
+        let turned = probe_info(&portrait, &root).await.unwrap();
+        assert_eq!((turned["width"].as_u64(), turned["height"].as_u64()), (Some(64), Some(128)));
+        // The decoded picture has that size too: the thumbnail and an extracted frame.
+        let thumbnail = probe_info(Path::new(turned["thumbnail"].as_str().unwrap()), &root)
+            .await
+            .unwrap();
+        assert!(thumbnail["height"].as_u64() > thumbnail["width"].as_u64(), "{thumbnail}");
+        let png = root.join("frame.png");
+        extract_frame(&portrait, 0.5, &png).await.unwrap();
+        let frame = image::open(&png).unwrap();
+        assert_eq!((frame.width(), frame.height()), (64, 128));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn proxies_are_for_large_or_heavy_video_only() {
+        let media = |kind: &str, width: u32, height: u32, codec: Value| {
+            json!({"id":"m","kind":kind,"width":width,"height":height,"codec":codec})
+        };
+        assert!(needs_proxy(&media("video", 3840, 2160, json!("h264"))));
+        assert!(needs_proxy(&media("video", 1080, 2560, json!("h264"))));
+        assert!(needs_proxy(&media("video", 1920, 1080, json!("hevc"))));
+        assert!(needs_proxy(&media("video", 1280, 720, json!("prores"))));
+        assert!(!needs_proxy(&media("video", 1920, 1080, json!("h264"))));
+        assert!(!needs_proxy(&media("video", 1080, 1920, json!("vp9"))));
+        // Media imported before the codec was recorded: size alone decides.
+        assert!(!needs_proxy(&media("video", 1920, 1080, Value::Null)));
+        assert!(needs_proxy(&media("video", 2560, 1440, Value::Null)));
+        assert!(!needs_proxy(&media("image", 6000, 4000, Value::Null)));
+        assert!(!needs_proxy(&media("audio", 0, 0, Value::Null)));
+        assert_eq!(
+            proxy_path(Path::new("/data"), "media-1"),
+            PathBuf::from("/data/proxies/media-1.mp4")
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_of_a_real_4k_hevc_source_is_small_h264_and_leaves_no_partial_files() {
+        let root = std::env::temp_dir().join(id("studio-proxy-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("uhd.mp4");
+        ffmpeg(
+            &[
+                "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=2",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            ],
+            &source,
+        )
+        .await;
+        let original = std::fs::read(&source).unwrap();
+        let asset = probe_info(&source, &root).await.unwrap();
+        assert_eq!(asset["codec"], "hevc");
+        assert!(needs_proxy(&asset));
+        let media_id = asset["id"].as_str().unwrap();
+        let files = |root: &Path| -> Vec<String> {
+            std::fs::read_dir(root.join("proxies"))
+                .into_iter()
+                .flatten()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        // A cancelled build stops and removes its temporary file.
+        let cancelled = build_proxy(&root, &asset, Arc::new(AtomicBool::new(true))).await;
+        assert!(cancelled.unwrap_err().contains("취소"));
+        assert!(files(&root).is_empty(), "{:?}", files(&root));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let proxy = build_proxy(&root, &asset, cancel.clone()).await.unwrap();
+        assert_eq!(proxy, proxy_path(&root, media_id));
+        assert_eq!(files(&root), vec![format!("{media_id}.mp4")]);
+        let made = probe_info(&proxy, &root).await.unwrap();
+        assert_eq!(made["codec"], "h264");
+        assert_eq!((made["width"].as_u64(), made["height"].as_u64()), (Some(1280), Some(720)));
+        assert_eq!(made["hasAudio"], true);
+        assert!(!needs_proxy(&made));
+        let (a, b) = (
+            asset["duration"].as_f64().unwrap(),
+            made["duration"].as_f64().unwrap(),
+        );
+        assert!((a - b).abs() < 0.1, "source {a}s, proxy {b}s");
+        // Keyframes at most half a second apart keep seeking in the browser fast.
+        let keyframes = Command::new(executable("ffprobe"))
+            .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"])
+            .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+            .arg(&proxy)
+            .output()
+            .await
+            .unwrap();
+        let times: Vec<f64> = String::from_utf8_lossy(&keyframes.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .collect();
+        assert!(times.len() >= 4, "{times:?}");
+        assert!(times.windows(2).all(|w| w[1] - w[0] <= 0.51), "{times:?}");
+        // Building again reuses the finished proxy; the source is never written.
+        let modified = std::fs::metadata(&proxy).unwrap().modified().unwrap();
+        build_proxy(&root, &asset, cancel.clone()).await.unwrap();
+        assert_eq!(std::fs::metadata(&proxy).unwrap().modified().unwrap(), modified);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        // A source that cannot be decoded fails without leaving anything behind.
+        let broken = root.join("broken.mp4");
+        std::fs::write(&broken, b"not a video").unwrap();
+        let failed = build_proxy(
+            &root,
+            &json!({"id":"media-broken","path":broken,"kind":"video"}),
+            cancel.clone(),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(build_proxy(&root, &json!({"id":"../escape","path":source}), cancel)
+            .await
+            .is_err());
+        assert_eq!(files(&root), vec![format!("{media_id}.mp4")]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

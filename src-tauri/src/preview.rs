@@ -19,14 +19,18 @@ use tokio::sync::{Mutex, Semaphore};
 
 const CANCELLED: &str = "더 새로운 미리보기 요청으로 대체되었습니다. (PREVIEW_CANCELLED)";
 
+type PendingRequest = (u64, String, u64, Arc<AtomicBool>);
+
 pub struct PreviewFrames {
     cache: Mutex<VecDeque<(String, Value)>>,
     renderer: Mutex<()>,
     requests: Semaphore,
-    /// Queued and rendering UI requests as (id, content hash, cancel flag). A UI request
-    /// for different content cancels them, so only the newest scrub frame is rendered.
-    /// Agent requests are not listed: they neither cancel the UI's frame nor get cancelled.
-    pending: std::sync::Mutex<Vec<(u64, u64, Arc<AtomicBool>)>>,
+    /// Queued and rendering requests as (id, client, content hash, cancel flag). A
+    /// request for different content cancels the earlier ones of the same client, so
+    /// each client (the player, the export dialog, one agent job) renders only its
+    /// newest frame and never stops another client's. Requests without a client are
+    /// not listed.
+    pending: std::sync::Mutex<Vec<PendingRequest>>,
     sequence: AtomicU64,
 }
 impl Default for PreviewFrames {
@@ -85,24 +89,32 @@ impl PreviewFrames {
             .map_err(|_| "미리보기 요청이 많습니다. 잠시 후 다시 시도해 주세요.".to_string())?;
         let (project, root) = editor.lock().await.preview_snapshot(&params, project_id)?;
         let width = (number(&params, "width", 640.0).clamp(64.0, 1920.0) as u32 / 2) * 2;
-        let frame = (number(&params, "time", 0.0) * number(&project, "fps", 30.0)).floor();
+        let frame = (number(&params, "time", 0.0) * number(&project, "fps", 30.0) + 1e-6).floor();
         let key = format!(
             "{}:{width}:{frame}",
             serde_json::to_string(&project).map_err(|e| e.to_string())?
         );
         let cancel = Arc::new(AtomicBool::new(false));
         let id = self.sequence.fetch_add(1, Ordering::Relaxed);
-        if !agent {
+        // `params.client` names who asks: "player", "export", or what the service sets
+        // for an agent token. The UI without a name is the player; an agent without
+        // one stays on its own.
+        let client = match params["client"].as_str().filter(|c| !c.is_empty()) {
+            Some(client) => Some(client.chars().take(64).collect::<String>()),
+            None if agent => None,
+            None => Some("player".to_string()),
+        };
+        if let Some(client) = client {
             let mut hasher = DefaultHasher::new();
             key.hash(&mut hasher);
             let content = hasher.finish();
             let mut pending = self.pending.lock().unwrap();
-            for (_, other, flag) in pending.iter() {
-                if *other != content {
+            for (_, other, other_content, flag) in pending.iter() {
+                if *other == client && *other_content != content {
                     flag.store(true, Ordering::Relaxed);
                 }
             }
-            pending.push((id, content, cancel.clone()));
+            pending.push((id, client, content, cancel.clone()));
         }
         let _pending = Pending(self, id);
         // Waiting for another render also deduplicates identical in-flight requests.
@@ -339,6 +351,97 @@ mod tests {
         let later_ui = request(2.0, false);
         agent.await.unwrap().expect("a UI request must not cancel the agent frame");
         later_ui.await.unwrap().unwrap();
+        assert!(frames.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_cancels_only_earlier_ones_of_its_own_client() {
+        let (root, editor) = setup();
+        let frames = Arc::new(PreviewFrames::default());
+        // Runs until cancelled, like a long FFmpeg render.
+        let endless = |time: f64, client: Option<&str>, agent: bool| {
+            let (editor, frames) = (editor.clone(), frames.clone());
+            let mut params = json!({"time":time});
+            if let Some(client) = client {
+                params["client"] = json!(client);
+            }
+            tokio::spawn(async move {
+                frames
+                    .frame_with(&editor, params, None, agent, |_, _, _, cancel| async move {
+                        while !cancel.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err("stopped".to_string())
+                    })
+                    .await
+            })
+        };
+        let registered = |n: u64| {
+            let frames = frames.clone();
+            async move {
+                while frames.sequence.load(Ordering::Relaxed) < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        let player = endless(0.0, Some("player"), false);
+        registered(1).await;
+        let export = endless(0.2, Some("export"), false);
+        registered(2).await;
+        let agent = endless(0.4, Some("agent-1"), true);
+        registered(3).await;
+        let other_agent = endless(0.6, Some("agent-2"), true);
+        registered(4).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            [&player, &export, &agent, &other_agent].iter().all(|task| !task.is_finished()),
+            "requests of different clients must not cancel each other"
+        );
+        // A request without a client is the player's: it replaces the player's frame only.
+        let unnamed = endless(0.8, None, false);
+        assert!(player.await.unwrap().unwrap_err().contains("PREVIEW_CANCELLED"));
+        let export_again = endless(1.0, Some("export"), false);
+        assert!(export.await.unwrap().unwrap_err().contains("PREVIEW_CANCELLED"));
+        let agent_again = endless(1.2, Some("agent-1"), true);
+        assert!(agent.await.unwrap().unwrap_err().contains("PREVIEW_CANCELLED"));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let remaining = [unnamed, export_again, agent_again, other_agent];
+        assert!(remaining.iter().all(|task| !task.is_finished()));
+        // One newer request per client ends the rest. They are sent together because
+        // all renders share one renderer and wait for each other's cancelled requests.
+        let newest: Vec<_> = [
+            (2.0, "player", false),
+            (2.2, "export", false),
+            (2.4, "agent-1", true),
+            (2.6, "agent-2", true),
+        ]
+        .into_iter()
+        .map(|(time, client, is_agent)| {
+            let (editor, frames) = (editor.clone(), frames.clone());
+            tokio::spawn(async move {
+                frames
+                    .frame_with(
+                        &editor,
+                        json!({"time":time,"client":client}),
+                        None,
+                        is_agent,
+                        |_, _, root, _| output(root, Arc::new(AtomicUsize::new(0))),
+                    )
+                    .await
+            })
+        })
+        .collect();
+        for task in newest {
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the newest request of each client must be rendered")
+                .unwrap()
+                .unwrap();
+        }
+        for task in remaining {
+            assert!(task.await.unwrap().unwrap_err().contains("PREVIEW_CANCELLED"));
+        }
         assert!(frames.pending.lock().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }

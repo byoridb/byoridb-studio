@@ -229,4 +229,92 @@ describe("AssistantPanel", () => {
     );
     expect(audience).toHaveValue("서버 값");
   });
+
+  it("loads this project's memories when the tab opens and widens to every project", async () => {
+    const items = [
+      { id: "n1", body: "도입부는 3초 안에", kind: "feedback", projectId: "p1" },
+      { id: "n2", body: "다른 영상의 메모", kind: "feedback", projectId: "p2" },
+    ];
+    serve({ "memory.search": () => ({ items }) });
+    render(panel());
+    expect(calls("memory.search")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /기억/ }));
+    expect(await screen.findByText("도입부는 3초 안에")).toBeInTheDocument();
+    expect(calls("memory.search")[0][1]).toEqual({ text: "", limit: 100, projectId: "p1" });
+    expect(screen.queryByText("다른 영상의 메모")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "전체" }));
+    expect(await screen.findByText("다른 영상의 메모")).toBeInTheDocument();
+    expect(calls("memory.search").slice(-1)[0][1]).toEqual({ text: "", limit: 100 });
+  });
+
+  it("does not query memory while ByoriDB is disconnected", async () => {
+    serve({});
+    render(
+      panel({
+        runtime: { ...runtime, byoridb: { installed: true, running: false, connected: false } },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /기억/ }));
+    expect(
+      await screen.findByText("ByoriDB에 연결하면 기억을 볼 수 있습니다."),
+    ).toBeInTheDocument();
+    expect(calls("memory.search")).toHaveLength(0);
+  });
+
+  it("lists this project's agent runs and reopens one", async () => {
+    serve({
+      "agent.list": () => [
+        { id: "old", provider: "gemini", state: "completed", projectId: "p1", startedAt: 1700000000000 },
+        { id: "else", provider: "codex", state: "failed", projectId: "p2", startedAt: 1700000001000 },
+      ],
+      "agent.status": ({ id }) => ({ id, state: "completed", logs: [], result: "컷을 정리했습니다" }),
+      "memory.search": () => ({ items: [] }),
+    });
+    render(panel());
+    fireEvent.click(screen.getByRole("button", { name: /기억/ }));
+    const run = await screen.findByRole("button", { name: /Gemini CLI.*완료/ });
+    expect(screen.queryByRole("button", { name: /Codex/ })).toBeNull();
+    fireEvent.click(run);
+    expect(await screen.findByText("컷을 정리했습니다")).toBeInTheDocument();
+    expect(rpc).toHaveBeenCalledWith("agent.status", { id: "old" });
+  });
+
+  it("shows a past run read-only while a job is running and keeps that job attached", async () => {
+    serve({
+      "agent.list": () => [
+        { id: "job1", provider: "gemini", state: "running", projectId: "p1", startedAt: 2 },
+        { id: "old", provider: "codex", state: "completed", projectId: "p1", startedAt: 1 },
+      ],
+      "agent.status": ({ id }) =>
+        id === "old"
+          ? { id, state: "completed", logs: [], result: "컷을 정리했습니다" }
+          : { id, state: "running", logs: [{ at: "", stream: "stdout", text: "도입부를 다듬는 중" }] },
+      "memory.search": () => ({ items: [] }),
+    });
+    const { unmount } = render(panel());
+    expect(await screen.findByText("도입부를 다듬는 중")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /기억/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Codex.*완료/ }));
+    expect(await screen.findByText("컷을 정리했습니다")).toBeInTheDocument();
+    // The running job still owns the composer: it can be stopped, not replaced.
+    expect(screen.getByTitle("작업 중단")).toBeEnabled();
+    expect(screen.getByLabelText("편집 에이전트")).toBeDisabled();
+    expect(screen.queryByTitle("편집 요청 보내기 (⌘Enter)")).toBeNull();
+    expect(screen.queryByRole("button", { name: "새 작업" })).toBeNull();
+    const before = calls("agent.status").filter(([, p]) => (p as { id: string }).id === "job1").length;
+    await waitFor(
+      () =>
+        expect(
+          calls("agent.status").filter(([, p]) => (p as { id: string }).id === "job1").length,
+        ).toBeGreaterThan(before),
+      { timeout: 3000 },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "현재 작업으로 돌아가기" }));
+    expect(await screen.findByText("도입부를 다듬는 중")).toBeInTheDocument();
+    expect(screen.getByText("편집 작업 진행 중")).toBeInTheDocument();
+    // lastJob was not replaced by the old run: a remount reattaches to the running job.
+    unmount();
+    render(panel());
+    expect(await screen.findByText("도입부를 다듬는 중")).toBeInTheDocument();
+  });
 });

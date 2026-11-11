@@ -119,13 +119,21 @@ describe("Studio application", () => {
     const { container, unmount } = render(<App />);
     try {
       await screen.findByLabelText("프로젝트 이름");
+      // Loading a project stops playback in an effect. Let it run before pressing
+      // play: a click landing between that commit and its effects is undone by it
+      // (the rare failure recorded below: playing=false, no frame requested).
+      await act(async () => {});
       fireEvent.click(screen.getByTitle("재생 (Space)"));
       const start = performance.now();
       act(() => frame?.(start + 1000));
       expect(container.querySelector(".player-time")?.textContent).toBe("00:00:00:00 / 00:00:05:00");
       waiting.mockReturnValue(false);
       act(() => frame?.(start + 1100));
-      expect(container.querySelector(".player-time")?.textContent).toBe("00:00:00:03 / 00:00:05:00");
+      // The message records the state should this fail again.
+      expect(
+        container.querySelector(".player-time")?.textContent,
+        `playing=${!!screen.queryByTitle("일시정지 (Space)")} frames requested=${raf.mock.calls.length} waiting checks=${waiting.mock.calls.length} real ms since play=${Math.round(performance.now() - start)}`,
+      ).toBe("00:00:00:03 / 00:00:05:00");
     } finally {
       unmount();
       raf.mockRestore(); cancel.mockRestore(); waiting.mockRestore();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   Check,
   ChevronDown,
@@ -6,6 +6,7 @@ import {
   Download,
   Film,
   FolderOpen,
+  Home as HomeIcon,
   LayoutPanelLeft,
   LoaderCircle,
   Plus,
@@ -32,7 +33,9 @@ import {
   selectedClips,
   shiftSelectionTracks,
 } from "./studio/selection";
-import Player from "./studio/Player";
+import Player, { type LoopRange } from "./studio/Player";
+import Home, { DEFAULT_PROJECT_NAME } from "./studio/Home";
+import { playbackClock, useIdleClockTime } from "./studio/playbackClock";
 import { isPreviewPlaybackWaiting, primePreviewPlayback } from "./studio/mediaPlayback";
 import { clipEditCommands } from "./studio/clipEditing";
 import {
@@ -57,8 +60,13 @@ const shortcutKey = (event: KeyboardEvent) =>
     : /^Key[A-Z]$/.test(event.code)
       ? event.code.slice(3).toLowerCase()
       : event.key.toLowerCase();
-const missingKey = (project: Project | null) =>
-  project?.media.filter((media) => media.missing).map((media) => media.id).join() ?? "";
+const flaggedKey = (project: Project | null, flag: "missing" | "proxy") =>
+  project?.media.filter((media) => media[flag]).map((media) => media.id).join() ?? "";
+/** What the service fills in without a new revision: missing files, proxies, waveforms. */
+const derivedKey = (project: Project | null) =>
+  project?.media
+    .map((media) => `${media.id}:${media.missing ? 1 : 0}${media.proxy ? 1 : 0}:${media.waveform?.length ?? "-"}`)
+    .join() ?? "";
 interface Selection {
   projectId: string | null;
   ids: string[];
@@ -67,6 +75,120 @@ interface Selection {
 }
 const noSelection: Selection = { projectId: null, ids: [], primary: null, trackId: null };
 const noIds: string[] = [];
+/** A project nobody has worked on yet: the app opens on the home screen instead. */
+const isBlank = (project: Project) =>
+  !project.clips.length &&
+  !project.media.length &&
+  [DEFAULT_PROJECT_NAME, "새 프로젝트"].includes(project.name);
+
+interface Layout {
+  /** Panel widths in pixels; a null library keeps its responsive default. */
+  library: number | null;
+  inspector: number;
+  timeline: number;
+}
+const LAYOUT_KEY = "byori.layout";
+const defaultLayout: Layout = { library: null, inspector: 278, timeline: 300 };
+const storedLayout = (): Layout => {
+  try {
+    const value = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "{}") as Partial<Layout>;
+    const size = (input: unknown) =>
+      typeof input === "number" && Number.isFinite(input) && input > 0 ? input : null;
+    return {
+      library: size(value.library),
+      inspector: size(value.inspector) ?? defaultLayout.inspector,
+      timeline: size(value.timeline) ?? defaultLayout.timeline,
+    };
+  } catch {
+    return defaultLayout;
+  }
+};
+const PANEL_LIMITS = { library: [220, 560], inspector: [240, 520] } as const;
+/** Two separators and the narrowest player. */
+const PLAYER_RESERVE = 6 + 250 + 6;
+
+/**
+ * The panel widths that fit a workspace `width` wide. The chosen widths stay
+ * stored; they are only narrowed (never below their minimum) while the window
+ * is too small for them. A null width is the stylesheet's responsive default.
+ */
+export function fitPanelWidths(
+  layout: { library: number | null; inspector: number },
+  width: number,
+): { library: number | null; inspector: number | null } {
+  const inspector = layout.inspector === defaultLayout.inspector ? null : layout.inspector;
+  if (!(width > 0)) return { library: layout.library, inspector };
+  const [minLibrary] = PANEL_LIMITS.library, [minInspector] = PANEL_LIMITS.inspector;
+  const budget = width - PLAYER_RESERVE;
+  // The responsive defaults, as the stylesheet resolves them.
+  const narrow = width <= 1200;
+  const library = layout.library ?? Math.max(narrow ? 280 : 282, width * (narrow ? 0.29 : 0.28));
+  const side = layout.inspector === defaultLayout.inspector && narrow ? 252 : layout.inspector;
+  if (library + side <= budget) return { library: layout.library, inspector };
+  if (layout.library === null)
+    return { library: null, inspector: inspector && Math.max(minInspector, Math.floor(budget - library)) };
+  const scale = budget / (library + side);
+  const fitted = Math.max(minInspector, Math.floor(side * scale));
+  return {
+    library: Math.max(minLibrary, Math.min(library, Math.floor(budget - fitted))),
+    inspector: inspector && fitted,
+  };
+}
+
+function PanelResizer({
+  panel,
+  label,
+  value,
+  onChange,
+}: {
+  panel: "library" | "inspector";
+  label: string;
+  value: number | null;
+  onChange: (width: number | null) => void;
+}) {
+  const [min, max] = PANEL_LIMITS[panel];
+  const clamp = (width: number) => Math.round(Math.max(min, Math.min(max, width)));
+  // The library sits before its separator, the inspector after it.
+  const target = (element: HTMLElement) =>
+    (panel === "library" ? element.previousElementSibling : element.nextElementSibling)?.getBoundingClientRect();
+  return (
+    <div
+      className="panel-resizer"
+      role="separator"
+      aria-label={label}
+      aria-orientation="vertical"
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={value ?? undefined}
+      title="드래그하거나 좌우 방향키로 폭 조절 · 더블클릭으로 기본값"
+      tabIndex={0}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+      }}
+      onPointerMove={(event) => {
+        if (!event.currentTarget.hasPointerCapture?.(event.pointerId)) return;
+        const rect = target(event.currentTarget);
+        if (rect) onChange(clamp(panel === "library" ? event.clientX - rect.left : rect.right - event.clientX));
+      }}
+      onPointerUp={(event) => {
+        if (event.currentTarget.hasPointerCapture?.(event.pointerId))
+          event.currentTarget.releasePointerCapture(event.pointerId);
+      }}
+      onDoubleClick={() => onChange(null)}
+      onKeyDown={(event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        event.stopPropagation();
+        const width = value || target(event.currentTarget)?.width || min;
+        const grow = (event.key === "ArrowRight") === (panel === "library");
+        onChange(clamp(width + (grow ? 16 : -16)));
+      }}
+    >
+      <span />
+    </div>
+  );
+}
 
 export default function App() {
   const [project, setProject] = useState<Project | null>(null);
@@ -99,13 +221,25 @@ export default function App() {
   const [saveFailed, setSaveFailed] = useState(false);
   const [serviceNotice, setServiceNotice] = useState<string | null>(null);
   const clipboard = useRef<{ projectId: string; clips: Clip[] } | null>(null);
-  const [time, setTime] = useState(0);
-  const [seekEpoch, setSeekEpoch] = useState(0);
-  const seekTime = useCallback((value: number | ((current: number) => number)) => {
-    setSeekEpoch((epoch) => epoch + 1);
-    setTime(value);
+  const [clipboardProject, setClipboardProject] = useState<string | null>(null);
+  // The playhead lives in the playback clock, outside React: playback must not
+  // re-render the app, the library or the inspector.
+  // The paused playhead always sits on a whole frame, so the timecode, the precise
+  // frame and anything placed "at the playhead" agree on which frame that is.
+  const snapToFrame = useCallback((value: number) => {
+    const fps = current.current?.fps || 30;
+    return Math.round(value * fps) / fps;
   }, []);
+  const seekTime = useCallback(
+    (value: number | ((now: number) => number)) =>
+      playbackClock.seek((now) => snapToFrame(typeof value === "function" ? value(now) : value)),
+    [snapToFrame],
+  );
   const [playing, setPlaying] = useState(false);
+  const idleTime = useIdleClockTime(playing);
+  const [loop, setLoop] = useState<LoopRange | null>(null);
+  /** null until the first project arrives; then the home screen or the editor. */
+  const [home, setHome] = useState<boolean | null>(null);
   const [previewMode, setPreviewMode] = useState<"fast" | "precise">("fast");
   const [previewDraft, setPreviewDraft] = useState<PreviewDraft | null>(null);
   const preview: PreviewDraftHandler = useCallback((clipId, patch) => {
@@ -127,27 +261,36 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const files = useRef<HTMLInputElement>(null);
   const editingSurface = useRef<HTMLDivElement>(null);
-  const [timelineHeight, setTimelineHeight] = useState(300);
+  const [layout, setLayout] = useState(storedLayout);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+    } catch {
+      /* The layout still applies for this session. */
+    }
+  }, [layout]);
   const [surfaceHeight, setSurfaceHeight] = useState(640);
+  const [surfaceWidth, setSurfaceWidth] = useState(0);
+  const panels = fitPanelWidths(layout, surfaceWidth);
   const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
+  // The stored height is kept as chosen and only clamped to what fits right now.
+  const timelineHeight = Math.max(200, Math.min(maxTimelineHeight, layout.timeline));
   const resizeTimeline = (height: number) =>
-    setTimelineHeight(Math.max(200, Math.min(maxTimelineHeight, height)));
+    setLayout((value) => ({ ...value, timeline: Math.round(Math.max(200, Math.min(maxTimelineHeight, height))) }));
   useEffect(() => {
     const surface = editingSurface.current;
     if (!surface) return;
     const measure = () => {
-      const height = surface.getBoundingClientRect().height;
+      const { width, height } = surface.getBoundingClientRect();
       if (!height) return;
       setSurfaceHeight(height);
-      setTimelineHeight((value) =>
-        Math.max(200, Math.min(height - 248, value)),
-      );
+      setSurfaceWidth(width);
     };
     const observer = new ResizeObserver(measure);
     observer.observe(surface);
     measure();
     return () => observer.disconnect();
-  }, [!!project]);
+  }, [!!project, home]);
   const current = useRef<Project | null>(null);
   current.current = project;
   const projectGeneration = useRef(0);
@@ -195,7 +338,10 @@ export default function App() {
       await connectStudio();
       setConnected(true);
       setOffline(false);
-      setProject(await rpc<Project>("project.get"));
+      const opened = await rpc<Project>("project.get");
+      playbackClock.seek(0);
+      setProject(opened);
+      setHome((shown) => shown ?? isBlank(opened));
       void rpc<{ notice?: string | null }>("project.notice")
         .then((result) => setServiceNotice(result?.notice || null))
         .catch(() => {});
@@ -230,7 +376,7 @@ export default function App() {
       const known = current.current;
       const conditional = known && !full;
       full = false;
-      void rpc<Project | { unchanged: true; missing?: string[] }>(
+      void rpc<Project | { unchanged: true; missing?: string[]; proxy?: string[] }>(
         "project.get",
         conditional ? { ifProjectId: known.id, ifRevision: known.revision } : {},
       )
@@ -240,7 +386,8 @@ export default function App() {
           if (projectGeneration.current !== generation) return;
           if ("unchanged" in p) {
             full = p.missing
-              ? p.missing.join() !== missingKey(current.current)
+              ? p.missing.join() !== flaggedKey(current.current, "missing") ||
+                (p.proxy ?? []).join() !== flaggedKey(current.current, "proxy")
               : ++unchangedReplies >= 5;
             if (full) unchangedReplies = 0;
             return;
@@ -249,7 +396,7 @@ export default function App() {
             p.id !== current.current?.id ||
             p.revision > (current.current?.revision ?? -1) ||
             (p.revision === current.current.revision &&
-              missingKey(p) !== missingKey(current.current))
+              derivedKey(p) !== derivedKey(current.current))
           ) {
             if (p.id !== current.current?.id) projectGeneration.current++;
             current.current = p;
@@ -309,7 +456,7 @@ export default function App() {
           return result;
         current.current = result as Project;
         setProject(result as Project);
-        setTime((t) => Math.min(t, durationOf(result as Project)));
+        playbackClock.set(Math.min(playbackClock.get(), durationOf(result as Project)));
       } else if (result && typeof result === "object" && "project" in result) {
         current.current = (result as { project: Project }).project;
         setProject(current.current);
@@ -354,6 +501,7 @@ export default function App() {
     async (next: boolean) => {
       if (!next) {
         previewRun.current++;
+        playbackClock.set(snapToFrame(playbackClock.get()));
         setPlaying(false);
         setPreparing(false);
         setBusy("");
@@ -414,11 +562,23 @@ export default function App() {
         }
       }
     },
-    [playbackUrl, previewMode],
+    [playbackUrl, previewMode, snapToFrame],
   );
+  useEffect(() => setLoop(null), [project?.id]);
+  // The repeated range, clamped to the project; a range emptied by an edit is ignored.
+  const activeLoop = useMemo(() => {
+    if (!loop || !project) return null;
+    const range = { start: Math.max(0, loop.start), end: Math.min(loop.end, total) };
+    return range.end - range.start >= 1 / project.fps ? range : null;
+  }, [loop, total, project?.fps]);
+  const loopRef = useRef(activeLoop);
+  loopRef.current = activeLoop;
   useEffect(() => {
     if (!playing) return;
-    if (time >= total) seekTime(0);
+    const range = loopRef.current;
+    const at = playbackClock.get();
+    if (range ? at < range.start || at >= range.end : at >= total)
+      playbackClock.seek(range?.start ?? 0);
     let id = 0,
       last = performance.now();
     const tick = (now: number) => {
@@ -428,18 +588,19 @@ export default function App() {
         id = requestAnimationFrame(tick);
         return;
       }
-      setTime((v) => {
-        if (v + dt >= total) {
-          setPlaying(false);
-          return total;
-        }
-        return v + dt;
-      });
+      const next = playbackClock.get() + dt;
+      const repeat = loopRef.current;
+      if (repeat && next >= repeat.end) playbackClock.seek(repeat.start);
+      else if (next >= total) {
+        playbackClock.set(total);
+        setPlaying(false);
+        return;
+      } else playbackClock.set(next);
       id = requestAnimationFrame(tick);
     };
     id = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(id);
-  }, [playing, total, seekTime]);
+  }, [playing, total]);
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(""), 4500);
@@ -455,12 +616,49 @@ export default function App() {
   }, [command]);
   // The listener is registered once and reads the latest render through a ref,
   // so a key pressed right after a state change never sees stale values.
-  const live = useRef({ selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save });
-  live.current = { selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save };
+  const live = useRef({ selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save });
+  live.current = { selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save };
+  const copySelection = useCallback(
+    (cut: boolean) => {
+      const active = current.current;
+      const ids = live.current.selectedIds;
+      if (!active || !ids.length) return;
+      if (cut && !canEditSelection(active, ids)) return;
+      const clips = structuredClone(selectedClips(active, ids));
+      clipboard.current = { projectId: active.id, clips };
+      setClipboardProject(active.id);
+      if (!cut) setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
+      else
+        void safeCommand("edit.delete", {
+          ids,
+          expectedRevision: active.revision,
+        }).then((result) => {
+          if (result) selectMany([], null);
+        });
+    },
+    [safeCommand, selectMany],
+  );
+  const pasteAt = useCallback(
+    (at: number) => {
+      const active = current.current;
+      if (!active || clipboard.current?.projectId !== active.id) return;
+      void safeCommand("edit.paste", {
+        clips: clipboard.current.clips,
+        at,
+        expectedRevision: active.revision,
+      }).then((result) => {
+        const ids = newClipIds(active, result);
+        if (ids.length) selectMany(ids);
+      });
+    },
+    [safeCommand, selectMany],
+  );
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      const { selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save } = live.current;
+      const { selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save } = live.current;
+      const time = playbackClock.get();
       if (recent) return; // The dialog handles its own keys (useModal).
+      if (home) return; // No timeline to edit on the home screen.
       if (
         (event.target instanceof Element &&
           event.target.closest(
@@ -527,28 +725,11 @@ export default function App() {
         selectedIds.length && !window.getSelection()?.toString()
       ) {
         event.preventDefault();
-        if (key === "x" && !editable) return;
-        const clips = structuredClone(selectedClips(active, selectedIds));
-        clipboard.current = { projectId: active.id, clips };
-        if (key === "c") setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
-        else
-          void safeCommand("edit.delete", {
-            ids: selectedIds,
-            expectedRevision: active.revision,
-          }).then((result) => {
-            if (result) selectMany([], null);
-          });
+        copySelection(key === "x");
       } else if (cmd && !event.shiftKey && !event.altKey && key === "v" && clipboard.current?.projectId === active.id) {
         event.preventDefault();
         if (event.repeat) return;
-        void safeCommand("edit.paste", {
-          clips: clipboard.current.clips,
-          at: time,
-          expectedRevision: active.revision,
-        }).then((result) => {
-          const ids = newClipIds(active, result);
-          if (ids.length) selectMany(ids);
-        });
+        pasteAt(time);
       } else if (cmd && key === "g" && selectedIds.length) {
         event.preventDefault();
         if (editable && (event.shiftKey || selectedIds.length > 1))
@@ -620,6 +801,17 @@ export default function App() {
         seekTime(total);
       } else if (key === "m" && !cmd && !event.altKey)
         void safeCommand("edit.marker", { time, label: "마커" });
+      else if ((key === "i" || key === "o") && !cmd && !event.altKey && !event.shiftKey && total) {
+        // Loop range: I marks its start and O its end at the playhead.
+        const at = Math.min(total, time);
+        setLoop((range) => {
+          const base = range ?? { start: 0, end: total };
+          const next = key === "i"
+            ? { start: at, end: base.end > at ? base.end : total }
+            : { start: base.start < at ? base.start : 0, end: at };
+          return next.end - next.start >= 1 / active.fps ? next : null;
+        });
+      }
       else if (event.key === "Escape") {
         setMenu(false);
         selectMany([], null);
@@ -627,7 +819,7 @@ export default function App() {
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [safeCommand, selectMany, seekTime]);
+  }, [safeCommand, selectMany, seekTime, copySelection, pasteAt]);
   const relink = async (media: Media) => {
     try {
       const paths = await pickFiles();
@@ -692,8 +884,9 @@ export default function App() {
     setBusy("예제 프로젝트를 준비하고 있습니다");
     try {
       await command("project.demo");
-      setTime(0);
+      playbackClock.seek(0);
       selectMany([], null);
+      setHome(false);
       setNotice(
         "예제 프로젝트 · 제공된 사진과 합성 오디오로 구성되어 있습니다.",
       );
@@ -703,16 +896,33 @@ export default function App() {
       setBusy("");
     }
   };
-  const create = async () => {
-    await safeCommand("project.new", {
-      name: "이름 없는 프로젝트",
-      width: 1920,
-      height: 1080,
+  const create = async (width = 1920, height = 1080) => {
+    const created = await safeCommand("project.new", {
+      name: DEFAULT_PROJECT_NAME,
+      width,
+      height,
       fps: 30,
     });
-    setTime(0);
-    selectMany([], null);
     setMenu(false);
+    if (!created) return;
+    playbackClock.seek(0);
+    selectMany([], null);
+    setHome(false);
+  };
+  const open = async (id: string) => {
+    if (id !== current.current?.id) {
+      const opened = await safeCommand("project.open", { id });
+      if (!opened) return;
+      playbackClock.seek(0);
+      selectMany([], null);
+    }
+    setRecent(null);
+    setHome(false);
+  };
+  const goHome = () => {
+    setMenu(false);
+    void requestPlayback(false);
+    setHome(true);
   };
   if (!project)
     return (
@@ -739,6 +949,33 @@ export default function App() {
           </>
         )}
       </main>
+    );
+  if (home)
+    return (
+      <>
+        <Home
+          currentId={project.id}
+          busy={!!busy || pending > 0}
+          onCreate={(width, height) => void create(width, height)}
+          onOpen={(id) => void open(id)}
+          onExample={() => void example()}
+          onSettings={() => setSettings(true)}
+        />
+        {(error || busy) && (
+          <div className={`studio-notification ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
+            {error ? <TriangleAlert size={14} /> : <LoaderCircle className="spin" size={14} />}
+            <span>{error || busy}</span>
+            {error && (
+              <button title="알림 닫기" onClick={() => setError("")}>
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        )}
+        {settings && (
+          <Settings onClose={() => setSettings(false)} onUpdate={setRuntime} />
+        )}
+      </>
     );
   const selected = project.clips.find((c) => c.id === selectedId) || null;
   const missing = project.media.filter((media) => media.missing);
@@ -785,6 +1022,9 @@ export default function App() {
               </button>
               {menu && (
                 <div className="app-menu">
+                  <button onClick={goHome}>
+                    <HomeIcon size={15} /> 홈
+                  </button>
                   <button onClick={() => void create()}>
                     <Plus size={15} /> 새 프로젝트
                   </button>
@@ -840,6 +1080,12 @@ export default function App() {
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") e.currentTarget.blur();
+                if (e.key === "Escape") {
+                  // Leave the name as it was; the blur then has nothing to save.
+                  e.stopPropagation();
+                  e.currentTarget.value = project.name;
+                  e.currentTarget.blur();
+                }
               }}
             />
             <span
@@ -934,15 +1180,29 @@ export default function App() {
               gridTemplateRows: `minmax(240px, 1fr) 8px ${timelineHeight}px`,
             }}
           >
-            <div className="upper-workspace">
+            <div
+              className="upper-workspace"
+              // Only chosen widths are set here; the stylesheet keeps the responsive defaults.
+              style={{
+                ...(panels.library ? { "--library-width": `${panels.library}px` } : {}),
+                ...(panels.inspector ? { "--inspector-width": `${panels.inspector}px` } : {}),
+              } as CSSProperties}
+            >
               <Library
                 project={project}
                 targetTrackId={selectedTrackId}
                 selected={selected}
-                playhead={time}
+                playhead={idleTime}
+                now={playbackClock.get}
                 onCommand={command}
                 onImport={() => void importPaths()}
                 onSelect={selectClip}
+              />
+              <PanelResizer
+                panel="library"
+                label="라이브러리 폭 조절"
+                value={layout.library}
+                onChange={(library) => setLayout((value) => ({ ...value, library }))}
               />
               <Player
                 project={withPreviewDraft(project, previewDraft)}
@@ -953,22 +1213,29 @@ export default function App() {
                   setPlaybackUrl(null);
                   setPreviewMode(mode);
                 }}
-                time={time}
-                seekEpoch={seekEpoch}
                 playing={playing}
                 onTime={seekTime}
                 onPlaying={(v) => void requestPlayback(v)}
+                loop={activeLoop}
+                onLoop={setLoop}
                 playbackUrl={playbackUrl}
                 preparing={preparing}
                 selectedId={selectedId}
                 onSelect={selectClip}
                 onCommand={safeCommand}
               />
+              <PanelResizer
+                panel="inspector"
+                label="속성 패널 폭 조절"
+                value={layout.inspector}
+                onChange={(inspector) => setLayout((value) => ({ ...value, inspector: inspector ?? defaultLayout.inspector }))}
+              />
               <Inspector
                 project={project}
                 selected={selected}
                 onCommand={command}
-                playhead={time}
+                playhead={idleTime}
+                now={playbackClock.get}
               />
             </div>
             <div
@@ -1024,8 +1291,11 @@ export default function App() {
               onTrackSelect={selectTrack}
               playing={playing}
               project={project}
-              time={time}
               onTime={seekTime}
+              loop={activeLoop}
+              onCopy={copySelection}
+              onPaste={pasteAt}
+              canPaste={clipboardProject === project.id}
               selectedId={selectedId}
               selectedIds={selectedIds}
               onSelection={selectMany}
@@ -1077,7 +1347,12 @@ export default function App() {
           />
         )}
         {recent && (
-          <div className="modal-backdrop">
+          <div
+            className="modal-backdrop"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) setRecent(null);
+            }}
+          >
             <RecentModal onClose={() => setRecent(null)}>
               <header>
                 <h2 id="recent-title">프로젝트 열기</h2>
@@ -1089,15 +1364,7 @@ export default function App() {
                 {recent.map((p) => (
                   <button
                     key={p.id}
-                    onClick={() => {
-                      void safeCommand("project.open", { id: p.id }).then(
-                        () => {
-                          setRecent(null);
-                          setTime(0);
-                          selectMany([], null);
-                        },
-                      );
-                    }}
+                    onClick={() => void open(p.id)}
                   >
                     <Film size={23} />
                     <span>

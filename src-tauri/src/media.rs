@@ -79,7 +79,9 @@ async fn output_within(
     command: &mut Command,
     limit: Duration,
 ) -> std::io::Result<std::process::Output> {
-    command.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    command
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     match tokio::time::timeout(limit, command.output()).await {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
@@ -146,7 +148,15 @@ async fn decode_waveform(path: &Path, duration: f64, limit: Duration) -> Option<
     let mut child = Command::new(executable("ffmpeg"))
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
-        .args(["-vn", "-sn", "-dn", "-ac", "1", "-ar", &WAVEFORM_RATE.to_string()])
+        .args([
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ac",
+            "1",
+            "-ar",
+            &WAVEFORM_RATE.to_string(),
+        ])
         .args(["-f", "s16le", "pipe:1"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -238,7 +248,12 @@ pub async fn constant_frame_rate(path: &Path) -> Option<f64> {
     let output = output_within(
         Command::new(executable("ffprobe"))
             .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "json"])
+            .args([
+                "-show_entries",
+                "stream=r_frame_rate,avg_frame_rate",
+                "-of",
+                "json",
+            ])
             .arg(path),
         PROBE_TIMEOUT,
     )
@@ -409,11 +424,24 @@ pub async fn extract_frame(
         let _ = std::fs::remove_file(&temporary);
         let result = output_within(
             Command::new(executable("ffmpeg"))
-                .args(["-y", "-v", "error", "-nostdin", "-ss", &format!("{time:.6}"), "-i"])
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-ss",
+                    &format!("{time:.6}"),
+                    "-i",
+                ])
                 .arg(media_path)
                 // Timestamps count from the seek point; the millisecond absorbs its
                 // rounding to a stream tick.
-                .args(["-map", "0:v:0", "-vf", &format!("trim=end={:.6}", source_time - time + 0.001)])
+                .args([
+                    "-map",
+                    "0:v:0",
+                    "-vf",
+                    &format!("trim=end={:.6}", source_time - time + 0.001),
+                ])
                 .args(["-update", "1", "-c:v", "png", "-f", "image2"])
                 .arg(&temporary),
             FRAME_TIMEOUT,
@@ -458,6 +486,21 @@ pub fn needs_proxy(media: &Value) -> bool {
 /// `<root>/proxies/<mediaId>.mp4`, whether or not the proxy exists yet.
 pub fn proxy_path(root: &Path, media_id: &str) -> PathBuf {
     root.join("proxies").join(format!("{media_id}.mp4"))
+}
+
+/// Next to each proxy, a note of the source file it was made from, written before
+/// the proxy is built: `<root>/proxies/<mediaId>.source`.
+pub fn proxy_source_note(proxy: &Path) -> PathBuf {
+    proxy.with_extension("source")
+}
+
+/// Whether `proxy` exists and shows `source`. A proxy without its note, or noted as
+/// made from another file (the media was relinked since), does not stand in for it.
+/// The one place that decides this, for the service that builds proxies and for the
+/// `proxy` flag of a media item.
+pub fn proxy_is_of(proxy: &Path, source: &str) -> bool {
+    proxy.is_file()
+        && std::fs::read_to_string(proxy_source_note(proxy)).is_ok_and(|noted| noted == source)
 }
 
 /// Transcodes the media's source into its proxy (H.264, at most 1280 on the longer
@@ -523,9 +566,16 @@ pub async fn encode_proxy(
     let mut child = Command::new(executable("ffmpeg"))
         .args(["-y", "-v", "error", "-nostdin", "-i"])
         .arg(source)
-        .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", &scale])
+        .args([
+            "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", &scale,
+        ])
         .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"])
-        .args(["-pix_fmt", "yuv420p", "-force_key_frames", "expr:gte(t,n_forced*0.5)"])
+        .args([
+            "-pix_fmt",
+            "yuv420p",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*0.5)",
+        ])
         .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2"])
         .args(["-movflags", "+faststart", "-f", "mp4"])
         .arg(output)
@@ -845,10 +895,24 @@ mod tests {
         // 4 s of video with a tone in the first 2 s only.
         ffmpeg(
             &[
-                "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=4",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
             ],
             &mp4,
         )
@@ -860,9 +924,18 @@ mod tests {
             .iter()
             .map(|v| v.as_f64().unwrap())
             .collect();
-        assert_eq!(peaks.len(), waveform_buckets(asset["duration"].as_f64().unwrap()));
-        assert!(peaks[4..60].iter().all(|p| *p > 0.05), "tone expected: {peaks:?}");
-        assert!(peaks[70..].iter().all(|p| *p == 0.0), "silence expected: {peaks:?}");
+        assert_eq!(
+            peaks.len(),
+            waveform_buckets(asset["duration"].as_f64().unwrap())
+        );
+        assert!(
+            peaks[4..60].iter().all(|p| *p > 0.05),
+            "tone expected: {peaks:?}"
+        );
+        assert!(
+            peaks[70..].iter().all(|p| *p == 0.0),
+            "silence expected: {peaks:?}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -906,9 +979,20 @@ mod tests {
         let mp4 = root.join("tone.mp4");
         ffmpeg(
             &[
-                "-f", "lavfi", "-i", "testsrc=size=64x64:rate=25:duration=2",
-                "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*440*t):s=44100:d=2",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=0.5*sin(2*PI*440*t):s=44100:d=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
             ],
             &mp4,
         )
@@ -921,9 +1005,14 @@ mod tests {
         assert_eq!(constant_frame_rate(&root.join("missing.mp4")).await, None);
         assert!(Path::new(asset["thumbnail"].as_str().unwrap()).is_file());
         let path = Path::new(asset["path"].as_str().unwrap());
-        let peaks = waveform(path, asset["duration"].as_f64().unwrap()).await.unwrap();
+        let peaks = waveform(path, asset["duration"].as_f64().unwrap())
+            .await
+            .unwrap();
         assert_eq!(peaks.len(), 128);
-        assert!(peaks[4..120].iter().all(|p| (0.35..=0.6).contains(p)), "{peaks:?}");
+        assert!(
+            peaks[4..120].iter().all(|p| (0.35..=0.6).contains(p)),
+            "{peaks:?}"
+        );
         // The combined probe still returns the same peaks.
         let full = probe(&mp4, &root).await.unwrap();
         assert_eq!(full["waveform"], json!(peaks));
@@ -939,10 +1028,20 @@ mod tests {
         // Red for the first second, blue for the second one.
         ffmpeg(
             &[
-                "-f", "lavfi", "-i", "color=red:size=64x64:rate=24:duration=1",
-                "-f", "lavfi", "-i", "color=blue:size=64x64:rate=24:duration=1",
-                "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=64x64:rate=24:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=blue:size=64x64:rate=24:duration=1",
+                "-filter_complex",
+                "[0:v][1:v]concat=n=2:v=1:a=0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
             ],
             &mp4,
         )
@@ -961,11 +1060,17 @@ mod tests {
         extract_frame(&mp4, 2.0, &png).await.unwrap();
         assert!(pixel(&png)[2] > 200);
         assert_eq!(image::open(&png).unwrap().width(), 64);
-        assert!(extract_frame(&root.join("missing.mp4"), 0.0, &png).await.is_err());
+        assert!(extract_frame(&root.join("missing.mp4"), 0.0, &png)
+            .await
+            .is_err());
         assert!(extract_frame(&mp4, -1.0, &png).await.is_err());
         assert!(extract_frame(&mp4, f64::NAN, &png).await.is_err());
         let wav = root.join("tone.wav");
-        ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=440:duration=1"], &wav).await;
+        ffmpeg(
+            &["-f", "lavfi", "-i", "sine=frequency=440:duration=1"],
+            &wav,
+        )
+        .await;
         let failed = root.join("frames/none.png");
         assert!(extract_frame(&wav, 0.5, &failed).await.is_err());
         assert!(!failed.exists());
@@ -1017,8 +1122,15 @@ mod tests {
 
     #[tokio::test]
     async fn portrait_video_stored_sideways_reports_its_displayed_size() {
-        for (rotation, sideways) in [(90, true), (-90, true), (270, true), (180, false), (0, false)] {
-            let stream = json!({"side_data_list":[{"side_data_type":"Display Matrix","rotation":rotation}]});
+        for (rotation, sideways) in [
+            (90, true),
+            (-90, true),
+            (270, true),
+            (180, false),
+            (0, false),
+        ] {
+            let stream =
+                json!({"side_data_list":[{"side_data_type":"Display Matrix","rotation":rotation}]});
             assert_eq!(stored_sideways(&stream), sideways, "{rotation}");
         }
         assert!(stored_sideways(&json!({"tags":{"rotate":"90"}})));
@@ -1028,8 +1140,14 @@ mod tests {
         let landscape = root.join("landscape.mp4");
         ffmpeg(
             &[
-                "-f", "lavfi", "-i", "testsrc=size=128x64:rate=10:duration=1",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=128x64:rate=10:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
             ],
             &landscape,
         )
@@ -1037,19 +1155,35 @@ mod tests {
         // The same frames with a quarter turn recorded in the file, as phones write it.
         let portrait = root.join("portrait.mp4");
         ffmpeg(
-            &["-display_rotation", "90", "-i", landscape.to_str().unwrap(), "-c", "copy"],
+            &[
+                "-display_rotation",
+                "90",
+                "-i",
+                landscape.to_str().unwrap(),
+                "-c",
+                "copy",
+            ],
             &portrait,
         )
         .await;
         let plain = probe_info(&landscape, &root).await.unwrap();
-        assert_eq!((plain["width"].as_u64(), plain["height"].as_u64()), (Some(128), Some(64)));
+        assert_eq!(
+            (plain["width"].as_u64(), plain["height"].as_u64()),
+            (Some(128), Some(64))
+        );
         let turned = probe_info(&portrait, &root).await.unwrap();
-        assert_eq!((turned["width"].as_u64(), turned["height"].as_u64()), (Some(64), Some(128)));
+        assert_eq!(
+            (turned["width"].as_u64(), turned["height"].as_u64()),
+            (Some(64), Some(128))
+        );
         // The decoded picture has that size too: the thumbnail and an extracted frame.
         let thumbnail = probe_info(Path::new(turned["thumbnail"].as_str().unwrap()), &root)
             .await
             .unwrap();
-        assert!(thumbnail["height"].as_u64() > thumbnail["width"].as_u64(), "{thumbnail}");
+        assert!(
+            thumbnail["height"].as_u64() > thumbnail["width"].as_u64(),
+            "{thumbnail}"
+        );
         let png = root.join("frame.png");
         extract_frame(&portrait, 0.5, &png).await.unwrap();
         let frame = image::open(&png).unwrap();
@@ -1059,9 +1193,7 @@ mod tests {
 
     #[test]
     fn proxies_are_for_large_or_heavy_video_only() {
-        let media = |kind: &str, width: u32, height: u32, codec: Value| {
-            json!({"id":"m","kind":kind,"width":width,"height":height,"codec":codec})
-        };
+        let media = |kind: &str, width: u32, height: u32, codec: Value| json!({"id":"m","kind":kind,"width":width,"height":height,"codec":codec});
         assert!(needs_proxy(&media("video", 3840, 2160, json!("h264"))));
         assert!(needs_proxy(&media("video", 1080, 2560, json!("h264"))));
         assert!(needs_proxy(&media("video", 1920, 1080, json!("hevc"))));
@@ -1073,6 +1205,24 @@ mod tests {
         assert!(needs_proxy(&media("video", 2560, 1440, Value::Null)));
         assert!(!needs_proxy(&media("image", 6000, 4000, Value::Null)));
         assert!(!needs_proxy(&media("audio", 0, 0, Value::Null)));
+        let folder = std::env::temp_dir().join(id("studio-proxy-note-test"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let proxy = proxy_path(&folder, "media-1");
+        assert_eq!(
+            proxy_source_note(&proxy),
+            folder.join("proxies/media-1.source")
+        );
+        std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+        // The note alone, or the file alone, is not a proxy of the source.
+        std::fs::write(proxy_source_note(&proxy), "/films/a.mp4").unwrap();
+        assert!(!proxy_is_of(&proxy, "/films/a.mp4"));
+        std::fs::remove_file(proxy_source_note(&proxy)).unwrap();
+        std::fs::write(&proxy, b"proxy").unwrap();
+        assert!(!proxy_is_of(&proxy, "/films/a.mp4"));
+        std::fs::write(proxy_source_note(&proxy), "/films/a.mp4").unwrap();
+        assert!(proxy_is_of(&proxy, "/films/a.mp4"));
+        assert!(!proxy_is_of(&proxy, "/films/b.mp4"), "relinked since");
+        std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(
             proxy_path(Path::new("/data"), "media-1"),
             PathBuf::from("/data/proxies/media-1.mp4")
@@ -1086,10 +1236,25 @@ mod tests {
         let source = root.join("uhd.mp4");
         ffmpeg(
             &[
-                "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=2",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
-                "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=3840x2160:rate=30:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=2",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
             ],
             &source,
         )
@@ -1116,7 +1281,10 @@ mod tests {
         assert_eq!(files(&root), vec![format!("{media_id}.mp4")]);
         let made = probe_info(&proxy, &root).await.unwrap();
         assert_eq!(made["codec"], "h264");
-        assert_eq!((made["width"].as_u64(), made["height"].as_u64()), (Some(1280), Some(720)));
+        assert_eq!(
+            (made["width"].as_u64(), made["height"].as_u64()),
+            (Some(1280), Some(720))
+        );
         assert_eq!(made["hasAudio"], true);
         assert!(!needs_proxy(&made));
         let (a, b) = (
@@ -1126,7 +1294,14 @@ mod tests {
         assert!((a - b).abs() < 0.1, "source {a}s, proxy {b}s");
         // Keyframes at most half a second apart keep seeking in the browser fast.
         let keyframes = Command::new(executable("ffprobe"))
-            .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-skip_frame",
+                "nokey",
+            ])
             .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
             .arg(&proxy)
             .output()
@@ -1141,7 +1316,10 @@ mod tests {
         // Building again reuses the finished proxy; the source is never written.
         let modified = std::fs::metadata(&proxy).unwrap().modified().unwrap();
         build_proxy(&root, &asset, cancel.clone()).await.unwrap();
-        assert_eq!(std::fs::metadata(&proxy).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            std::fs::metadata(&proxy).unwrap().modified().unwrap(),
+            modified
+        );
         assert_eq!(std::fs::read(&source).unwrap(), original);
         // A source that cannot be decoded fails without leaving anything behind.
         let broken = root.join("broken.mp4");
@@ -1153,9 +1331,11 @@ mod tests {
         )
         .await;
         assert!(failed.is_err());
-        assert!(build_proxy(&root, &json!({"id":"../escape","path":source}), cancel)
-            .await
-            .is_err());
+        assert!(
+            build_proxy(&root, &json!({"id":"../escape","path":source}), cancel)
+                .await
+                .is_err()
+        );
         assert_eq!(files(&root), vec![format!("{media_id}.mp4")]);
         std::fs::remove_dir_all(root).unwrap();
     }

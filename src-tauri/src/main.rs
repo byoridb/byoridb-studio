@@ -10,7 +10,15 @@ fn studio_connection(state: tauri::State<'_, Connection>) -> Connection {
 
 #[tauri::command]
 async fn studio_open_files(extensions: Option<Vec<String>>) -> Vec<String> {
-    let extensions = extensions.unwrap_or_else(|| ["mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg", "jpeg", "webp", "gif", "srt", "cube", "3dl"].into_iter().map(String::from).collect());
+    let extensions = extensions.unwrap_or_else(|| {
+        [
+            "mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg",
+            "jpeg", "webp", "gif", "srt", "cube", "3dl",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    });
     rfd::AsyncFileDialog::new()
         .add_filter("파일", &extensions)
         .pick_files()

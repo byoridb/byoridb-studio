@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
-import { Copy, Film, FolderOpen, LoaderCircle, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
-import { rpc } from "./api";
+import { Copy, Film, LoaderCircle, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
+import { projectThumbnailUrl, rpc } from "./api";
 
 export interface ProjectSummary {
   id: string;
   name: string;
   updatedAt: string | number;
+  /** The earliest picture of the project that already has a thumbnail (project.list). */
+  thumbnail?: { mediaId: string };
+  /** No clips and no media yet (project.list). */
+  empty?: boolean;
 }
+/** The name project.demo gives the example; an existing one is reopened instead of made again. */
+export const EXAMPLE_PROJECT_NAME = "잠시, 멈추는 여행 · 예제";
 export const DEFAULT_PROJECT_NAME = "이름 없는 프로젝트";
+/** The names a project has before anyone names it. */
+export const UNNAMED = [DEFAULT_PROJECT_NAME, "새 프로젝트"];
 export const FRAME_PRESETS = [
   { ratio: "16:9", label: "가로", width: 1920, height: 1080 },
   { ratio: "9:16", label: "세로", width: 1080, height: 1920 },
@@ -15,17 +23,39 @@ export const FRAME_PRESETS = [
   { ratio: "4:5", label: "피드", width: 1080, height: 1350 },
 ] as const;
 
-const when = (value: string | number) => {
+/** "오늘 오전 2:35", "어제 오후 9:10", then the date (with the year once it differs). */
+export const relativeDate = (value: string | number, now = new Date()) => {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("ko-KR", { dateStyle: "medium", timeStyle: "short" });
+  if (Number.isNaN(date.getTime())) return "";
+  const midnight = (day: Date) => new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+  const days = Math.round((midnight(now) - midnight(date)) / 86_400_000);
+  if (days === 0 || days === 1)
+    return `${days ? "어제" : "오늘"} ${date.toLocaleTimeString("ko-KR", { hour: "numeric", minute: "2-digit" })}`;
+  return date.toLocaleDateString("ko-KR", {
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+    month: "long",
+    day: "numeric",
+  });
 };
 const stamp = (value: string | number) => {
   const time = new Date(value).getTime();
   return Number.isNaN(time) ? 0 : time;
 };
 
+/** The project's first frame; the film icon stands in when there is none or it cannot be read. */
+function Cover({ item }: { item: ProjectSummary }) {
+  const [failed, setFailed] = useState(false);
+  const mediaId = item.thumbnail?.mediaId;
+  useEffect(() => setFailed(false), [mediaId]);
+  const url = mediaId && !failed ? projectThumbnailUrl(item.id, mediaId) : "";
+  return url
+    ? <img src={url} alt="" draggable={false} onError={() => setFailed(true)} />
+    : <Film size={22} aria-hidden="true" />;
+}
+
 export default function Home({
   currentId,
+  hiddenId,
   busy,
   onCreate,
   onOpen,
@@ -34,6 +64,8 @@ export default function Home({
 }: {
   /** The project the editor already holds: opening it only leaves the home screen. */
   currentId: string;
+  /** A project to leave out of the list: the untouched one the app created by itself. */
+  hiddenId?: string | null;
   busy?: boolean;
   onCreate: (width: number, height: number) => void;
   onOpen: (id: string) => void;
@@ -72,7 +104,10 @@ export default function Home({
       setWorking(null);
     }
   };
-  const sorted = [...(projects ?? [])].sort((a, b) => stamp(b.updatedAt) - stamp(a.updatedAt));
+  const sorted = (projects ?? [])
+    // Untouched projects the app made by itself are not the user's work to list.
+    .filter((item) => item.id !== hiddenId && !(item.empty && UNNAMED.includes(item.name)))
+    .sort((a, b) => stamp(b.updatedAt) - stamp(a.updatedAt));
   return (
     <main className="home-screen">
       <header className="home-header">
@@ -106,17 +141,21 @@ export default function Home({
                 </small>
               </button>
             ))}
-            <button className="home-example" disabled={busy} onClick={onExample}>
-              <span className="home-preset-frame">
-                <Film size={22} aria-hidden="true" />
-              </span>
-              <strong>예제 열기</strong>
-              <small>사진과 합성 오디오로 둘러보기</small>
-            </button>
           </div>
         </section>
         <section aria-labelledby="home-recent">
-          <h2 id="home-recent">최근 프로젝트</h2>
+          <div className="home-section-heading">
+            <h2 id="home-recent">최근 프로젝트</h2>
+            <button
+              className="home-example"
+              aria-label="예제 열기"
+              title="제공된 사진과 합성 오디오로 만든 예제 프로젝트"
+              disabled={busy}
+              onClick={onExample}
+            >
+              예제 열기
+            </button>
+          </div>
           {error && (
             <div className="inline-error" role="alert">
               {error}
@@ -140,7 +179,7 @@ export default function Home({
                       disabled={busy || working === item.id}
                       onClick={() => onOpen(item.id)}
                     >
-                      <FolderOpen size={22} aria-hidden="true" />
+                      <Cover item={item} />
                     </button>
                     <div className="home-card-text">
                       {renaming === item.id ? (
@@ -168,10 +207,10 @@ export default function Home({
                       )}
                       <small>
                         {current ? "열려 있음 · " : ""}
-                        {when(item.updatedAt)}
+                        {relativeDate(item.updatedAt)}
                       </small>
                     </div>
-                    <div className="home-card-actions">
+                    <div className={`home-card-actions ${deleting === item.id ? "confirming" : ""}`}>
                       {deleting === item.id ? (
                         <>
                           <button className="danger" onClick={() => { setDeleting(null); void act(item.id, "project.delete", { id: item.id }); }}>
@@ -182,10 +221,10 @@ export default function Home({
                       ) : (
                         <>
                           <button title="이름 변경" aria-label={`${item.name} 이름 변경`} onClick={() => setRenaming(item.id)}>
-                            <Pencil size={13} />
+                            <Pencil size={14} />
                           </button>
                           <button title="복제" aria-label={`${item.name} 복제`} onClick={() => void act(item.id, "project.duplicate", { id: item.id })}>
-                            <Copy size={13} />
+                            <Copy size={14} />
                           </button>
                           <button
                             title={current ? "열려 있는 프로젝트는 삭제할 수 없습니다" : "프로젝트 삭제 · 되돌릴 수 없습니다"}
@@ -193,7 +232,7 @@ export default function Home({
                             disabled={current}
                             onClick={() => setDeleting(item.id)}
                           >
-                            <Trash2 size={13} />
+                            <Trash2 size={14} />
                           </button>
                         </>
                       )}

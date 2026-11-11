@@ -46,7 +46,11 @@ fn available_tools(listed: &[String]) -> Vec<String> {
         tracing::info!(
             "Higgsfield MCP does not offer {}; using {}",
             missing.join(", "),
-            if found.is_empty() { "no tools".to_owned() } else { found.join(", ") }
+            if found.is_empty() {
+                "no tools".to_owned()
+            } else {
+                found.join(", ")
+            }
         );
     }
     found.into_iter().map(String::from).collect()
@@ -435,7 +439,9 @@ mod tests {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let (_tx, mut rx) = watch::channel(false);
-        let listed = probe(good, &mut rx, &ProcessGroups::default()).await.unwrap();
+        let listed = probe(good, &mut rx, &ProcessGroups::default())
+            .await
+            .unwrap();
         assert_eq!(listed, ["models_explore", "generate_image", "balance"]);
         // Allowlisted names the server lacks are dropped, and nothing else gets in.
         assert_eq!(available_tools(&listed), ["models_explore", "balance"]);
@@ -446,7 +452,9 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let error = probe(bad, &mut rx, &ProcessGroups::default()).await.unwrap_err();
+        let error = probe(bad, &mut rx, &ProcessGroups::default())
+            .await
+            .unwrap_err();
         assert!(!error.contains("private-token"));
     }
     #[tokio::test]

@@ -168,7 +168,7 @@ describe("Studio application", () => {
     const { container, unmount } = render(<App />);
     try {
       await screen.findByLabelText("프로젝트 이름");
-      fireEvent.change(screen.getByRole("combobox", { name: "미리보기 모드" }), { target: { value: "precise" } });
+      fireEvent.click(screen.getByRole("button", { name: "정밀 재생" }));
       fireEvent.click(screen.getByTitle("재생 (Space)"));
       await screen.findByTitle("일시정지 (Space)");
       const proxy = container.querySelector<HTMLVideoElement>("video.rendered-preview")!;
@@ -209,9 +209,12 @@ describe("Studio application", () => {
     await waitFor(() =>
       expect(rpc).toHaveBeenCalledWith("project.save", {}, "test-project"),
     );
-    expect(
-      await screen.findByText("저장됨 · /tmp/test.json"),
-    ).toBeInTheDocument();
+    // Saving is automatic, so ⌘S stays quiet and the menu has no save entry.
+    await act(async () => {});
+    expect(screen.queryByText(/저장됨 ·/)).toBeNull();
+    expect(screen.getByTitle("자동 저장")).toHaveTextContent("저장됨");
+    fireEvent.click(screen.getByRole("button", { name: "메뉴" }));
+    expect(screen.queryByRole("button", { name: /^저장/ })).toBeNull();
   });
   it("routes a natural language request to the selected CLI provider", async () => {
     const user = userEvent.setup();

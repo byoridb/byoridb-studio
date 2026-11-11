@@ -46,11 +46,11 @@ export default function McpSettings() {
     catch (e) { setError(String(e)); }
     finally { setBusy(false); }
   };
-  const label = !status?.added ? "미연결" : !status.enabled ? "꺼짐" : active ? "연결 확인 중" : status.phase === "connected" ? "연결 확인됨" : "연결 확인 필요";
+  const label = !status ? "" : !status.added ? "미연결" : !status.enabled ? "꺼짐" : active ? "연결 확인 중" : status.phase === "connected" ? "연결 확인됨" : "연결 확인 필요";
   return <section className="mcp-settings" aria-labelledby="higgsfield-heading">
     <div className="section-heading">
       <h3 id="higgsfield-heading">Higgsfield MCP</h3>
-      <span className={`state-badge ${status?.enabled && status.phase === "connected" ? "online" : ""}`}>{label}</span>
+      {status && <span className={`state-badge ${status.enabled && status.phase === "connected" ? "online" : ""}`}>{label}</span>}
     </div>
     <p>편집 에이전트에서 Higgsfield의 모델과 크레딧을 조회합니다.</p>
     <div className="mcp-endpoint"><Link2 size={13} /><span>{status?.url || "https://mcp.higgsfield.ai/mcp"}</span></div>
@@ -74,6 +74,6 @@ export default function McpSettings() {
     </> : <button className="secondary-button" disabled={busy || !status} onClick={() => void run("runtime.mcpSave", { enabled: true })}><Plus size={14} /> Higgsfield 추가</button>}
     {status && !status.bridgeAvailable && <p className="inline-error">연결하려면 Node.js와 npx를 설치해주세요.</p>}
     {(error || status?.error) && <p className="inline-error" role="alert">{error || status?.error}</p>}
-    <p className="status-detail">현재는 조회 도구를 지원합니다. 유료 생성 실행은 별도의 비용 확인·승인 흐름을 연결한 뒤 제공됩니다. 앱을 다시 열면 연결 확인을 눌러 저장된 로그인을 확인해주세요. <a href="https://higgsfield.ai/creator-hub/help-center/integrations/how-do-i-connect-higgsfield-to-ai-agent" target="_blank" rel="noreferrer">연결 안내 <ExternalLink size={11} /></a></p>
+    <p className="status-detail">모델·크레딧 조회만 지원합니다. <a href="https://higgsfield.ai/creator-hub/help-center/integrations/how-do-i-connect-higgsfield-to-ai-agent" target="_blank" rel="noreferrer">연결 안내 <ExternalLink size={11} /></a></p>
   </section>;
 }

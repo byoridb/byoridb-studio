@@ -385,7 +385,13 @@ impl Runtime {
         let started = async {
             std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
             let connection = work.join("connection.json");
-            private_write(&connection, &serde_json::to_vec(&json!({"url":self.connection.url,"token":token,"projectId":project_id})).unwrap())?;
+            private_write(
+                &connection,
+                &serde_json::to_vec(
+                    &json!({"url":self.connection.url,"token":token,"projectId":project_id}),
+                )
+                .unwrap(),
+            )?;
             let command = agent_command(
                 provider,
                 &executable,
@@ -818,42 +824,42 @@ fn agent_command(
         &mcp_file,
         &serde_json::to_vec(&json!({"mcpServers":servers})).unwrap(),
     )?;
-        let mut command = Command::new(executable);
-        let allowed_tools = if let Some(bridge) = higgsfield {
-            std::iter::once("mcp__studio__*".to_owned())
-                .chain(
-                    bridge
-                        .tools
-                        .iter()
-                        .map(|tool| format!("mcp__higgsfield__{tool}")),
-                )
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            "mcp__studio__*".to_owned()
-        };
-        match provider {
-            "claude" => {
-                command
-                    .args([
-                        "--print",
-                        "--verbose",
-                        "--output-format",
-                        "stream-json",
-                        "--permission-mode",
-                        "dontAsk",
-                        "--allowedTools",
-                        &allowed_tools,
-                        "--tools",
-                        "",
-                        "--strict-mcp-config",
-                        "--mcp-config",
-                    ])
-                    .arg(&mcp_file)
-                    .args(["--setting-sources", ""]);
-            }
-            "codex" => {
-                command
+    let mut command = Command::new(executable);
+    let allowed_tools = if let Some(bridge) = higgsfield {
+        std::iter::once("mcp__studio__*".to_owned())
+            .chain(
+                bridge
+                    .tools
+                    .iter()
+                    .map(|tool| format!("mcp__higgsfield__{tool}")),
+            )
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "mcp__studio__*".to_owned()
+    };
+    match provider {
+        "claude" => {
+            command
+                .args([
+                    "--print",
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--allowedTools",
+                    &allowed_tools,
+                    "--tools",
+                    "",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                ])
+                .arg(&mcp_file)
+                .args(["--setting-sources", ""]);
+        }
+        "codex" => {
+            command
                     .args([
                         "exec",
                         "--json",
@@ -879,56 +885,56 @@ fn agent_command(
                     .arg("mcp_servers.studio.startup_timeout_sec=20")
                     .arg("-c").arg("mcp_servers.studio.default_tools_approval_mode=\"approve\"")
                     .arg("-c").arg("mcp_servers.studio.enabled_tools=[\"studio_project\",\"studio_edit\",\"studio_export\",\"studio_memory\",\"studio_speech\",\"studio_assets\"]");
-                if let Some(bridge) = higgsfield {
-                    command.arg("-c").arg(format!(
-                        "mcp_servers.higgsfield.command={}",
-                        json!(bridge.command)
-                    ));
-                    command.arg("-c").arg(format!(
-                        "mcp_servers.higgsfield.args={}",
-                        json!(bridge.args)
-                    ));
-                    for (key, value) in &bridge.env {
-                        command
-                            .arg("-c")
-                            .arg(format!("mcp_servers.higgsfield.env.{key}={value}"));
-                    }
+            if let Some(bridge) = higgsfield {
+                command.arg("-c").arg(format!(
+                    "mcp_servers.higgsfield.command={}",
+                    json!(bridge.command)
+                ));
+                command.arg("-c").arg(format!(
+                    "mcp_servers.higgsfield.args={}",
+                    json!(bridge.args)
+                ));
+                for (key, value) in &bridge.env {
                     command
                         .arg("-c")
-                        .arg("mcp_servers.higgsfield.startup_timeout_sec=45");
-                    command
-                        .arg("-c")
-                        .arg("mcp_servers.higgsfield.default_tools_approval_mode=\"approve\"");
-                    command.arg("-c").arg(format!(
-                        "mcp_servers.higgsfield.enabled_tools={}",
-                        json!(bridge.tools)
-                    ));
+                        .arg(format!("mcp_servers.higgsfield.env.{key}={value}"));
                 }
-                command.arg("-");
+                command
+                    .arg("-c")
+                    .arg("mcp_servers.higgsfield.startup_timeout_sec=45");
+                command
+                    .arg("-c")
+                    .arg("mcp_servers.higgsfield.default_tools_approval_mode=\"approve\"");
+                command.arg("-c").arg(format!(
+                    "mcp_servers.higgsfield.enabled_tools={}",
+                    json!(bridge.tools)
+                ));
             }
-            "gemini" => {
-                std::fs::create_dir_all(work.join(".gemini")).map_err(|e| e.to_string())?;
-                private_write(
-                    &work.join(".gemini/settings.json"),
-                    &serde_json::to_vec(&gemini_settings(&servers)).unwrap(),
-                )?;
-                command.args([
-                    "--prompt",
-                    "Complete the editing request provided on stdin.",
-                    "--output-format",
-                    "stream-json",
-                    "--extensions",
-                    "none",
-                    "--allowed-mcp-server-names",
-                    "studio",
-                ]);
-                if higgsfield.is_some() {
-                    command.arg("higgsfield");
-                }
-                command.arg("--skip-trust");
-            }
-            _ => unreachable!(),
+            command.arg("-");
         }
+        "gemini" => {
+            std::fs::create_dir_all(work.join(".gemini")).map_err(|e| e.to_string())?;
+            private_write(
+                &work.join(".gemini/settings.json"),
+                &serde_json::to_vec(&gemini_settings(&servers)).unwrap(),
+            )?;
+            command.args([
+                "--prompt",
+                "Complete the editing request provided on stdin.",
+                "--output-format",
+                "stream-json",
+                "--extensions",
+                "none",
+                "--allowed-mcp-server-names",
+                "studio",
+            ]);
+            if higgsfield.is_some() {
+                command.arg("higgsfield");
+            }
+            command.arg("--skip-trust");
+        }
+        _ => unreachable!(),
+    }
     Ok(command)
 }
 
@@ -1004,17 +1010,18 @@ fn search_paths_from(path: Option<std::ffi::OsString>, home: &Path) -> Vec<PathB
         .map(|relative| home.join(relative)),
     );
     // nvm keeps one folder per Node version; prefer the newest.
-    let mut node: Vec<(semver::Version, PathBuf)> = std::fs::read_dir(home.join(".nvm/versions/node"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            Some((
-                parse_version(&entry.file_name().to_string_lossy())?,
-                entry.path().join("bin"),
-            ))
-        })
-        .collect();
+    let mut node: Vec<(semver::Version, PathBuf)> =
+        std::fs::read_dir(home.join(".nvm/versions/node"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                Some((
+                    parse_version(&entry.file_name().to_string_lossy())?,
+                    entry.path().join("bin"),
+                ))
+            })
+            .collect();
     node.sort_by(|a, b| b.0.cmp(&a.0));
     paths.extend(node.into_iter().map(|(_, path)| path));
     paths.extend(
@@ -1131,10 +1138,16 @@ fn parse_version(value: &str) -> Option<semver::Version> {
 fn memory_condition(text: &str, project: &str) -> String {
     let mut parts = Vec::new();
     if !text.is_empty() {
-        parts.push(format!("n.studio_note.body CONTAINS '{}'", escape_ngql(text)));
+        parts.push(format!(
+            "n.studio_note.body CONTAINS '{}'",
+            escape_ngql(text)
+        ));
     }
     if !project.is_empty() {
-        parts.push(format!("n.studio_note.project_id == '{}'", escape_ngql(project)));
+        parts.push(format!(
+            "n.studio_note.project_id == '{}'",
+            escape_ngql(project)
+        ));
     }
     if parts.is_empty() {
         String::new()
@@ -1661,10 +1674,7 @@ async fn install_engine(
     let manifest = serde_json::to_vec_pretty(&json!({"tag":tag,"target":target,"sha256":format!("{:x}",Sha256::digest(binary_bytes)),"source":url,"installedAt":now_ms()})).unwrap();
     #[cfg(target_os = "macos")]
     {
-        let label = db
-            .label
-            .clone()
-            .unwrap_or_else(|| DATABASE_LABEL.into());
+        let label = db.label.clone().unwrap_or_else(|| DATABASE_LABEL.into());
         let plist_path = prepare_launch_agent(db, &label)?;
         let domain = format!("gui/{}", user_id().await?);
         let service = format!("{domain}/{label}");
@@ -1868,7 +1878,10 @@ mod tests {
             url: "http://127.0.0.1:1".into(),
             token: "ui".into(),
         };
-        (Runtime::new(root.clone(), connection, editor).unwrap(), root)
+        (
+            Runtime::new(root.clone(), connection, editor).unwrap(),
+            root,
+        )
     }
     #[cfg(unix)]
     fn pid_file() -> PathBuf {
@@ -1925,7 +1938,11 @@ mod tests {
         command.args(["-c", script]);
         command
     }
-    async fn start_script(runtime: &Runtime, root: &Path, script: &str) -> (String, String, PathBuf) {
+    async fn start_script(
+        runtime: &Runtime,
+        root: &Path,
+        script: &str,
+    ) -> (String, String, PathBuf) {
         let id = Uuid::new_v4().to_string();
         let work = root.join("agent-workspaces").join(&id);
         std::fs::create_dir_all(&work).unwrap();
@@ -1947,7 +1964,10 @@ mod tests {
     }
     async fn finished(runtime: &Runtime, id: &str) -> Value {
         for _ in 0..200 {
-            let job = runtime.dispatch("agent.status", json!({"id":id})).await.unwrap();
+            let job = runtime
+                .dispatch("agent.status", json!({"id":id}))
+                .await
+                .unwrap();
             if !matches!(job["state"].as_str(), Some("running" | "cancelling")) {
                 return job;
             }
@@ -1964,7 +1984,10 @@ mod tests {
             start_script(&runtime, &root, "echo 'Please log in' >&2; sleep 30").await;
         assert_eq!(runtime.agent_project(&token).as_deref(), Some("project-a"));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let cancelling = runtime.dispatch("agent.cancel", json!({"id":id})).await.unwrap();
+        let cancelling = runtime
+            .dispatch("agent.cancel", json!({"id":id}))
+            .await
+            .unwrap();
         assert_eq!(cancelling["state"], "cancelling");
         let job = finished(&runtime, &id).await;
         assert_eq!(job["state"], "cancelled");
@@ -1974,7 +1997,10 @@ mod tests {
         assert!(!work.exists());
         assert!(runtime.children.0.lock().unwrap().is_empty());
         // Cancelling again is a no-op on a finished job.
-        let again = runtime.dispatch("agent.cancel", json!({"id":id})).await.unwrap();
+        let again = runtime
+            .dispatch("agent.cancel", json!({"id":id}))
+            .await
+            .unwrap();
         assert_eq!(again["state"], "cancelled");
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2003,7 +2029,8 @@ mod tests {
         assert_eq!(job["authRequired"], true);
         assert!(job["error"].as_str().unwrap().contains("로그인"));
 
-        let (crashed, ..) = start_script(&runtime, &root, "echo '자막에 please log in 문구' ; exit 3").await;
+        let (crashed, ..) =
+            start_script(&runtime, &root, "echo '자막에 please log in 문구' ; exit 3").await;
         let job = finished(&runtime, &crashed).await;
         assert_eq!(job["state"], "failed");
         assert!(job["authRequired"].is_null());
@@ -2025,12 +2052,21 @@ mod tests {
     #[test]
     fn auth_hints_ignore_model_output() {
         assert!(auth_hint("stderr", "Error: Not logged in"));
-        assert!(auth_hint("stdout", r#"{"type":"error","message":"Authentication required"}"#));
+        assert!(auth_hint(
+            "stdout",
+            r#"{"type":"error","message":"Authentication required"}"#
+        ));
         assert!(!auth_hint("stdout", "Please log in"));
-        assert!(!auth_hint("stdout", r#"{"type":"assistant","text":"please log in"}"#));
+        assert!(!auth_hint(
+            "stdout",
+            r#"{"type":"assistant","text":"please log in"}"#
+        ));
         assert!(!auth_hint("stderr", "warning: slow network"));
         assert_eq!(agent_result(Exit::Success, true).0, "completed");
-        assert_eq!(agent_result(Exit::Cancelled, true), ("cancelled", None, false));
+        assert_eq!(
+            agent_result(Exit::Cancelled, true),
+            ("cancelled", None, false)
+        );
         assert!(!agent_result(Exit::Timeout, true).2);
         assert!(agent_result(Exit::Failed(Some(1)), true).2);
         assert!(!agent_result(Exit::Failed(Some(1)), false).2);
@@ -2039,12 +2075,18 @@ mod tests {
     async fn agent_start_binds_to_the_open_project_and_selected_clip() {
         let (runtime, root) = runtime_fixture();
         let stale = runtime
-            .dispatch("agent.start", json!({"provider":"claude","prompt":"자르기","projectId":"other"}))
+            .dispatch(
+                "agent.start",
+                json!({"provider":"claude","prompt":"자르기","projectId":"other"}),
+            )
             .await
             .unwrap_err();
         assert!(stale.contains("프로젝트가 변경"), "{stale}");
         let missing = runtime
-            .dispatch("agent.start", json!({"provider":"claude","prompt":"자르기","clipId":"nope"}))
+            .dispatch(
+                "agent.start",
+                json!({"provider":"claude","prompt":"자르기","clipId":"nope"}),
+            )
             .await
             .unwrap_err();
         assert!(missing.contains("클립"), "{missing}");
@@ -2054,8 +2096,17 @@ mod tests {
         assert_eq!(clip_context(&project, None).unwrap(), "");
         assert_eq!(clip_context(&project, Some("")).unwrap(), "");
         let selection = clip_context(&project, Some("c1")).unwrap();
-        let instructions = agent_instructions(&project, &root.join("exports"), &selection, false, "이 클립 줄여줘");
-        assert!(instructions.contains(r#"clip "c1" selected (track "v1", start 2.5s, duration 4.0s)"#), "{instructions}");
+        let instructions = agent_instructions(
+            &project,
+            &root.join("exports"),
+            &selection,
+            false,
+            "이 클립 줄여줘",
+        );
+        assert!(
+            instructions.contains(r#"clip "c1" selected (track "v1", start 2.5s, duration 4.0s)"#),
+            "{instructions}"
+        );
         assert!(instructions.contains("(revision 4)"));
         assert!(instructions.ends_with("User request:\n이 클립 줄여줘"));
         std::fs::remove_dir_all(&root).unwrap();
@@ -2069,7 +2120,10 @@ mod tests {
             std::fs::write(root.join(folder).join("connection.json"), "token").unwrap();
         }
         let editor = Arc::new(Mutex::new(Editor::new(root.clone()).unwrap()));
-        let connection = Connection { url: "http://127.0.0.1:1".into(), token: "ui".into() };
+        let connection = Connection {
+            url: "http://127.0.0.1:1".into(),
+            token: "ui".into(),
+        };
         let runtime = Runtime::new(root.clone(), connection, editor).unwrap();
         assert!(!root.join("agent-workspaces").exists());
         assert!(!root.join("downloads").exists());
@@ -2086,9 +2140,25 @@ mod tests {
         removed.sort();
         assert_eq!(removed, ["job-0", "job-1", "job-2", "job-3", "job-4"]);
         let mut jobs: HashMap<String, Job> = (0..FINISHED_JOB_LIMIT as u64 + 2)
-            .map(|at| (format!("done-{at}"), Job { value: json!({"finishedAt":at + 1}), cancel: None, auth_hint: false }))
+            .map(|at| {
+                (
+                    format!("done-{at}"),
+                    Job {
+                        value: json!({"finishedAt":at + 1}),
+                        cancel: None,
+                        auth_hint: false,
+                    },
+                )
+            })
             .collect();
-        jobs.insert("running".into(), Job { value: json!({"state":"running"}), cancel: None, auth_hint: false });
+        jobs.insert(
+            "running".into(),
+            Job {
+                value: json!({"state":"running"}),
+                cancel: None,
+                auth_hint: false,
+            },
+        );
         prune_jobs(&mut jobs);
         assert_eq!(jobs.len(), FINISHED_JOB_LIMIT + 1);
         assert!(jobs.contains_key("running") && !jobs.contains_key("done-0"));
@@ -2097,15 +2167,35 @@ mod tests {
     fn agent_allowlist_matches_the_editor_contract() {
         let methods = agent_methods();
         for method in [
-            "project.get", "project.save", "project.notice", "media.relink", "edit.trackDelete",
-            "edit.trackMove", "edit.markerUpdate", "edit.markerDelete", "edit.paste", "edit.batch",
-            "export.start", "captions.export", "preview.frame", "memory.record", "speech.transcribe",
+            "project.get",
+            "project.save",
+            "project.notice",
+            "media.relink",
+            "edit.trackDelete",
+            "edit.trackMove",
+            "edit.markerUpdate",
+            "edit.markerDelete",
+            "edit.paste",
+            "edit.batch",
+            "export.start",
+            "captions.export",
+            "preview.frame",
+            "memory.record",
+            "speech.transcribe",
         ] {
             assert!(methods.contains(method), "{method}");
         }
         for method in [
-            "project.delete", "project.open", "project.new", "project.demo", "project.duplicate",
-            "project.rename", "agent.start", "agent.list", "runtime.install", "runtime.mcpSave",
+            "project.delete",
+            "project.open",
+            "project.new",
+            "project.demo",
+            "project.duplicate",
+            "project.rename",
+            "agent.start",
+            "agent.list",
+            "runtime.install",
+            "runtime.mcpSave",
         ] {
             assert!(!methods.contains(method), "{method}");
         }
@@ -2114,21 +2204,33 @@ mod tests {
     fn tool_search_covers_finder_launches() {
         let home = std::env::temp_dir().join(format!("studio-home-{}", Uuid::new_v4()));
         for version in ["v18.20.4", "v22.3.0", "v9.11.2", "not-a-version"] {
-            std::fs::create_dir_all(home.join(".nvm/versions/node").join(version).join("bin")).unwrap();
+            std::fs::create_dir_all(home.join(".nvm/versions/node").join(version).join("bin"))
+                .unwrap();
         }
         let paths = search_paths_from(Some("/usr/bin:/custom/bin:/usr/bin".into()), &home);
-        let position = |path: PathBuf| paths.iter().position(|p| *p == path).unwrap_or_else(|| panic!("{path:?}"));
+        let position = |path: PathBuf| {
+            paths
+                .iter()
+                .position(|p| *p == path)
+                .unwrap_or_else(|| panic!("{path:?}"))
+        };
         assert_eq!(position("/usr/bin".into()), 0, "the user's PATH wins");
-        assert_eq!(paths.iter().filter(|p| p.as_os_str() == "/usr/bin").count(), 1);
+        assert_eq!(
+            paths.iter().filter(|p| p.as_os_str() == "/usr/bin").count(),
+            1
+        );
         for path in ["/custom/bin", "/opt/homebrew/bin", "/usr/local/bin"] {
             position(path.into());
         }
         for path in [".local/bin", ".volta/bin"] {
             position(home.join(path));
         }
-        let node = |version: &str| position(home.join(".nvm/versions/node").join(version).join("bin"));
+        let node =
+            |version: &str| position(home.join(".nvm/versions/node").join(version).join("bin"));
         assert!(node("v22.3.0") < node("v18.20.4") && node("v18.20.4") < node("v9.11.2"));
-        assert!(!paths.iter().any(|p| p.to_string_lossy().contains("not-a-version")));
+        assert!(!paths
+            .iter()
+            .any(|p| p.to_string_lossy().contains("not-a-version")));
         // A Finder launch has no shell PATH at all.
         assert!(search_paths_from(None, &home).contains(&PathBuf::from("/opt/homebrew/bin")));
         std::fs::remove_dir_all(&home).unwrap();
@@ -2137,10 +2239,20 @@ mod tests {
     fn release_checksums_are_read_strictly() {
         let digest = "a".repeat(64);
         let name = "byoridb-v1.0.0-aarch64-apple-darwin.tar.gz";
-        assert_eq!(checksum_from(&format!("{digest}\n"), name), Some(digest.clone()));
-        let sums = format!("{}  other.tar.gz\n{}  *{name}\n", "b".repeat(64), digest.to_uppercase());
+        assert_eq!(
+            checksum_from(&format!("{digest}\n"), name),
+            Some(digest.clone())
+        );
+        let sums = format!(
+            "{}  other.tar.gz\n{}  *{name}\n",
+            "b".repeat(64),
+            digest.to_uppercase()
+        );
         assert_eq!(checksum_from(&sums, name), Some(digest.clone()));
-        assert_eq!(checksum_from(&format!("{}  other.tar.gz\n", "b".repeat(64)), name), None);
+        assert_eq!(
+            checksum_from(&format!("{}  other.tar.gz\n", "b".repeat(64)), name),
+            None
+        );
         assert_eq!(checksum_from("not a checksum", name), None);
         assert_eq!(sha256_hex("abc"), None);
     }
@@ -2149,32 +2261,72 @@ mod tests {
         let name = "byoridb-v1.0.0-aarch64-apple-darwin.tar.gz";
         let asset = json!({"name":name,"browser_download_url":"https://github.com/byoridb/byoridb/releases/download/v1.0.0/x"});
         let release = json!({"assets":[asset.clone()]});
-        let error = release_checksum(&release, &asset, name, "v1.0.0").await.unwrap_err();
+        let error = release_checksum(&release, &asset, name, "v1.0.0")
+            .await
+            .unwrap_err();
         assert!(error.contains("체크섬"), "{error}");
         let digest = "c".repeat(64);
         let with_digest = json!({"name":name,"digest":format!("sha256:{digest}")});
-        assert_eq!(release_checksum(&release, &with_digest, name, "v1.0.0").await.unwrap(), digest);
+        assert_eq!(
+            release_checksum(&release, &with_digest, name, "v1.0.0")
+                .await
+                .unwrap(),
+            digest
+        );
         // A checksum file hosted anywhere but the official release is ignored.
         let foreign = json!({"assets":[asset.clone(),{"name":"SHA256SUMS","browser_download_url":"https://example.com/SHA256SUMS"}]});
-        assert!(release_checksum(&foreign, &asset, name, "v1.0.0").await.is_err());
+        assert!(release_checksum(&foreign, &asset, name, "v1.0.0")
+            .await
+            .is_err());
     }
     #[test]
     fn gemini_is_limited_to_studio_mcp_tools() {
         let settings = gemini_settings(&json!({"studio":{"command":"python3"}}));
         assert_eq!(settings["mcp"]["allowed"], json!(["studio"]));
         let excluded = settings["tools"]["exclude"].as_array().unwrap();
-        for tool in ["run_shell_command", "write_file", "replace", "read_file", "read_many_files", "list_directory", "glob", "grep_search", "web_fetch", "google_web_search", "save_memory"] {
+        for tool in [
+            "run_shell_command",
+            "write_file",
+            "replace",
+            "read_file",
+            "read_many_files",
+            "list_directory",
+            "glob",
+            "grep_search",
+            "web_fetch",
+            "google_web_search",
+            "save_memory",
+        ] {
             assert!(excluded.contains(&json!(tool)), "{tool}");
         }
         let work = std::env::temp_dir().join(format!("studio-gemini-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&work).unwrap();
-        let command = agent_command("gemini", Path::new("gemini"), Path::new("python3"), Path::new("studio-mcp.py"), &work.join("connection.json"), &work, None).unwrap();
-        let args: Vec<String> = command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("{flag}"));
+        let command = agent_command(
+            "gemini",
+            Path::new("gemini"),
+            Path::new("python3"),
+            Path::new("studio-mcp.py"),
+            &work.join("connection.json"),
+            &work,
+            None,
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag}"))
+        };
         assert_eq!(args[at("--extensions") + 1], "none");
         assert_eq!(args[at("--allowed-mcp-server-names") + 1], "studio");
         assert!(!args.iter().any(|a| a == "--approval-mode" || a == "--yolo"));
-        let written: Value = serde_json::from_slice(&std::fs::read(work.join(".gemini/settings.json")).unwrap()).unwrap();
+        let written: Value =
+            serde_json::from_slice(&std::fs::read(work.join(".gemini/settings.json")).unwrap())
+                .unwrap();
         assert_eq!(written["tools"], settings["tools"]);
         assert_eq!(written["mcp"], settings["mcp"]);
         assert_eq!(written["mcpServers"]["studio"]["command"], "python3");

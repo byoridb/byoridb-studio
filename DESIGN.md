@@ -55,7 +55,6 @@ typography:
 rounded:
   badge: "3px"
   control: "4px"
-  inset: "5px"
   panel: "6px"
   dialog: "8px"
 spacing:
@@ -182,6 +181,8 @@ The type ramp is deliberately shallow. Modal titles are the strongest reusable t
 - **Label:** panel headers, field labels, actions and ordinary explanatory copy; longer explanations use line heights around 1.7–1.85 as implemented.
 - **Supporting:** filenames, help and secondary details. It is not the default for reading paragraphs.
 
+The steps are the CSS variables `--fs-title` 17, `--fs-body` 13, `--fs-panel` 12, `--fs-label` 11 and `--fs-supporting` 10 (`src/styles/index.css`); nothing is smaller than 10px. Radii are `--radius-badge` 3, `--radius-control` 4, `--radius-panel` 6 and `--radius-dialog` 8. Text is one of `--text`, `--muted` or `--disabled`. Sliders share one style: a 2px track and a 12px thumb.
+
 ### Named Rules
 
 **The Stable Readout Rule.** Timecodes and numeric metadata use tabular numerals so changing values do not disturb alignment.
@@ -190,11 +191,11 @@ The type ramp is deliberately shallow. Modal titles are the strongest reusable t
 
 The application fills its window. The desktop shell has a minimum width of 920px and minimum height of 580px; its top bar is 54px and status bar is 23px. The workspace uses 6px gutters. Its upper region contains the library, flexible player and inspector; the default columns are `minmax(282px, 28%) minmax(250px, 1fr) 278px`.
 
-The timeline spans the editing surface below the upper panels. It begins at 300px high and has an 8px resize separator. Pointer dragging and keyboard arrows adjust it, with a 200px minimum and space reserved for a 240px upper workspace. The desktop reference shows video, audio and text tracks together. Track labels remain sticky while the content scrolls; the ruler stays visible while moving vertically.
+The timeline spans the editing surface below the upper panels. It begins at 300px high and has an 8px resize separator. Pointer dragging and keyboard arrows adjust it, with a 200px minimum and space reserved for a 240px upper workspace. At that height two video tracks, an audio track and a text track fit below the 38px toolbar and 28px ruler. Track labels remain sticky while the content scrolls; the ruler stays visible while moving vertically.
 
-The assistant is 320px wide. Above 1500px window width it occupies a neighboring column; at or below that breakpoint it overlays the right side of the editing workspace. At 1200px and below, the inspector narrows to 252px, the library uses a 29% column and the player controls wrap with the timecode above transport buttons. The 700px height breakpoint compresses selected controls. No mobile layout is implemented.
+The assistant is 320px wide and is always a column beside the editing surface: opening it narrows the editor and never covers it. Panel defaults follow the width of the editing surface (container queries), not the window: when the surface is narrow the inspector is 252px, the library uses a 29% column and the player controls wrap with the timecode above the transport buttons; below 820px of editing surface the inspector column is hidden. The 700px height breakpoint compresses selected controls. No mobile layout is implemented.
 
-Spacing is a compact working rhythm, not a strict mathematical scale. Small gaps group icons and labels; larger insets separate sections. The media library uses a two-column grid and an independent scroll area. Library tabs keep their size and scroll horizontally with visible overflow arrow controls when needed.
+Spacing is a compact working rhythm, not a strict mathematical scale. Small gaps group icons and labels; larger insets separate sections. The media library uses a three-column grid (two when the panel is narrow) and an independent scroll area. The eight library tabs share the panel width equally; there are no overflow arrows and no category rail, only type chips on the media tab.
 
 ## Elevation & Depth
 
@@ -224,7 +225,7 @@ Photographic thumbnails crop within their library tile. The composition and expo
 
 Compact, direct controls keep the work in view. Primary and secondary dialog actions share padding, a 32px minimum height and 11px labels; primary actions use weight 600. The top-right export action has its own compact height and the root cyan accent. Icon buttons use SVG symbols with tooltips or accessible labels.
 
-Hover changes fill, text or border over 120ms. Generic buttons use `control-hover`; primary actions lighten their teal. Disabled controls reduce opacity and use a not-allowed cursor. Keyboard focus uses a 2px cyan outline, normally offset by 3px; library and inspector controls use a 2px offset.
+Hover changes fill, text or border over 120ms. Generic buttons use `control-hover`; primary actions lighten their teal. Disabled icon and ghost buttons reduce opacity; a disabled filled button becomes a flat grey (`control-bg`, `disabled` text, `control-border`) at full opacity. Both use a not-allowed cursor. Keyboard focus uses a 2px cyan outline, normally offset by 3px; library and inspector controls use a 2px offset.
 
 ### Chips
 
@@ -234,7 +235,7 @@ Context chips identify the selected clip in the assistant composer with a subdue
 
 Media tiles present an image or audio illustration, a type icon, duration when relevant, a lower-right add action and a filename below. Thumbnails use an aspect ratio of 1.55 and a cyan border on hover. The grid remains content-first; it does not wrap every tile in an additional elevated card.
 
-Settings, export and recent-project dialogs share a bordered charcoal container, rounded corners, separated header/footer regions and a constrained scrolling body. Export pairs a real rendered composite with its output settings. Its preview respects the project aspect ratio and shows a loading or failure message when the frame is unavailable.
+Settings, export and recent-project dialogs share a bordered charcoal container, rounded corners, separated header/footer regions and a constrained scrolling body. Export is one 560px column: a small real rendered composite on top, then paired output settings. Its preview respects the project aspect ratio and shows a loading or failure message when the frame is unavailable.
 
 ### Inputs / Fields
 
@@ -242,13 +243,13 @@ Graphite fields use a one-pixel border and the common control radius. Focus chan
 
 ### Navigation
 
-Library categories pair SVG icons with short Korean labels. Active tabs use cyan text; inspector and assistant tabs also use a thin bottom indicator. Library overflow remains reachable using arrow buttons. Selected sidebar categories use accent text. There is no mobile navigation variant.
+Library categories pair SVG icons with short Korean labels. Active tabs use cyan text; inspector and assistant tabs also use a thin bottom indicator. Tabs are `role=tab` with `aria-selected`. There is no mobile navigation variant.
 
 ### Timeline and Selection
 
-Track lanes use consistent label and content heights: 72px video/image, 62px audio and 54px text. Clips keep their media-type fill, compact label band and contextual trim handles. Video/image clips use 58px height with a 19px label band and 37px filmstrip. A pale outline makes primary selection distinct; multiple selections retain their own quieter outline. A fine vertical playhead crosses the ruler and lanes.
+Track lanes use consistent label and content heights: 66px video/image and 40px audio and text. Clips keep their media-type fill, compact label band and contextual trim handles (4px, 8px on hover). Video/image clips are 58px high, audio and text clips 32px with a one-line label. A clip that starts under the clip before it begins its label after the overlap. Track headers show only lock, visibility and mute; moving and deleting a track are in its context menu. A pale outline makes primary selection distinct; multiple selections retain their own quieter outline. A fine vertical playhead crosses the ruler and lanes.
 
-A compact second toolbar row exposes labeled Split, Trim Start and Trim End actions with shortcuts and contextual selection guidance. Selected clips show accent-colored handles at both ends; dragging shows the retained time range and duration. Handles support one-frame arrow-key edits and visible keyboard focus while global editor shortcuts continue to work.
+Split, Trim Start and Trim End sit in the single timeline toolbar as icon buttons; why one is unavailable is in its tooltip, and shortcuts are listed in one popover. Selected clips show accent-colored handles at both ends; dragging shows the retained time range and duration. Handles support one-frame arrow-key edits and visible keyboard focus while global editor shortcuts continue to work.
 
 The player selection overlay sits above the rendered composite, with a fine pale-cyan boundary, a movable interior and four square corner handles. Both pointer and keyboard operations are supported. The visible bounds, inspector values and selected timeline clip refer to the same selection.
 
@@ -262,7 +263,7 @@ Motion is functional: short state transitions, smooth tab scrolling and one-seco
 
 Filters and effects place a compact “내 필터/내 효과” section before the built-in preset grids, with import, save-name input and reusable preset rows so adding assets is immediately discoverable. Text exposes “내 글꼴” and a font picker action in the inspector. The controls use the established 10–13px type steps, graphite inputs and cyan interaction language. Editable font samples, video text preset colors, HSL/RGB swatches and chroma-key colors represent media content; scoped detector exceptions keep those values separate from the Studio interface palette. Fixture-only values are likewise excluded narrowly.
 
-The player mode control distinguishes immediate “빠른 재생” from exact “정밀 재생”. Approximate local feedback is labeled; exact frames replace it after rendering settles. Slider drafts, typed text and filter hover update the canvas without accumulating undo entries. Imported partial presets deep-merge consistently with committed edits.
+Playback is immediate by default; a header toggle (“정밀 재생”) switches to exact playback. Approximate local feedback is labeled; exact frames replace it after rendering settles. Slider drafts, typed text and filter hover update the canvas without accumulating undo entries. Imported partial presets deep-merge consistently with committed edits.
 
 Higgsfield connection controls live within the existing settings dialog. Added, disabled, checking, connected and failed states are visible. The UI states the current read-only tool boundary and keeps OAuth login separate from generation claims.
 

@@ -65,6 +65,11 @@ export function assetUrl(id: string, variant: boolean | "proxy" = false): string
   const suffix = variant === "proxy" ? "/proxy" : variant ? "/thumbnail" : "";
   return `${connection.url}/assets/${encodeURIComponent(id)}${suffix}?token=${encodeURIComponent(connection.token)}`;
 }
+/** The cover of a stored project (open or not); `mediaId` is `thumbnail.mediaId` from project.list. */
+export function projectThumbnailUrl(projectId: string, mediaId: string): string {
+  if (!connection) return "";
+  return `${connection.url}/projects/${encodeURIComponent(projectId)}/thumbnail?media=${encodeURIComponent(mediaId)}&token=${encodeURIComponent(connection.token)}`;
+}
 export async function uploadFile(
   file: File,
   projectId: string,

@@ -1,4 +1,4 @@
-import { junctionTransitionCommands } from "./clipEditing";
+import { maxTransitionDuration } from "./clipEditing";
 import { animatedValue } from "./fastPreview";
 import type {
   BlendMode,
@@ -97,26 +97,12 @@ export function overlapWithPrevious(project: Project, clip: Clip): number {
   const overlap = previous.start + previous.duration - clip.start;
   return overlap > 1 / Math.max(1, project.fps) / 2 ? overlap : 0;
 }
-const withClipPatch = (
-  commands: EditCommand[],
-  clip: Clip,
-  patch: Patch,
-): EditCommand[] => {
-  const own = commands.find((c) => c.params.id === clip.id);
-  if (!own)
-    return [{ method: "edit.update", params: { id: clip.id, patch } }, ...commands];
-  return commands.map((c) =>
-    c === own
-      ? { ...c, params: { ...c.params, patch: { ...(c.params.patch as Patch), ...patch } } }
-      : c,
-  );
-};
-
 /**
- * Sets, changes or removes the transition between a clip and the one before it,
- * by the timeline's rule (clipEditing.junctionTransitionCommands): the overlap
- * always equals the transition length, a whole number of frames and at most half
- * of the shorter clip. Audio clips only fade.
+ * Sets, changes or removes the transition between a clip and the one before it.
+ * The overlap always equals the transition length: a whole number of frames and
+ * at most half of the shorter clip (the timeline's rule, maxTransitionDuration).
+ * The clip and everything after it on the track move as one `edit.shift`, so the
+ * batch stays two commands however long the track is. Audio clips only fade.
  */
 export function incomingTransitionCommands(
   project: Project,
@@ -125,21 +111,41 @@ export function incomingTransitionCommands(
 ): EditCommand[] {
   const before = previousClip(project, clip);
   if (!before) return [];
-  const commands = junctionTransitionCommands(
-    project,
-    { before, after: clip },
-    transition && {
-      type: clip.kind === "audio" ? "fade" : transition.type,
-      duration: transition.duration,
-    },
-  );
-  const own = commands.find((c) => c.params.id === clip.id);
-  const set = (own?.params.patch as Patch | undefined)?.transitionIn as
-    | Transition
-    | null
-    | undefined;
-  if (!transition) return withClipPatch(commands, clip, { transitionIn: null, fadeIn: 0 });
-  return set ? withClipPatch(commands, clip, { fadeIn: set.duration }) : commands;
+  const frame = 1 / Math.max(1, project.fps);
+  // Whole frames, as the editor rounds the shift to whole frames too.
+  const frames = transition
+    ? Math.max(
+        1,
+        Math.min(
+          Math.floor(maxTransitionDuration({ before, after: clip }) / frame + 1e-6),
+          Math.round(transition.duration / frame),
+        ),
+      )
+    : 0;
+  const duration = frames * frame;
+  const overlap = Math.max(0, before.start + before.duration - clip.start);
+  const delta = overlap - duration;
+  const commands: EditCommand[] = [];
+  // The editor refuses a shift that rounds to no frames.
+  if (Math.abs(delta) >= frame / 2)
+    commands.push({
+      method: "edit.shift",
+      params: { trackId: clip.trackId, from: clip.start, delta },
+    });
+  const next: Transition | null = transition
+    ? { type: clip.kind === "audio" ? "fade" : transition.type, duration }
+    : null;
+  const current = clip.transitionIn ?? null;
+  const changed =
+    (current?.type ?? null) !== (next?.type ?? null) ||
+    Math.abs((current?.duration ?? 0) - duration) > epsilon ||
+    Math.abs(clip.fadeIn - duration) > epsilon;
+  if (changed)
+    commands.push({
+      method: "edit.update",
+      params: { id: clip.id, patch: { transitionIn: next, fadeIn: duration } },
+    });
+  return commands;
 }
 
 /**
@@ -167,7 +173,12 @@ export function separateTransitionCommands(
   extra: Patch = {},
 ): EditCommand[] {
   if (!overlapWithPrevious(project, clip)) return [];
-  return withClipPatch(incomingTransitionCommands(project, clip, null), clip, extra);
+  const commands = incomingTransitionCommands(project, clip, null);
+  const patch = { transitionIn: null, fadeIn: 0, ...extra };
+  const own = commands.find((c) => c.method === "edit.update");
+  if (own) own.params.patch = patch;
+  else commands.push({ method: "edit.update", params: { id: clip.id, patch } });
+  return commands;
 }
 
 export interface KeyframeProperty {
@@ -428,6 +439,41 @@ export function activeAnimationPreset(
             ),
           ),
       ) ?? null
+  );
+}
+
+/** A slow scale over the whole clip, written as two ordinary scale keyframes. */
+export interface MotionPreset {
+  id: string;
+  name: string;
+  start: number;
+  end: number;
+}
+export const motionPresets: MotionPreset[] = [
+  { id: "pushIn", name: "천천히 확대", start: 1, end: 1.08 },
+  { id: "pullOut", name: "천천히 축소", start: 1.08, end: 1 },
+  { id: "closeUp", name: "가까이", start: 1, end: 1.2 },
+];
+const isScale = (k: Keyframe) => canonicalProperty(k.property) === "transform.scale";
+/** Replaces the clip's scale keyframes with the preset's; `null` removes them. */
+export function motionPresetKeyframes(clip: Clip, preset: MotionPreset | null): Keyframe[] {
+  const kept = (clip.keyframes || []).filter((k) => !isScale(k));
+  if (!preset) return kept;
+  return sorted([
+    ...kept,
+    { property: "transform.scale", time: 0, value: preset.start },
+    { property: "transform.scale", time: clip.duration, value: preset.end },
+  ]);
+}
+export function activeMotionPreset(clip: Clip): MotionPreset | null {
+  const frames = (clip.keyframes || []).filter(isScale).sort((a, b) => a.time - b.time);
+  if (frames.length !== 2) return null;
+  const [first, last] = frames;
+  if (Math.abs(first.time) > epsilon || Math.abs(last.time - clip.duration) > epsilon) return null;
+  return (
+    motionPresets.find(
+      (p) => Math.abs(p.start - first.value) < 1e-4 && Math.abs(p.end - last.value) < 1e-4,
+    ) ?? null
   );
 }
 

@@ -5,8 +5,11 @@ import {
   activeAnimationPreset,
   animationPresetKeyframes,
   animationPresets,
+  activeMotionPreset,
   incomingTransitionCommands,
   joinTransitionCommands,
+  motionPresetKeyframes,
+  motionPresets,
   overlapWithPrevious,
   separateTransitionCommands,
   stickers,
@@ -50,14 +53,27 @@ describe("transitions", () => {
     });
   });
 
-  it("joins only touching clips and leaves other tracks alone", () => {
+  const shift = (delta: number, from = 4) => ({
+    method: "edit.shift",
+    params: { trackId: "v", from, delta },
+  });
+  const update = (patch: Record<string, unknown>) => ({
+    method: "edit.update",
+    params: { id: "b", patch },
+  });
+  const close = (commands: { method: string; params: Record<string, unknown> }[]) =>
+    JSON.parse(JSON.stringify(commands, (_key, value) =>
+      typeof value === "number" ? Number(value.toFixed(6)) : value));
+
+  it("joins only touching clips with one ripple shift, whatever follows on the track", () => {
     const a = { ...clip, id: "a", start: 0 };
     const other = { ...clip, id: "o", trackId: "v2", start: 6 };
-    const after = { ...clip, id: "c", start: 8 };
-    const commands = joinTransitionCommands(project([a, clip, other, after]), clip, "wipeLeft", 1);
-    expect(commands.map((c) => [c.params.id, (c.params.patch as Clip).start])).toEqual([
-      ["b", 3],
-      ["c", 7],
+    const later = Array.from({ length: 600 }, (_, i) => ({ ...clip, id: `c${i}`, start: 8 + i * 4 }));
+    const commands = joinTransitionCommands(project([a, clip, other, ...later]), clip, "wipeLeft", 1);
+    // The editor moves the clip and everything after it on the track: no per-clip updates.
+    expect(commands).toEqual([
+      shift(-1),
+      update({ transitionIn: { type: "wipeLeft", duration: 1 }, fadeIn: 1 }),
     ]);
     const gap = { ...clip, start: 5 };
     expect(joinTransitionCommands(project([a, gap]), gap, "fade", 1)).toEqual([]);
@@ -66,33 +82,31 @@ describe("transitions", () => {
 
   it("limits the overlap to half of the shorter clip and undoes it exactly", () => {
     const a = { ...clip, id: "a", start: 3, duration: 1 };
-    const [first] = joinTransitionCommands(project([a, clip]), clip, "dissolve", 3);
-    expect(first.params.patch).toMatchObject({ start: 3.5, fadeIn: 0.5 });
-    const joined = { ...clip, start: 3.5, fadeIn: 0.5 };
-    const after = { ...clip, id: "c", start: 7.5 };
-    const value = project([a, joined, after]);
+    expect(close(joinTransitionCommands(project([a, clip]), clip, "dissolve", 3))).toEqual([
+      shift(-0.5),
+      update({ transitionIn: { type: "dissolve", duration: 0.5 }, fadeIn: 0.5 }),
+    ]);
+    const joined = {
+      ...clip,
+      start: 3.5,
+      fadeIn: 0.5,
+      transitionIn: { type: "dissolve" as const, duration: 0.5 },
+    };
+    const value = project([a, joined, { ...clip, id: "c", start: 7.5 }]);
     expect(overlapWithPrevious(value, joined)).toBeCloseTo(0.5);
-    // The later clip moves first so the track never collides while moving back.
-    expect(
-      separateTransitionCommands(value, joined).map((c) => [
-        c.params.id,
-        (c.params.patch as Clip).start,
-      ]),
-    ).toEqual([
-      ["b", 4],
-      ["c", 8],
+    expect(close(separateTransitionCommands(value, joined))).toEqual([
+      shift(0.5, 3.5),
+      update({ transitionIn: null, fadeIn: 0 }),
     ]);
   });
 
   it("uses a fade for audio clips whatever type was asked for", () => {
     const a = { ...clip, id: "a", start: 0, kind: "audio" as const };
     const audio = { ...clip, kind: "audio" as const };
-    const [first] = joinTransitionCommands(project([a, audio]), audio, "dissolve", 0.5);
-    expect(first.params.patch).toEqual({
-      start: 3.5,
-      transitionIn: { type: "fade", duration: 0.5 },
-      fadeIn: 0.5,
-    });
+    expect(close(joinTransitionCommands(project([a, audio]), audio, "dissolve", 0.5))).toEqual([
+      shift(-0.5),
+      update({ transitionIn: { type: "fade", duration: 0.5 }, fadeIn: 0.5 }),
+    ]);
   });
 
   it("keeps the overlap equal to the transition when a joined clip's length or type changes", () => {
@@ -103,48 +117,57 @@ describe("transitions", () => {
       fadeIn: 0.5,
       transitionIn: { type: "dissolve" as const, duration: 0.5 },
     };
-    const after = { ...clip, id: "c", start: 7.5 };
-    const value = project([a, joined, after]);
+    const value = project([a, joined, { ...clip, id: "c", start: 7.5 }]);
     expect(
-      incomingTransitionCommands(value, joined, { type: "wipeLeft", duration: 2 }),
+      close(incomingTransitionCommands(value, joined, { type: "wipeLeft", duration: 2 })),
     ).toEqual([
-      {
-        method: "edit.update",
-        params: {
-          id: "b",
-          patch: { start: 2, transitionIn: { type: "wipeLeft", duration: 2 }, fadeIn: 2 },
-        },
-      },
-      { method: "edit.update", params: { id: "c", patch: { start: 6 } } },
+      shift(-1.5, 3.5),
+      update({ transitionIn: { type: "wipeLeft", duration: 2 }, fadeIn: 2 }),
     ]);
     // A type change alone moves nothing.
     expect(
-      incomingTransitionCommands(value, joined, { type: "zoom", duration: 0.5 }),
-    ).toEqual([
-      {
-        method: "edit.update",
-        params: { id: "b", patch: { transitionIn: { type: "zoom", duration: 0.5 }, fadeIn: 0.5 } },
-      },
-    ]);
-    // The section reset also clears the out transition.
+      close(incomingTransitionCommands(value, joined, { type: "zoom", duration: 0.5 })),
+    ).toEqual([update({ transitionIn: { type: "zoom", duration: 0.5 }, fadeIn: 0.5 })]);
+    // Nothing changes: no command, so no empty undo step.
     expect(
-      separateTransitionCommands(value, joined, { transitionOut: null, fadeOut: 0 })[0].params
-        .patch,
-    ).toEqual({ start: 4, transitionIn: null, fadeIn: 0, transitionOut: null, fadeOut: 0 });
+      incomingTransitionCommands(value, joined, { type: "dissolve", duration: 0.5 }),
+    ).toEqual([]);
+    // A caller's reset can clear the out transition in the same update.
+    expect(
+      close(separateTransitionCommands(value, joined, { transitionOut: null, fadeOut: 0 })),
+    ).toEqual([
+      shift(0.5, 3.5),
+      update({ transitionIn: null, fadeIn: 0, transitionOut: null, fadeOut: 0 }),
+    ]);
   });
 
-  it("follows the timeline's rule: whole frames, at most half of the shorter clip", () => {
+  it("uses whole frames, at most half of the shorter clip", () => {
     const a = { ...clip, id: "a", start: 0 };
-    // 0.12s clip: the overlap is half of it (0.06s), not a 0.1s floor.
+    // 0.12s clip at 24fps: half of it is 1.44 frames, so the overlap is one frame.
     const short = { ...clip, duration: 0.12 };
     const film = { ...project([a, short]), fps: 24 } as Project;
-    const [tiny] = joinTransitionCommands(film, short, "dissolve", 0.5);
-    expect((tiny.params.patch as Clip).transitionIn!.duration).toBeCloseTo(0.06);
-    // 0.5s is 12 frames at 24fps and 11.988 at 23.976: rounded to 12 frames there.
+    const tiny = joinTransitionCommands(film, short, "dissolve", 0.5);
+    expect(tiny[0].params.delta).toBeCloseTo(-1 / 24);
+    expect((tiny[1].params.patch as Clip).transitionIn!.duration).toBeCloseTo(1 / 24);
+    // 0.5s is 11.988 frames at 23.976fps: rounded to 12 frames.
     const ntsc = { ...project([a, clip]), fps: 23.976 } as Project;
-    const [first] = joinTransitionCommands(ntsc, clip, "dissolve", 0.5);
-    expect((first.params.patch as Clip).transitionIn!.duration).toBeCloseTo(12 / 23.976);
-    expect((first.params.patch as Clip).start).toBeCloseTo(4 - 12 / 23.976);
+    const [moved, patched] = joinTransitionCommands(ntsc, clip, "dissolve", 0.5);
+    expect(moved.params.delta).toBeCloseTo(-12 / 23.976);
+    expect((patched.params.patch as Clip).transitionIn!.duration).toBeCloseTo(12 / 23.976);
+  });
+
+  it("applies and recognises the slow scale motions without touching other keyframes", () => {
+    const fade = { property: "transform.opacity", time: 0, value: 0 };
+    const base = { ...clip, keyframes: [fade, { property: "scale", time: 1, value: 2 }] };
+    const frames = motionPresetKeyframes(base, motionPresets[0]);
+    expect(frames).toEqual([
+      fade,
+      { property: "transform.scale", time: 0, value: 1 },
+      { property: "transform.scale", time: 4, value: 1.08 },
+    ]);
+    expect(activeMotionPreset({ ...base, keyframes: frames })?.id).toBe("pushIn");
+    expect(activeMotionPreset(base)).toBeNull();
+    expect(motionPresetKeyframes({ ...base, keyframes: frames }, null)).toEqual([fade]);
   });
 });
 

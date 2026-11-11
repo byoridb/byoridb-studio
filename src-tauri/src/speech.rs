@@ -529,11 +529,22 @@ mod tests {
         let pid_file = std::env::temp_dir().join(format!("studio-speech-{}", Uuid::new_v4()));
         let mut command = Command::new("/bin/sh");
         // The tool exits at once but leaves a helper behind.
-        command.args(["-c", &format!("sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'", pid_file.display())]);
-        run(command, &jobs, "id", rx, &ProcessGroups::default()).await.unwrap();
+        command.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'",
+                pid_file.display()
+            ),
+        ]);
+        run(command, &jobs, "id", rx, &ProcessGroups::default())
+            .await
+            .unwrap();
         let helper = std::fs::read_to_string(&pid_file).unwrap();
         std::fs::remove_file(&pid_file).unwrap();
-        assert!(crate::runtime::exits_soon(helper.trim()).await, "helper survived");
+        assert!(
+            crate::runtime::exits_soon(helper.trim()).await,
+            "helper survived"
+        );
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -558,9 +569,15 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         tx.send(true).unwrap();
         let jobs = Arc::new(Mutex::new(HashMap::new()));
-        assert!(run(Command::new("does-not-exist"), &jobs, "id", rx, &ProcessGroups::default())
-            .await
-            .unwrap_err()
-            .contains("취소"));
+        assert!(run(
+            Command::new("does-not-exist"),
+            &jobs,
+            "id",
+            rx,
+            &ProcessGroups::default()
+        )
+        .await
+        .unwrap_err()
+        .contains("취소"));
     }
 }

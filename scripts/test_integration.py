@@ -320,6 +320,9 @@ class IntegrationTests(unittest.TestCase):
         stored = Path(asset['path'])
         self.assertEqual(stored.parent, (s.home / 'imports').resolve())
         self.assertEqual(source.read_bytes(), stored.read_bytes())
+        # The library shows the name the file came with, not the stored `<uuid>-name`.
+        self.assertEqual(asset['name'], 'upload.mp4')
+        self.assertNotEqual(stored.name, 'upload.mp4')
         token = s.connection['token']
         status, headers, part = s.request(f"/assets/{asset['id']}?token={token}", token=False, headers={'Range': 'bytes=0-99'})
         self.assertEqual((status, len(part)), (206, 100))
@@ -366,6 +369,144 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([f.name for f in (s.home / 'proxies').iterdir() if 'partial' in f.name], [])
         s.start()
         self.assertFalse(proxy.exists())
+
+    def frame_pixel(self, path, x, y):
+        """The RGB of one pixel of a picture or of a video's first frame."""
+        raw = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-frames:v', '1', '-vf', f'format=rgb24,crop=1:1:{x}:{y}',
+                                       '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'])
+        return tuple(raw[:3])
+
+    def test_transition_reaches_the_preview_frame_and_the_export(self):
+        s = self.service
+        source = self.media / 'wipe.mp4'
+        make_video(source, seconds=2)
+        project = s.rpc('project.new', {'name': '전환', 'width': 640, 'height': 360})
+        project = s.rpc('project.update', {'patch': {'background': '#0000ff'}, 'expectedRevision': project['revision']})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        clip = next(c for c in project['clips'] if c['kind'] == 'video')
+        project = s.rpc('edit.update', {'id': clip['id'], 'expectedRevision': project['revision'],
+                                        'patch': {'transitionIn': {'type': 'wipeRight', 'duration': 1.0}}})
+        self.assertEqual(next(c for c in project['clips'] if c['id'] == clip['id'])['transitionIn'],
+                         {'type': 'wipeRight', 'duration': 1.0})
+        self.assertIn('REVISION_CONFLICT', s.error('edit.update', {
+            'id': clip['id'], 'patch': {'transitionIn': None}, 'expectedRevision': project['revision'] - 1}))
+
+        # Half way through the wipe the left half shows the clip, the right half the
+        # blue background. The frame is narrower than the project: like the export it
+        # is composed at the project size, then resized.
+        def blue(pixel):
+            return pixel[2] > 180 and pixel[0] < 70 and pixel[1] < 70
+        frame = s.rpc('preview.frame', {'time': 0.5, 'width': 320, 'expectedRevision': project['revision']})
+        self.assertEqual((frame['width'], frame['height'], frame['revision']), (320, 180, project['revision']))
+        self.assertFalse(blue(self.frame_pixel(frame['path'], 60, 90)), 'the revealed part shows the clip')
+        self.assertTrue(blue(self.frame_pixel(frame['path'], 260, 90)), 'the part not yet revealed shows the background')
+        status, headers, image = s.request(f"/assets/{frame['assetId']}")
+        self.assertEqual((status, image[:4]), (200, b'\x89PNG'))
+        later = s.rpc('preview.frame', {'time': 1.5, 'width': 320})
+        self.assertFalse(blue(self.frame_pixel(later['path'], 260, 90)), 'after the wipe the clip fills the frame')
+
+        output = s.home / 'exports' / 'wipe.mp4'
+        self.export(s, {'path': str(output), 'format': 'mp4', 'start': 0.5, 'end': 1.0, 'hardware': False})
+        self.assertFalse(blue(self.frame_pixel(output, 120, 180)))
+        self.assertTrue(blue(self.frame_pixel(output, 520, 180)))
+
+    def test_freeze_inserts_a_still_that_is_one_undo_and_exports(self):
+        s = self.service
+        source = self.media / 'freeze.mp4'
+        make_video(source, seconds=2)
+        untouched = source.read_bytes()
+        project = s.rpc('project.new', {'name': '정지 프레임'})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        clip = next(c for c in project['clips'] if c['kind'] == 'video')
+        before = project['revision']
+        self.assertIn('REVISION_CONFLICT', s.error('edit.freeze', {'id': clip['id'], 'time': 1.0, 'expectedRevision': before - 1}))
+        frozen = s.rpc('edit.freeze', {'id': clip['id'], 'time': 1.0, 'duration': 0.5, 'expectedRevision': before})
+        self.assertEqual(frozen['revision'], before + 1)
+        track = sorted((c for c in frozen['clips'] if c['trackId'] == clip['trackId']), key=lambda c: c['start'])
+        self.assertEqual([c['kind'] for c in track], ['video', 'image', 'video'])
+        self.assertEqual([round(c['start'], 3) for c in track], [0, 1.0, 1.5])
+        self.assertEqual([round(c['duration'], 3) for c in track], [1.0, 0.5, 1.0])
+        still = next(m for m in frozen['media'] if m['id'] == track[1]['mediaId'])
+        picture = Path(still['path'])
+        self.assertEqual(picture.parent, (s.home / 'projects' / f"{frozen['id']}-assets" / 'frames').resolve())
+        self.assertEqual(picture.read_bytes()[:4], b'\x89PNG')
+        self.assertEqual(source.read_bytes(), untouched, 'the source is only read')
+
+        # The still holds the frame at the cut for its whole length.
+        first = s.rpc('preview.frame', {'time': 1.05, 'width': 320})
+        last = s.rpc('preview.frame', {'time': 1.45, 'width': 320})
+        self.assertEqual(self.frame_pixel(first['path'], 160, 90), self.frame_pixel(last['path'], 160, 90))
+        output = s.home / 'exports' / 'freeze.mp4'
+        self.export(s, {'path': str(output), 'format': 'mp4', 'width': 320, 'height': 180, 'hardware': False})
+        self.assertTrue(2.4 <= duration_of(output) <= 2.7, duration_of(output))
+
+        undone = s.rpc('history.undo')
+        self.assertEqual([c['id'] for c in undone['clips'] if c['kind'] == 'video'], [clip['id']])
+        self.assertEqual([m['kind'] for m in undone['media']], ['video'], 'the split and the still are one undo step')
+        self.assertEqual(s.rpc('history.redo')['clips'], frozen['clips'])
+
+    def test_storage_report_and_cleanup_leave_user_media_and_agents_out(self):
+        s = self.service
+        source = self.media / 'stored.mp4'
+        make_video(source, seconds=1)
+        project = s.rpc('project.new', {'name': '저장 공간'})
+        status, _, body = s.request(f"/upload?name=stored.mp4&projectId={project['id']}", source.read_bytes())
+        self.assertEqual(status, 200, body)
+        uploaded = Path(json.loads(body)['result']['media'][0]['path'])
+        frame_project = s.rpc('edit.add', {'text': {'content': '저장 공간'}, 'start': 0, 'duration': 1})
+        frame = s.rpc('preview.frame', {'time': 0.5, 'width': 320, 'expectedRevision': frame_project['revision']})
+        for folder in ('proxies', 'renders', 'previews', 'speech/job'):
+            (s.home / folder).mkdir(parents=True, exist_ok=True)
+        orphans = [s.home / 'proxies/media-gone.mp4', s.home / 'proxies/media-gone.source',
+                   s.home / 'previews/preview-left.png', s.home / 'renders/export-left']
+        for path in orphans[:3]:
+            path.write_bytes(b'x' * 1000)
+        orphans[3].mkdir()
+        (orphans[3] / 'filters.ffgraph').write_bytes(b'x' * 1000)
+        voice = s.home / 'speech/job/voice.aiff'
+        voice.write_bytes(b'x' * 500)
+
+        usage = s.rpc('storage.usage')
+        self.assertEqual(set(usage['folders']), {'proxies', 'imports', 'speech', 'renders', 'previews'})
+        self.assertEqual(usage['folders']['imports']['bytes'], uploaded.stat().st_size)
+        self.assertEqual(usage['folders']['speech'], {'files': 1, 'bytes': 500, 'cleanable': False})
+        self.assertEqual(usage['reclaimableBytes'], 4000)
+        self.assertEqual(usage['bytes'], sum(folder['bytes'] for folder in usage['folders'].values()))
+        self.assertTrue(all(path.exists() for path in orphans))
+
+        cleaned = s.rpc('storage.clean')
+        self.assertEqual(cleaned['removedBytes'], 4000)
+        self.assertFalse(any(path.exists() for path in orphans))
+        self.assertTrue(uploaded.is_file() and voice.is_file() and Path(frame['path']).is_file())
+        self.assertEqual(s.rpc('storage.usage')['reclaimableBytes'], 0)
+        # Not part of the agent tools, so no agent token can reach them.
+        tools = json.loads((REPO / 'scripts/studio-tools.json').read_text())
+        allowed = {method for tool in tools['tools'] for method in tool.get('methods', [])}
+        self.assertFalse({'storage.usage', 'storage.clean'} & allowed)
+        self.assertEqual(s.call('storage.clean', token='wrong')[0], 401)
+
+    def test_cover_of_a_project_that_is_not_open_is_served(self):
+        s = self.service
+        source = self.media / 'cover.mp4'
+        make_video(source, seconds=1)
+        project = s.rpc('project.new', {'name': '표지'})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        other = s.rpc('project.new', {'name': '다른 프로젝트'})
+        listed = {p['id']: p for p in s.rpc('project.list')}
+        cover = listed[project['id']]['thumbnail']
+        self.assertEqual(cover['mediaId'], project['media'][0]['id'])
+        self.assertNotIn('thumbnail', listed[other['id']])
+        token = s.connection['token']
+        path = f"/projects/{project['id']}/thumbnail"
+        for url in (f"{path}?media={cover['mediaId']}", path):
+            status, headers, image = s.request(url)
+            self.assertEqual((status, headers['Content-Type'], image[:2]), (200, 'image/jpeg', b'\xff\xd8'), url)
+        self.assertEqual(s.request(f"{path}?media={cover['mediaId']}&token={token}", token=False)[0], 200)
+        self.assertEqual(s.request(path, token=False)[0], 401)
+        self.assertEqual(s.request(path, headers={'Origin': 'https://example.com'})[0], 401)
+        self.assertEqual(s.request(f"{path}?media=media-unknown")[0], 404)
+        self.assertEqual(s.request(f"/projects/{other['id']}/thumbnail")[0], 404)
+        self.assertEqual(s.request('/projects/project-unknown/thumbnail')[0], 404)
 
     def test_agent_token_is_scoped_to_the_allowlist_and_revoked_after_the_job(self):
         # A stand-in CLI: it gets exactly what a real agent gets (its working folder

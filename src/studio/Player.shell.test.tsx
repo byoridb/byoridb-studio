@@ -167,25 +167,31 @@ describe("player controls", () => {
     expect(stage.style.width).toBe("640px");
     await act(async () => {});
   });
-  it("marks a loop range at the playhead and toggles whole-project repeat", async () => {
-    const onLoop = vi.fn();
+  it("repeats the selection or the whole project from one button, and switches precise playback with a toggle", async () => {
+    const onLoop = vi.fn(), onPreviewMode = vi.fn();
     const project = fixture([clip("a", 0, { duration: 10 })]);
-    const { rerender, props } = mount(project, { time: 4, onLoop });
-    fireEvent.click(screen.getByRole("button", { name: "반복 시작점 지정" }));
-    expect(onLoop).toHaveBeenLastCalledWith({ start: 4, end: 10 });
-    rerender(<Player {...props} time={6} loop={{ start: 4, end: 10 }} />);
-    fireEvent.click(screen.getByRole("button", { name: "반복 끝점 지정" }));
-    expect(onLoop).toHaveBeenLastCalledWith({ start: 4, end: 6 });
-    // An end before the start restarts the range from the beginning.
-    rerender(<Player {...props} time={2} loop={{ start: 4, end: 6 }} />);
-    fireEvent.click(screen.getByRole("button", { name: "반복 끝점 지정" }));
-    expect(onLoop).toHaveBeenLastCalledWith({ start: 0, end: 2 });
-    expect(screen.getByRole("button", { name: "구간 반복" })).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(screen.getByRole("button", { name: "구간 반복" }));
-    expect(onLoop).toHaveBeenLastCalledWith(null);
-    rerender(<Player {...props} time={2} loop={null} />);
-    fireEvent.click(screen.getByRole("button", { name: "구간 반복" }));
+    const { rerender, props, container } = mount(project, { time: 4, onLoop, onPreviewMode });
+    // One repeat control: no separate start/end buttons and no ratio chip beside it.
+    expect(screen.queryByRole("button", { name: /반복 (시작점|끝점)/ })).toBeNull();
+    expect(container.querySelector(".ratio-label")).toBeNull();
+    const repeat = () => screen.getByRole("button", { name: "구간 반복" });
+    fireEvent.click(repeat());
     expect(onLoop).toHaveBeenLastCalledWith({ start: 0, end: 10 });
+    rerender(<Player {...props} time={4} loop={{ start: 0, end: 10 }} />);
+    expect(repeat()).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(repeat());
+    expect(onLoop).toHaveBeenLastCalledWith(null);
+    // With a selection the button repeats just that range.
+    rerender(<Player {...props} time={4} loop={null} loopTarget={{ start: 2, end: 6 }} />);
+    fireEvent.click(repeat());
+    expect(onLoop).toHaveBeenLastCalledWith({ start: 2, end: 6 });
+    const precise = screen.getByRole("button", { name: "정밀 재생" });
+    expect(precise).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(precise);
+    expect(onPreviewMode).toHaveBeenLastCalledWith("precise");
+    rerender(<Player {...props} time={4} previewMode="precise" />);
+    fireEvent.click(screen.getByRole("button", { name: "정밀 재생" }));
+    expect(onPreviewMode).toHaveBeenLastCalledWith("fast");
     await act(async () => {});
   });
   it("fits the frame to the screen in fullscreen, so text scales with it", async () => {

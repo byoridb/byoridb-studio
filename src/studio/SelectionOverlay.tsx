@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, type CSSProperties } from "react";
 import type { Clip, Command } from "./types";
 import { canvasTransformPatch } from "./clipEditing";
 import "./selection-overlay.css";
@@ -13,6 +13,8 @@ export type LiveTransform = {
 };
 type Mode = "move" | "scale" | "rotate";
 const SNAP_PIXELS = 6;
+/** Screen pixels from the box's top edge to the centre of the rotation handle. */
+const ROTATE_REACH = 20;
 const normalizeAngle = (angle: number) => ((((angle + 180) % 360) + 360) % 360) - 180;
 export default function SelectionOverlay({
   clip,
@@ -149,14 +151,26 @@ export default function SelectionOverlay({
         ),
       });
   };
+  // The rotation handle normally stands above the box. When that point falls
+  // outside the frame (a full-frame clip), it moves just inside the top edge.
+  const reach = (box.height / 2) * transform.scale + ROTATE_REACH;
+  const turn = (rotation * Math.PI) / 180;
+  const handle = stage && {
+    x: (stage.width / 2 + transform.x) * ratio + Math.sin(turn) * reach,
+    y: (stage.height / 2 + transform.y) * ratio - Math.cos(turn) * reach,
+  };
+  const rotateInside = !!handle && !!stage &&
+    (handle.x < 0 || handle.y < 0 || handle.x > stage.width * ratio || handle.y > stage.height * ratio);
   return (
     <div
-      className="selection-overlay"
+      className={`selection-overlay ${rotateInside ? "rotate-inside" : ""}`}
       style={{
         width: Math.max(2, box.width - 2),
         height: Math.max(2, box.height - 2),
         transform: `translate(-50%,-50%) translate(${transform.x * ratio}px,${transform.y * ratio}px) rotate(${rotation}deg) scale(${transform.scale})`,
-      }}
+        // Handles and the outline keep their screen size whatever the clip's scale.
+        "--inverse-scale": 1 / Math.max(0.01, transform.scale),
+      } as CSSProperties}
     >
       <button
         className="selection-move"

@@ -1,13 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AudioLines,
   Captions,
   Check,
-  CirclePlus,
-  ChevronLeft,
-  ChevronRight,
   Film,
-  Folder,
   Image,
   Import,
   LoaderCircle,
@@ -23,22 +19,22 @@ import {
   WandSparkles,
   X,
 } from "lucide-react";
+import { isTauri } from "@tauri-apps/api/core";
 import { assetUrl, pickFiles, savePath, uploadFile } from "./api";
 import {
   incomingTransitionCommands,
-  joinTransitionCommands,
   overlapWithPrevious,
   previousClip,
+  separateTransitionCommands,
   stickerUrl,
   stickers,
   textDefaults,
   textPresets,
-  transitionOf,
   transitionPatch,
   transitionsFor,
-  type Edge,
   type StickerAsset,
 } from "./clipPresets";
+import { errorText, type ErrorText } from "./errorText";
 import type { Clip, Command, Media, Project, TransitionType } from "./types";
 import SpeechPanel from "./SpeechPanel";
 import { FontLibrary, PresetLibrary } from "./CustomAssets";
@@ -111,12 +107,6 @@ const filters = [
     color: { brightness: 0.03, contrast: 0.9, saturation: 0.75, temperature: 0.3 },
   },
 ];
-const motionPresets = [
-  { name: "천천히 확대", label: "108%", start: 1, end: 1.08 },
-  { name: "천천히 축소", label: "100%", start: 1.08, end: 1 },
-  { name: "가까이", label: "120%", start: 1, end: 1.2 },
-  { name: "모션 초기화", label: "—", start: 1, end: 1 },
-];
 const maskPresets = [
   {
     name: "원형 프레임",
@@ -167,46 +157,17 @@ export function Library({
 }: LibraryProps) {
   const preview = usePreviewDraft();
   const [tab, setTab] = useState<Tab>("media");
-  const tabStrip = useRef<HTMLElement>(null);
-  const [tabOverflow, setTabOverflow] = useState({
-    overflow: false,
-    left: false,
-    right: false,
-  });
-  useEffect(() => {
-    const element = tabStrip.current;
-    if (!element) return;
-    const measure = () =>
-      setTabOverflow({
-        overflow: element.scrollWidth > element.clientWidth + 2,
-        left: element.scrollLeft > 2,
-        right:
-          element.scrollLeft + element.clientWidth < element.scrollWidth - 2,
-      });
-    const observer =
-      typeof ResizeObserver === "undefined"
-        ? null
-        : new ResizeObserver(measure);
-    observer?.observe(element);
-    window.addEventListener("resize", measure);
-    element.addEventListener("scroll", measure);
-    measure();
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener("resize", measure);
-      element.removeEventListener("scroll", measure);
-    };
-  }, []);
-  const scrollTabs = (direction: number) =>
-    tabStrip.current?.scrollBy({ left: direction * 160, behavior: "smooth" });
   const [search, setSearch] = useState("");
   const [mediaFilter, setMediaFilter] = useState("all");
   const [pending, setPending] = useState<string | null>(null);
-  const [error, setError] = useState("");
+  const [error, setFailure] = useState<ErrorText | null>(null);
+  /** Empty clears the error; `subject` names what an OS error was about. */
+  const setError = (value: unknown, subject?: string) =>
+    setFailure(value === "" ? null : errorText(value, subject));
   const [notice, setNotice] = useState("");
   const [captionPath, setCaptionPath] = useState("");
   const [brokenThumbs, setBrokenThumbs] = useState<string[]>([]);
-  const [edge, setEdge] = useState<Edge>("in");
+  const [menu, setMenu] = useState<{ media: Media; x: number; y: number } | null>(null);
   const [transitionLength, setTransitionLength] = useState(0.5);
   const query = search.trim().toLowerCase();
   const matches = (name: string) => name.toLowerCase().includes(query);
@@ -219,9 +180,7 @@ export function Library({
           ? filters.filter((p) => matches(p.name)).length
           : tab === "transitions"
             ? transitionsFor(selected).filter((p) => matches(p.name)).length
-            : [...motionPresets, ...maskPresets].filter((p) => matches(p.name))
-                .length;
-  const pathInput = useRef<HTMLInputElement>(null);
+            : maskPresets.filter((p) => matches(p.name)).length;
   const assets = useMemo(
     () =>
       project.media.filter(
@@ -264,11 +223,7 @@ export function Library({
       }
       return result;
     } catch (e) {
-      setError(
-        e instanceof Error
-          ? e.message
-          : "작업을 완료하지 못했습니다. 다시 시도해 주세요.",
-      );
+      setError(e, method.startsWith("captions.") ? "자막 파일" : undefined);
     } finally {
       setPending(null);
     }
@@ -322,7 +277,7 @@ export function Library({
           "브라우저에서는 CLI의 media.relink 명령으로 원본 경로를 다시 지정할 수 있습니다.",
         );
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     }
   };
   const addText = (label: string, style: Record<string, unknown> = {}) =>
@@ -379,32 +334,20 @@ export function Library({
       );
       if (clip) onSelect(clip.id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     } finally {
       setPending(null);
     }
   };
   const transitions = transitionsFor(selected);
-  const currentTransition = selected ? transitionOf(selected, edge) : null;
+  // The transition tab only joins a clip to the one before it; a clip's own
+  // entrance and exit are animations in the inspector.
+  const before = selected ? previousClip(project, selected) : null;
   const joined = selected ? overlapWithPrevious(project, selected) > 0 : false;
-  const canJoin =
-    !!selected && edge === "in" && !joined && !!previousClip(project, selected);
-  const applyTransition = (type: TransitionType | null) =>
-    selected &&
-    // A joined clip overlaps the previous one by exactly its in transition.
-    (edge === "in" && joined
-      ? batchSelected(
-          `transition-${type}`,
-          incomingTransitionCommands(
-            project,
-            selected,
-            type && { type, duration: transitionLength },
-          ),
-        )
-      : patchSelected(
-          `transition-${type}`,
-          transitionPatch(selected, edge, type, transitionLength),
-        ));
+  const currentTransition = joined ? (selected?.transitionIn ?? null) : null;
+  useEffect(() => {
+    if (currentTransition) setTransitionLength(currentTransition.duration);
+  }, [selected?.id, currentTransition?.duration]);
   const batchSelected = (
     key: string,
     commands: { method: string; params: Record<string, unknown> }[],
@@ -412,12 +355,37 @@ export function Library({
     commands.length
       ? run(key, "edit.batch", { commands, expectedRevision: project.revision })
       : undefined;
+  const applyTransition = (type: TransitionType | null, length = transitionLength) =>
+    selected &&
+    before &&
+    batchSelected(
+      `transition-${type}`,
+      type
+        ? incomingTransitionCommands(project, selected, { type, duration: length })
+        : separateTransitionCommands(project, selected),
+    );
   const previewTransition = (type: TransitionType | null) =>
     selected &&
+    before &&
     preview(
       selected.id,
-      type ? transitionPatch(selected, edge, type, transitionLength) : null,
+      type ? transitionPatch(selected, "in", type, transitionLength) : null,
     );
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
   const setCurrentTab = (value: Tab) => {
     setTab(value);
     setSearch("");
@@ -428,109 +396,23 @@ export function Library({
 
   return (
     <section className="studio-library" aria-label="소재 라이브러리">
-      <div className="library-tab-navigation">
-        {tabOverflow.overflow && (
+      <div className="library-tabs" role="tablist" aria-label="편집 소재">
+        {tabs.map(({ id, label, icon: Icon }) => (
           <button
-            className="library-tab-scroll"
-            title="이전 소재 탭 보기"
-            aria-label="이전 소재 탭 보기"
-            disabled={!tabOverflow.left}
-            onClick={() => scrollTabs(-1)}
+            key={id}
+            role="tab"
+            className={tab === id ? "active" : ""}
+            aria-selected={tab === id}
+            aria-label={label}
+            title={label}
+            onClick={() => setCurrentTab(id)}
           >
-            <ChevronLeft size={15} />
+            <Icon size={18} />
+            <span>{label}</span>
           </button>
-        )}
-        <nav ref={tabStrip} className="library-tabs" aria-label="편집 소재">
-          {tabs.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              className={tab === id ? "active" : ""}
-              onClick={() => setCurrentTab(id)}
-              aria-pressed={tab === id}
-              onFocus={(event) =>
-                event.currentTarget.scrollIntoView?.({
-                  block: "nearest",
-                  inline: "nearest",
-                })
-              }
-            >
-              <Icon size={19} />
-              <span>{label}</span>
-            </button>
-          ))}
-        </nav>
-        {tabOverflow.overflow && (
-          <button
-            className="library-tab-scroll"
-            title="다음 소재 탭 보기"
-            aria-label="다음 소재 탭 보기"
-            disabled={!tabOverflow.right}
-            onClick={() => scrollTabs(1)}
-          >
-            <ChevronRight size={15} />
-          </button>
-        )}
+        ))}
       </div>
       <div className="library-body">
-        <aside className="library-categories" aria-label="소재 분류">
-          <div className="category-heading">
-            {tab === "media"
-              ? "로컬"
-              : tab === "audio"
-                ? "내 오디오"
-                : tab === "text"
-                  ? "텍스트 추가"
-                  : tab === "captions"
-                    ? "자막 파일"
-                    : "기본"}
-          </div>
-          {(tab === "media" || tab === "audio") && (
-            <>
-              <button
-                className={mediaFilter === "all" ? "selected" : ""}
-                onClick={() => setMediaFilter("all")}
-              >
-                전체
-              </button>
-              {tab === "media" && (
-                <>
-                  <button
-                    className={mediaFilter === "video" ? "selected" : ""}
-                    onClick={() => setMediaFilter("video")}
-                  >
-                    동영상
-                  </button>
-                  <button
-                    className={mediaFilter === "image" ? "selected" : ""}
-                    onClick={() => setMediaFilter("image")}
-                  >
-                    이미지
-                  </button>
-                  <button
-                    className={mediaFilter === "audio" ? "selected" : ""}
-                    onClick={() => setMediaFilter("audio")}
-                  >
-                    오디오
-                  </button>
-                </>
-              )}
-            </>
-          )}
-          {tab === "filters" && (
-            <span className="category-label">컬러 프리셋</span>
-          )}
-          {tab === "transitions" && (
-            <span className="category-label">등장 · 퇴장</span>
-          )}
-          {tab === "effects" && <span className="category-label">모션</span>}
-          {tab === "stickers" && (
-            <span className="category-label">도형 · 기호</span>
-          )}
-          <div className="library-category-bottom">
-            <Folder size={14} />
-            <span>프로젝트 소재</span>
-          </div>
-        </aside>
         <div className="library-content">
           {tab !== "captions" && (
             <label className="panel-search">
@@ -557,6 +439,27 @@ export function Library({
                 </button>
                 <span className="asset-count">{assets.length}개</span>
               </div>
+              {tab === "media" && (
+                <div className="library-chips" role="group" aria-label="소재 종류">
+                  {(
+                    [
+                      ["all", "전체"],
+                      ["video", "동영상"],
+                      ["image", "이미지"],
+                      ["audio", "오디오"],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <button
+                      key={id}
+                      className={mediaFilter === id ? "active" : ""}
+                      aria-pressed={mediaFilter === id}
+                      onClick={() => setMediaFilter(id)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
               {audioToRecheck.length > 0 && <button
                 className="panel-action-button"
                 disabled={pending !== null}
@@ -572,6 +475,23 @@ export function Library({
                       className="media-tile"
                       key={media.id}
                       draggable={!media.missing}
+                      tabIndex={0}
+                      aria-label={media.name}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setMenu({ media, x: e.clientX, y: e.clientY });
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.target !== e.currentTarget) return;
+                        if (e.key === "Delete" || e.key === "Backspace") {
+                          e.preventDefault();
+                          removeMedia(media);
+                        } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+                          e.preventDefault();
+                          const box = e.currentTarget.getBoundingClientRect();
+                          setMenu({ media, x: box.left + 12, y: box.top + 12 });
+                        }
+                      }}
                       onDragStart={(e) => {
                         e.dataTransfer.setData(
                           "application/x-studio-media",
@@ -618,15 +538,6 @@ export function Library({
                             <TriangleAlert size={11} /> 원본 없음
                           </span>
                         )}
-                        <button
-                          className="remove-media"
-                          title="프로젝트에서 소재 삭제"
-                          aria-label={`${media.name} 소재 삭제`}
-                          disabled={pending !== null}
-                          onClick={() => removeMedia(media)}
-                        >
-                          <Trash2 size={13} />
-                        </button>
                         <span className="media-kind">
                           {media.kind === "video" ? (
                             <Film size={11} />
@@ -636,11 +547,11 @@ export function Library({
                             <Music2 size={11} />
                           )}
                         </span>
-                        <span className="media-duration">
-                          {media.kind === "image"
-                            ? "이미지"
-                            : durationLabel(media.duration)}
-                        </span>
+                        {media.kind !== "image" && (
+                          <span className="media-duration">
+                            {durationLabel(media.duration)}
+                          </span>
+                        )}
                         <button
                           className="add-media"
                           title="타임라인에 추가"
@@ -690,9 +601,9 @@ export function Library({
                   )}
                 </div>
               )}
-              {assets.length > 0 && (
+              {assets.length > 0 && !project.clips.length && (
                 <p className="panel-help">
-                  소재를 타임라인으로 드래그하거나 +를 눌러 추가하세요.
+                  소재를 타임라인으로 끌어 놓거나 +를 눌러 추가하세요.
                 </p>
               )}
               {tab === "audio" &&
@@ -781,10 +692,6 @@ export function Library({
                   </button>
                 ))}
               </div>
-              <p className="panel-help">
-                추가한 텍스트의 내용과 스타일은 오른쪽 패널에서 변경할 수
-                있습니다.
-              </p>
             </>
           )}
           {tab === "stickers" && (
@@ -810,11 +717,6 @@ export function Library({
                   </button>
                 ))}
               </div>
-              <p className="panel-help">
-                스티커는 이미지 소재로 프로젝트에 추가되어 재생 위치에
-                놓입니다. 크기와 위치는 미리보기 화면이나 속성 패널에서
-                조절하세요.
-              </p>
             </>
           )}
           {tab === "filters" && (
@@ -872,42 +774,23 @@ export function Library({
           {tab === "transitions" && (
             <>
               <h3 className="library-section-title">
-                전환 <span>{builtInMatches}</span>
+                클립 사이 전환 <span>{builtInMatches}</span>
               </h3>
-              {!selected && (
+              {!before && (
                 <p className="panel-hint">
-                  전환을 적용할 클립을 타임라인에서 선택하세요.
+                  {selected
+                    ? "앞 클립과 맞닿아 있는 클립을 선택하세요."
+                    : "전환을 넣을 뒤쪽 클립을 타임라인에서 선택하세요."}
                 </p>
               )}
               <div className="transition-controls">
-                <div className="segmented" role="group" aria-label="전환 위치">
-                  {(
-                    [
-                      ["in", "등장"],
-                      ["out", "퇴장"],
-                    ] as const
-                  ).map(([id, label]) => (
-                    <button
-                      key={id}
-                      className={edge === id ? "active" : ""}
-                      aria-pressed={edge === id}
-                      onClick={() => {
-                        setEdge(id);
-                        const existing = selected && transitionOf(selected, id);
-                        if (existing) setTransitionLength(existing.duration);
-                      }}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
                 <label>
                   길이
                   <input
                     aria-label="전환 길이"
                     type="number"
                     min={0.1}
-                    max={Math.max(0.1, selected?.duration ?? 10)}
+                    max={Math.max(0.1, (selected?.duration ?? 20) / 2)}
                     step={0.1}
                     value={transitionLength}
                     onChange={(e) =>
@@ -928,6 +811,16 @@ export function Library({
                   />
                   <small>초</small>
                 </label>
+                {joined && (
+                  <button
+                    className="panel-action-button"
+                    disabled={pending !== null}
+                    onClick={() => void applyTransition(null)}
+                  >
+                    <Trash2 size={13} />
+                    전환 제거
+                  </button>
+                )}
               </div>
               <div className="effect-preset-grid">
                 {transitions.map((item) => matches(item.name) && (
@@ -935,14 +828,14 @@ export function Library({
                     key={item.id}
                     className={currentTransition?.type === item.id ? "active" : ""}
                     aria-pressed={currentTransition?.type === item.id}
-                    disabled={!selected || pending !== null}
+                    disabled={!before || pending !== null}
                     onMouseEnter={() => previewTransition(item.id)}
                     onMouseLeave={() => previewTransition(null)}
                     onFocus={() => previewTransition(item.id)}
                     onBlur={() => previewTransition(null)}
                     onClick={() => void applyTransition(item.id)}
                   >
-                    <span className={`transition-art ${edge} ${item.id}`}>
+                    <span className={`transition-art in ${item.id}`}>
                       <i
                         style={
                           representative
@@ -960,90 +853,19 @@ export function Library({
                   </button>
                 ))}
               </div>
-              <button
-                className="panel-wide-button secondary"
-                disabled={!selected || !currentTransition || pending !== null}
-                onClick={() =>
-                  void applyTransition(null)
-                }
-              >
-                <Trash2 size={13} />
-                {edge === "in" ? "등장" : "퇴장"} 전환 제거
-              </button>
-              {canJoin && selected && (
-                <button
-                  className="panel-wide-button secondary"
-                  disabled={pending !== null}
-                  onClick={() =>
-                    void batchSelected(
-                      "transition-join",
-                      joinTransitionCommands(
-                        project,
-                        selected,
-                        currentTransition?.type ??
-                          (selected.kind === "audio" ? "fade" : "dissolve"),
-                        transitionLength,
-                      ),
-                    )
-                  }
-                >
-                  앞 클립과 겹쳐 전환
-                </button>
-              )}
-              <p className="panel-help">
-                {joined
-                  ? "이 클립은 앞 클립 위로 겹쳐 등장합니다. 전환을 제거하면 뒤 클립들이 원래 자리로 돌아갑니다."
-                  : "전환은 선택한 클립이 나타나고 사라지는 방식입니다. ‘앞 클립과 겹쳐 전환’은 이 클립과 뒤 클립들을 전환 길이만큼 앞으로 당깁니다."}
-              </p>
             </>
           )}
           {tab === "effects" && (
             <>
               <PresetLibrary kind="effect" project={project} selected={selected} onCommand={onCommand} query={query} />
-              <h3 className="library-section-title">모션 프리셋</h3>
-              <p className="panel-hint">
-                선택한 클립에 편집 가능한 키프레임을 추가합니다.
-              </p>
-              <div className="effect-preset-grid">
-                {motionPresets.map((effect) => matches(effect.name) && (
-                  <button
-                    key={effect.name}
-                    disabled={
-                      !selected || selected.kind === "audio" || pending !== null
-                    }
-                    onClick={() => {
-                      if (!selected) return;
-                      const untouched = selected.keyframes.filter(
-                        (k) => k.property !== "transform.scale",
-                      );
-                      void patchSelected(effect.name, {
-                        keyframes:
-                          effect.name === "모션 초기화"
-                            ? untouched
-                            : [
-                                ...untouched,
-                                {
-                                  property: "transform.scale",
-                                  time: 0,
-                                  value: effect.start,
-                                },
-                                {
-                                  property: "transform.scale",
-                                  time: selected.duration,
-                                  value: effect.end,
-                                },
-                              ],
-                      });
-                    }}
-                  >
-                    <span className="motion-art">{effect.label}</span>
-                    <small>{effect.name}</small>
-                  </button>
-                ))}
-              </div>
               <h3 className="library-section-title frames-title">
                 프레임 마스크
               </h3>
+              {(!selected || selected.kind === "audio") && (
+                <p className="panel-hint">
+                  마스크를 적용할 영상, 이미지 또는 텍스트를 선택하세요.
+                </p>
+              )}
               <div className="effect-preset-grid">
                 {maskPresets.map((effect) => matches(effect.name) && (
                   <button
@@ -1078,53 +900,55 @@ export function Library({
           {tab === "captions" && (
             <>
               <h3 className="library-section-title">자막 파일</h3>
-              <p className="panel-hint">
-                SRT 자막을 타임라인에 가져오고, 텍스트처럼 편집하세요.
-              </p>
               <div className="caption-drop">
-                <Captions size={32} />
+                <Captions size={28} />
                 <strong>SRT 자막 가져오기</strong>
-                <p>시간 정보와 자막 내용을 함께 가져옵니다.</p>
-                <button
-                  className="panel-action-button"
-                  disabled={pending !== null}
-                  onClick={async () => {
-                    try {
-                      const files = await pickFiles();
-                      if (files?.[0])
-                        await run("caption-import", "captions.import", {
-                          path: files[0],
+                {isTauri() ? (
+                  <button
+                    className="panel-action-button"
+                    disabled={pending !== null}
+                    onClick={async () => {
+                      try {
+                        const files = await pickFiles(["srt"]);
+                        if (files?.[0])
+                          await run("caption-import", "captions.import", {
+                            path: files[0],
+                          });
+                      } catch (e) {
+                        setError(e, "자막 파일");
+                      }
+                    }}
+                  >
+                    <Import size={14} />
+                    파일 선택
+                  </button>
+                ) : (
+                  // The browser build has no file dialog for local paths.
+                  <form
+                    className="caption-path"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (captionPath.trim())
+                        void run("caption-import", "captions.import", {
+                          path: captionPath.trim(),
                         });
-                      else pathInput.current?.focus();
-                    } catch (e) {
-                      setError(String(e));
-                    }
-                  }}
-                >
-                  <Import size={14} />
-                  파일 선택
-                </button>
+                    }}
+                  >
+                    <input
+                      aria-label="자막 파일 경로"
+                      value={captionPath}
+                      onChange={(e) => setCaptionPath(e.target.value)}
+                      placeholder="/Users/…/captions.srt"
+                    />
+                    <button
+                      className="panel-action-button"
+                      disabled={!captionPath.trim() || pending !== null}
+                    >
+                      자막 가져오기
+                    </button>
+                  </form>
+                )}
               </div>
-              <label className="caption-path-label">
-                자막 파일 경로
-                <input
-                  ref={pathInput}
-                  value={captionPath}
-                  onChange={(e) => setCaptionPath(e.target.value)}
-                  placeholder="/Users/…/captions.srt"
-                />
-              </label>
-              <button
-                className="panel-wide-button"
-                disabled={!captionPath.trim() || pending !== null}
-                onClick={() =>
-                  void run("caption-import", "captions.import", {
-                    path: captionPath.trim(),
-                  })
-                }
-              >
-                자막 가져오기
-              </button>
               <button
                 className="panel-wide-button secondary"
                 disabled={
@@ -1148,7 +972,7 @@ export function Library({
                       );
                     }
                   } catch (e) {
-                    setError(String(e));
+                    setError(e, "자막 파일");
                   }
                 }}
               >
@@ -1176,14 +1000,6 @@ export function Library({
               적용 중…
             </div>
           )}
-          {error && (
-            <div className="panel-inline-error" role="alert">
-              {error}
-              <button aria-label="오류 닫기" onClick={() => setError("")}>
-                <X size={13} />
-              </button>
-            </div>
-          )}
           {notice && (
             <p className="panel-notice" role="status">
               {notice}
@@ -1191,16 +1007,37 @@ export function Library({
           )}
         </div>
       </div>
-      <footer className="library-footer">
-        <CirclePlus size={13} />
-        <span>
-          {tab === "media" || tab === "audio"
-            ? "소재를 추가하고 이야기를 시작하세요"
-            : selected
-              ? `선택: ${selected.name}`
-              : "타임라인에서 클립을 선택하세요"}
-        </span>
-      </footer>
+      {/* Outside the scroll area so a failure is visible wherever the list is scrolled. */}
+      {error && (
+        <div className="panel-inline-error pinned" role="alert" title={error.detail}>
+          {error.message}
+          <button aria-label="오류 닫기" onClick={() => setError("")}>
+            <X size={13} />
+          </button>
+        </div>
+      )}
+      {menu && (
+        <div
+          className="library-menu"
+          role="menu"
+          aria-label={`${menu.media.name} 소재 메뉴`}
+          style={{ left: menu.x, top: menu.y }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <button
+            role="menuitem"
+            autoFocus
+            disabled={pending !== null}
+            onClick={() => {
+              removeMedia(menu.media);
+              setMenu(null);
+            }}
+          >
+            <Trash2 size={13} />
+            프로젝트에서 삭제
+          </button>
+        </div>
+      )}
     </section>
   );
 }

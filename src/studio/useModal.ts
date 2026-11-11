@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 const focusable =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -11,7 +11,9 @@ export function useModal<T extends HTMLElement>(
   const ref = useRef<T>(null);
   const state = useRef({ onClose, canClose });
   state.current = { onClose, canClose };
-  useEffect(() => {
+  // A layout effect: the keys work from the moment the dialog is on screen, not a
+  // task later (Escape pressed in between used to be lost).
+  useLayoutEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
     const previous = document.activeElement as HTMLElement | null;

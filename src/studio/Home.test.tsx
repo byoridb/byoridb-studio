@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import Home from "./Home";
+import Home, { relativeDate } from "./Home";
 import { rpc } from "./api";
 
-vi.mock("./api", () => ({ rpc: vi.fn() }));
+vi.mock("./api", () => ({
+  rpc: vi.fn(),
+  projectThumbnailUrl: (id: string, mediaId: string) => `http://service/projects/${id}/thumbnail?media=${mediaId}`,
+}));
 const list = [
   { id: "old", name: "오래된 편집", updatedAt: "2026-10-01T10:00:00Z" },
   { id: "new", name: "최신 편집", updatedAt: "2026-11-10T10:00:00Z" },
@@ -96,5 +99,44 @@ describe("home screen", () => {
     fireEvent.click(screen.getByRole("button", { name: "오래된 편집 복제" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("프로젝트를 찾을 수 없습니다.");
     expect(screen.getByText("오래된 편집")).toBeInTheDocument();
+  });
+  it("shows a project's first frame when the service has one and the icon otherwise", async () => {
+    vi.mocked(rpc).mockResolvedValue([{ ...list[0], thumbnail: { mediaId: "m1", path: "/private/thumb.jpg" } }, list[1]]);
+    mount();
+    const withCover = await screen.findByRole("button", { name: "오래된 편집 열기" });
+    const image = withCover.querySelector("img")!;
+    // The service route, never the local file path.
+    expect(image).toHaveAttribute("src", "http://service/projects/old/thumbnail?media=m1");
+    expect(screen.getByRole("button", { name: "최신 편집 열기" }).querySelector("img")).toBeNull();
+    expect(screen.getByRole("button", { name: "최신 편집 열기" }).querySelector("svg")).not.toBeNull();
+    // An unreadable thumbnail falls back to the icon.
+    fireEvent.error(image);
+    expect(withCover.querySelector("img")).toBeNull();
+    expect(withCover.querySelector("svg")).not.toBeNull();
+  });
+  it("leaves the untouched auto-created project out, so a first run shows the empty state", async () => {
+    vi.mocked(rpc).mockResolvedValue([list[1]]);
+    mount({ hiddenId: "new" });
+    expect(await screen.findByText(/저장된 프로젝트가 없습니다/)).toBeInTheDocument();
+    expect(screen.queryByText("최신 편집")).toBeNull();
+  });
+  it("leaves out closed projects that are empty and still unnamed, and keeps named empty ones", async () => {
+    vi.mocked(rpc).mockResolvedValue([
+      { id: "auto", name: "새 프로젝트", updatedAt: 3, empty: true },
+      { id: "named", name: "여름 브이로그", updatedAt: 2, empty: true },
+      { id: "worked", name: "새 프로젝트", updatedAt: 1 },
+    ]);
+    mount();
+    expect(await screen.findByText("여름 브이로그")).toBeInTheDocument();
+    // The section heading and the one project that has work in it.
+    expect(screen.getAllByText("새 프로젝트")).toHaveLength(2);
+  });
+  it("writes dates relative to today", () => {
+    const now = new Date(2026, 10, 12, 15, 0);
+    expect(relativeDate(new Date(2026, 10, 12, 2, 35).getTime(), now)).toBe("오늘 오전 2:35");
+    expect(relativeDate(new Date(2026, 10, 11, 21, 10).getTime(), now)).toBe("어제 오후 9:10");
+    expect(relativeDate(new Date(2026, 9, 1, 10, 0).getTime(), now)).toBe("10월 1일");
+    expect(relativeDate(new Date(2025, 11, 31, 10, 0).getTime(), now)).toBe("2025년 12월 31일");
+    expect(relativeDate("not a date", now)).toBe("");
   });
 });

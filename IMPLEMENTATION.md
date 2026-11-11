@@ -84,7 +84,7 @@ Clip {
   color: ColorAdjustment, keyframes: Keyframe[],
   text?: {content, fontSize, color, fontFamily, fontId?, fontPath?, bold, align, background},
   crop?, mask?, chromaKey?, audio?, stabilize?, groupId?,
-  filter?, transitionIn?, transitionOut?
+  filter?, transitionIn?, transitionOut?, blendMode?, sourceSpan?
 }
 ```
 
@@ -134,7 +134,7 @@ All Editor methods accept optional `expectedRevision` as described above. Mutati
 | Method | Parameters | Result / behavior |
 | --- | --- | --- |
 | `project.get` | `{ifProjectId?,ifRevision?}` | Project, or `{unchanged:true,id,revision,missing:string[]}` when both match and no `Media.missing` flag changed in this call; `missing` lists the ids of media whose file is absent |
-| `project.list` | `{}` | `[{id,name,updatedAt}]` |
+| `project.list` | `{}` | `[{id,name,updatedAt,thumbnail?:{mediaId,path},empty?:true}]`; see the third-phase contract |
 | `project.new` | `{name?,width?,height?,fps?}` | New Project; resets session undo history |
 | `project.open` | `{id? ,path?}` | Opens saved Project; resets undo history. A file whose id belongs to a different stored project gets a new id |
 | `project.save` | `{path?,overwrite?}` | `{path,project}`; agent tokens may not pass `path` |
@@ -145,7 +145,8 @@ All Editor methods accept optional `expectedRevision` as described above. Mutati
 | `media.reprobe` | `{ids:string[],expectedRevision?}` | Reprobes 1..100 distinct existing media IDs; repairs misclassified audio clips and returns Project in one undoable commit |
 | `media.relink` | `{id,path,expectedRevision?}` | Points an existing media ID at another file and refreshes its metadata in one undoable commit; rejects a file of a different kind or one already in the project |
 | `media.remove` | `{id}` | Rejects media still used by clips |
-| `edit.add` | `{mediaId?,trackId?,start?,duration?,text?,name?,transform?}` | Adds media or text; text may be string or text object; `name`/`transform` place an overlay already named and sized |
+| `edit.add` | `{mediaId?,trackId?,newTrack?,start?,duration?,text?,name?,transform?}` | Adds media or text; text may be string or text object; `name`/`transform` place an overlay already named and sized; `newTrack:"<name>"` (instead of `trackId`) makes a track of the clip's kind for it in the same undo step |
+| `edit.shift` | `{trackId,from,delta}` | Moves every clip of the track that starts at or after `from` by `delta` seconds (rounded to whole frames); refused when a start would go below 0, the track is locked or `delta` rounds to no frame. Usable inside `edit.batch` |
 | `edit.update` | `{id,patch}` | Deep-merges permitted clip fields; rejects locked target track |
 | `edit.delete` | `{ids:string[],ripple?:boolean}` | Deletes selected clips; ripple closes only the time the deleted clips occupied alone (time still covered by a surviving, overlapping clip stays) |
 | `edit.split` | `{id,time}` | `time` is absolute timeline time |
@@ -300,7 +301,7 @@ The earlier database-explorer UI (`src/components/` and its stylesheets) and `sr
 
 ## Second-phase contract
 
-Added on top of everything above. The editor validates and stores, `render.rs` outputs, the frontend edits and approximates in the fast preview; the names below are identical in `src/studio/types.ts`, `editor.rs` (`EASINGS`, `TRANSITIONS`, `BLEND_MODES`) and `render.rs`.
+Added on top of everything above; where the third-phase contract below differs (the limit on the sum of fades, the two-command transition batch), the third phase is current. The editor validates and stores, `render.rs` outputs, the frontend edits and approximates in the fast preview; the names below are identical in `src/studio/types.ts`, `editor.rs` (`EASINGS`, `TRANSITIONS`, `BLEND_MODES`) and `render.rs`.
 
 - `Keyframe.easing?: "linear"|"easeIn"|"easeOut"|"easeInOut"|"hold"` (absent = linear) applies from that keyframe to the next: t², 1-(1-t)², 3t²-2t³, or the value held until the next keyframe.
 - `Clip.transitionIn/Out: null | {type,duration}`, `type` one of `fade|dissolve|wipeLeft|wipeRight|wipeUp|wipeDown|slideLeft|slideRight|zoom` (audio clips: `fade` only). It is the clip's own entrance/exit with linear progress p (0 absent → 1 present). fade/dissolve: alpha p. wipe: a crop of the clip's own box whose edge travels in the named direction (entering reveals behind the edge, leaving hides behind it). slide: x offset `sign·(1-p)·max(0, (frame width + layer width)/2 − sign·x)`, where x is the layer's own x at that time (keyframes included) and sign is +1 towards the right edge, −1 towards the left, so at p=0 the layer lies just outside the edge wherever it rests; `slideLeft` enters from the right and leaves to the left. The fast preview uses the same expression, except that a text clip's width is taken as the frame width. zoom: scale 0.8+0.2p with alpha p. `fadeIn/fadeOut` always equal the transition duration and always drive the audio fade; the picture's alpha fades only for fade/dissolve/zoom, or for an old clip with `fadeIn/fadeOut` and no transition object. `edit.update` and `presets.apply` clamp each fade and transition to the clip's duration (a zero-length transition becomes `null`); the sum of the in and out lengths is not limited. A video clip reclassified as audio by `media.reprobe` keeps its transition lengths as `fade` and loses `blendMode`.
@@ -319,6 +320,28 @@ Frontend structure: the app opens on a home screen (new project by frame preset,
 
 Wipes and opacity keyframes rely on FFmpeg's `sendcmd` and filter commands; this was verified with FFmpeg 9.0.2 only. A clip is drawn on the frames whose time is at or after its start and before its end, with a 0.1 ms tolerance so that boundaries such as 7/30 s, which differ from the frame time in the last binary digit, land on the intended frame.
 
+## Third-phase contract
+
+Added on top of everything above.
+
+- **Frame grid.** New `start`, `duration`, trim and split positions (`edit.add/update/trim/split/freeze/paste/shift`) are rounded to the nearest frame of the project's fps, at least one frame long; the returned Project is authoritative. Where a start and a duration arrive together (`edit.add`, `edit.paste`, `edit.update` with both, imported captions) the start and the end are rounded separately and the duration is their difference, so clips that touched before rounding still touch. A negative start is refused, not rounded up to 0. `edit.update` with only `duration` rounds the length alone. `sourceIn`, fade lengths, keyframe and marker times are not rounded. Stored projects are not migrated: an off-grid clip stays where it is until it is edited, and changing the project fps does not move clips.
+- **Fades.** `fadeIn + fadeOut` (transitions included) never exceed the clip: each is first limited to the clip, then both are reduced in proportion so that they sum to its duration, and the transition durations follow. Applied by `edit.update`, `edit.trim`, `edit.split`, `edit.paste` and `presets.apply`; not by validation, so existing files open unchanged.
+- **Speed.** A speed change stores the stretch of source it keeps in `Clip.sourceSpan` (seconds) and derives the duration from it, so 1× → 1.7× → 1× returns the original length. The stored span is used only while it still explains the current duration: after a trim, split or duration change the clip's current length is the basis again. `edit.update {speed,duration}` whose duration equals current source span ÷ new speed is treated as the same speed change. `edit.paste` does not copy `sourceSpan`.
+- **`edit.shift` and groups.** Clips on other tracks that share a `groupId` with a moved clip move by the same delta (all of them when the whole group moves; otherwise only those at or after `from`). The command is refused when such a clip's track is locked or a start would go below 0. It does not check for overlaps, because the transition between clips overlaps on purpose. `edit.freeze` uses the same shift.
+- **Transition between clips.** One `edit.batch` of two commands however long the track is: `edit.update {transitionIn (+fadeIn)}` on the later clip and `edit.shift {trackId, from:<later clip start>, delta}`. Its length is a whole number of frames and at most half of the shorter clip, rounded down (`clipEditing.junctionTransitionCommands` for the timeline, `clipPresets.incomingTransitionCommands` for the Library and Inspector).
+- **Overlays from the Library.** Text and stickers go to the preferred track when it is free at the playhead, else to the topmost free track of the kind, else `edit.add` is sent with `newTrack` (`App.libraryCommand`, `clipEditing.overlayPlacement`). Hidden and locked tracks are never chosen by the UI. The core's own default for an `edit.add` without `trackId` is still the first unlocked track of the kind, hidden or not.
+- **`project.list`** items carry `thumbnail {mediaId,path}` when the earliest video/image clip's media has a thumbnail inside `<root>/thumbnails`, and `empty:true` when the project has no clips and no media. `GET /projects/<id>/thumbnail?media=<mediaId>` (`?token=` or Bearer; 404 without a cover) serves it for closed projects too; `path` is a local path and is not used by the browser UI. The home screen leaves out projects that are `empty` and still carry a default name.
+- **Uploads.** A file received on `/upload` is stored as `imports/<uuid>-<name>`; its `Media.name` is `<name>`.
+- **Storage.** `storage.usage {}` → `{folders:{proxies|imports|speech|renders|previews:{files,bytes,cleanable,reclaimableFiles?,reclaimableBytes?}},bytes,reclaimableBytes}`; `storage.clean {}` → the same shape with `removedFiles`/`removedBytes`. Only proxies no project mentions and preview/render scratch that no running render, cached frame or registered preview asset uses are removed; `imports` and `speech` are reported only. Not in `scripts/studio-tools.json`: agent tokens get 403.
+- **Preview frames** are composed at the project size and resized at the end, exactly as an export is; there is one code path (`render::render_frame`). Composing at the frame's own size was measured and removed: on 4K projects it saved 0–7% and at frame widths that do not divide the project evenly text could land up to a pixel off. A preview is current when the project matches apart from `Media.waveform`/`Media.proxy`, so a waveform arriving in the background does not make it `PREVIEW_STALE`.
+- **Waveforms** that cannot be saved are retried after 2, 4 and 8 s within the run (the decoded peaks are kept), then left until the next start.
+- **Errors in the UI.** `src/studio/errorText.ts` turns service and OS errors into one Korean sentence (the original text stays in a tooltip). The Library and Inspector show a failure in place, pinned below the panel's scroll area so it is visible at any scroll position, and their commands (`App.panelCommand`) raise no toast; every other failure is a toast with the same wording.
+- **Timeline details.** While a trim handle is dragged the row shows the resulting start, end and length next to the dragged edge; the result is announced once on release. A clip whose media is missing is outlined with `--danger-text`. Escape closes the shortcut popover without clearing the selection.
+- **Frontend state kept in `localStorage`:** `byori.timeline.<projectId>` (zoom, snap), `byori.inspector.sections` (collapsed sections), `byori.assistant.introduced`. All are optional conveniences read inside try/catch.
+- The Inspector no longer creates a clip's own entrance/exit *transition* for video and image clips (the animation tab's entrance/exit presets and the transition between two clips replace it); an existing one is shown and can be removed. CLI/MCP can still set `transitionIn/Out` on any clip.
+
 ### Verification
 
-`npm run verify` runs the version check (`scripts/check-version.mjs`; `package.json` is the single version source, `--write` syncs the others), Vitest, `cargo test --lib`, a `studio-service` build, the Python tests including `scripts/test_integration.py` against the real binary (temporary `BYORI_STUDIO_HOME`, free port, never 43123) and the production build. `.github/workflows/ci.yml` runs the same on macOS plus `cargo clippy --all-targets -- -D warnings`.
+`npm run verify` runs the version check (`scripts/check-version.mjs`; `package.json` is the single version source, `--write` syncs the others), Vitest, `cargo test --lib`, a `studio-service` build, the Python tests including `scripts/test_integration.py` against the real binary (temporary `BYORI_STUDIO_HOME`, free port, never 43123) and the production build. `.github/workflows/ci.yml` runs `cargo fmt --check`, the same verify and `cargo clippy --all-targets -- -D warnings` on macOS; it has not been run on GitHub yet.
+
+The packaged app (`npm run tauri build -- --bundles app`) honours `BYORI_STUDIO_HOME` and `BYORI_STUDIO_PORT` like `studio-service`, so it can be started against a temporary folder and a free port for end-to-end checks. What was checked that way, and what was not, is in [VALIDATION.md](VALIDATION.md).

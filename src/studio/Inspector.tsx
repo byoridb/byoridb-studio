@@ -6,15 +6,12 @@ import {
   ChevronDown,
   Circle,
   Diamond,
-  Film,
   FlipHorizontal2,
   FlipVertical2,
+  LoaderCircle,
   RotateCcw,
-  Settings2,
-  SlidersHorizontal,
   Square,
   Trash2,
-  Plus,
 } from "lucide-react";
 import type {
   BlendMode,
@@ -27,24 +24,29 @@ import type {
   Project,
   TransitionType,
 } from "./types";
+import { maxTransitionDuration } from "./clipEditing";
+import { errorText, type ErrorText } from "./errorText";
 import {
   activeAnimationPreset,
+  activeMotionPreset,
   animationPresetKeyframes,
   animationPresets,
   blendModes,
   canonicalProperty,
   easings,
   incomingTransitionCommands,
-  joinTransitionCommands,
   keyframeAt,
   keyframeProperties,
   localTime,
+  motionPresetKeyframes,
+  motionPresets,
   outlineOff,
   overlapWithPrevious,
   previousClip,
   separateTransitionCommands,
   shadowOff,
   shadowOn,
+  transitionCatalog,
   transitionOf,
   transitionPatch,
   transitionsFor,
@@ -59,6 +61,8 @@ import { notifyAssetsChanged, registerFont, useAssetCatalog, type StudioFont } f
 import { usePreviewDraft } from "./previewDraft";
 import CurveEditor from "./CurveEditor";
 import { durationOf, timecode } from "./types";
+
+const addFontValue = "__add-font__";
 import "./panels.css";
 import "./custom-assets.css";
 
@@ -84,67 +88,95 @@ interface NumberFieldProps {
   onKeyframe?: () => void;
   range?: boolean;
 }
-function NumberField({
-  label,
+/** A typed draft that previews while editing and commits once, bounded. */
+function useNumberDraft({
   value,
   onCommit,
   onPreview,
   onCancelPreview,
   min,
   max,
-  step = 1,
-  unit,
-  onKeyframe,
-  range,
-}: NumberFieldProps) {
-  const [draft, setDraft] = useState(String(Number(value.toFixed(3))));
-  useEffect(() => setDraft(String(Number(value.toFixed(3)))), [value]);
+}: Pick<NumberFieldProps, "value" | "onCommit" | "onPreview" | "onCancelPreview" | "min" | "max">) {
+  const shown = String(Number(value.toFixed(3)));
+  const [draft, setDraft] = useState(shown);
+  useEffect(() => setDraft(shown), [shown]);
+  const bound = (n: number) => Math.max(min ?? -Infinity, Math.min(max ?? Infinity, n));
+  const reset = () => {
+    setDraft(shown);
+    onCancelPreview?.();
+  };
   const change = (next: string) => {
     setDraft(next);
     const n = Number(next);
-    if (next !== "" && Number.isFinite(n)) onPreview?.(Math.max(min ?? -Infinity, Math.min(max ?? Infinity, n)));
+    if (next !== "" && Number.isFinite(n)) onPreview?.(bound(n));
   };
   const commit = () => {
     const n = Number(draft);
-    if (draft !== "" && Number.isFinite(n)) {
-      const bounded = Math.max(min ?? -Infinity, Math.min(max ?? Infinity, n));
-      setDraft(String(bounded));
-      if (Math.abs(bounded - value) > 0.00001) onCommit(bounded);
-      else onCancelPreview?.();
-    } else { setDraft(String(value)); onCancelPreview?.(); }
+    if (draft === "" || !Number.isFinite(n)) return reset();
+    const bounded = bound(n);
+    setDraft(String(bounded));
+    if (Math.abs(bounded - value) > 0.00001) onCommit(bounded);
+    else onCancelPreview?.();
   };
+  return { draft, change, commit, reset };
+}
+type NumberDraft = ReturnType<typeof useNumberDraft>;
+/** The one number input of the inspector: fixed width, optional prefix and unit. */
+function NumberBox({
+  label,
+  state,
+  min,
+  max,
+  step = 1,
+  unit,
+  prefix,
+}: Pick<NumberFieldProps, "label" | "min" | "max" | "step" | "unit"> & {
+  state: NumberDraft;
+  prefix?: string;
+}) {
+  return (
+    <span className="number-input-wrap">
+      {prefix && <small aria-hidden="true">{prefix}</small>}
+      <input
+        type="number"
+        aria-label={label}
+        value={state.draft}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => state.change(e.target.value)}
+        onBlur={state.commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+          if (e.key === "Escape") state.reset();
+        }}
+      />
+      {unit && <small>{unit}</small>}
+    </span>
+  );
+}
+function KeyframeButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      className="keyframe-button"
+      aria-label={`${label} 키프레임 추가`}
+      title="현재 위치에 키프레임 추가"
+      onClick={onClick}
+    >
+      <Diamond size={12} />
+    </button>
+  );
+}
+function NumberField(props: NumberFieldProps) {
+  const { label, min, max, step = 1, onKeyframe, range } = props;
+  const state = useNumberDraft(props);
   return (
     <div className={`inspector-number-field ${range ? "with-range" : ""}`}>
       <label>
         <span>{label}</span>
         <span className="inspector-number-controls">
-          <span className="number-input-wrap">
-            <input
-              type="number"
-              aria-label={label}
-              value={draft}
-              min={min}
-              max={max}
-              step={step}
-              onChange={(e) => change(e.target.value)}
-              onBlur={commit}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-                if (e.key === "Escape") { setDraft(String(value)); onCancelPreview?.(); }
-              }}
-            />
-            {unit && <small>{unit}</small>}
-          </span>
-          {onKeyframe && (
-            <button
-              className="keyframe-button"
-              aria-label={`${label} 키프레임 추가`}
-              title="현재 위치에 키프레임 추가"
-              onClick={onKeyframe}
-            >
-              <Diamond size={12} />
-            </button>
-          )}
+          <NumberBox {...props} state={state} />
+          {onKeyframe && <KeyframeButton label={label} onClick={onKeyframe} />}
         </span>
       </label>
       {range && (
@@ -154,10 +186,10 @@ function NumberField({
           min={min}
           max={max}
           step={step}
-          value={Number(draft) || 0}
-          onChange={(e) => change(e.target.value)}
-          onPointerUp={commit}
-          onPointerCancel={() => { setDraft(String(value)); onCancelPreview?.(); }}
+          value={Number(state.draft) || 0}
+          onChange={(e) => state.change(e.target.value)}
+          onPointerUp={state.commit}
+          onPointerCancel={state.reset}
           onKeyUp={(e) => {
             if (
               [
@@ -169,10 +201,38 @@ function NumberField({
                 "PageDown",
               ].includes(e.key)
             )
-              commit();
+              state.commit();
           }}
         />
       )}
+    </div>
+  );
+}
+type PairField = Omit<NumberFieldProps, "onKeyframe" | "range"> & { prefix: string };
+function PairBox(props: PairField) {
+  return <NumberBox {...props} state={useNumberDraft(props)} />;
+}
+/** Two related values on one row: the label on the left, both inputs on the right. */
+function NumberPair({
+  label,
+  fields,
+  onKeyframe,
+}: {
+  label: string;
+  fields: PairField[];
+  onKeyframe?: () => void;
+}) {
+  return (
+    <div className="inspector-number-field" role="group" aria-label={label}>
+      <div className="inspector-number-row">
+        <span>{label}</span>
+        <span className="inspector-number-controls">
+          {fields.map((field) => (
+            <PairBox key={field.label} {...field} />
+          ))}
+          {onKeyframe && <KeyframeButton label={label} onClick={onKeyframe} />}
+        </span>
+      </div>
     </div>
   );
 }
@@ -475,26 +535,92 @@ function TextField({
   );
 }
 
+const sectionsKey = "byori.inspector.sections";
+/** Sections the user opened or closed, by title; survives selection changes and restarts. */
+let sectionChoices: Record<string, boolean> | null = null;
+function sectionChoice(title: string): boolean | undefined {
+  if (!sectionChoices) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(sectionsKey) || "{}");
+      sectionChoices = stored && typeof stored === "object" ? stored : {};
+    } catch {
+      sectionChoices = {};
+    }
+  }
+  const choice = sectionChoices![title];
+  return typeof choice === "boolean" ? choice : undefined;
+}
+function rememberSection(title: string, open: boolean) {
+  sectionChoice(title);
+  sectionChoices![title] = open;
+  try {
+    localStorage.setItem(sectionsKey, JSON.stringify(sectionChoices));
+  } catch {
+    // Without storage the choice still lasts for this session.
+  }
+}
+/** For tests: forget what was opened or closed. */
+export function resetInspectorSections() {
+  sectionChoices = null;
+}
+
+/** A single-line text input that commits on blur or Enter. */
+function InlineText({
+  label,
+  value,
+  onCommit,
+}: {
+  label: string;
+  value: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  return (
+    <input
+      className="clip-name"
+      aria-label={label}
+      title={value}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        if (draft.trim() && draft !== value) onCommit(draft);
+        else setDraft(value);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") setDraft(value);
+      }}
+    />
+  );
+}
+
 function Section({
   title,
   children,
   onReset,
-  defaultOpen = true,
+  defaultOpen = false,
 }: {
   title: string;
   children: React.ReactNode;
   onReset?: () => void;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = useState(() => sectionChoice(title) ?? defaultOpen);
   return (
     <section className="inspector-section">
       <div className="inspector-section-heading">
-        <button onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <button
+          onClick={() => {
+            rememberSection(title, !open);
+            setOpen(!open);
+          }}
+          aria-expanded={open}
+        >
           <ChevronDown size={14} className={open ? "" : "collapsed"} />
           <span>{title}</span>
         </button>
-        {onReset && (
+        {onReset && open && (
           <button
             aria-label={`${title} 초기화`}
             title="초기화"
@@ -519,7 +645,9 @@ export function Inspector({
   const preview = usePreviewDraft();
   const { catalog } = useAssetCatalog(selected?.kind === "text");
   const [tab, setTab] = useState("basic");
-  const [error, setError] = useState("");
+  const [error, setFailure] = useState<ErrorText | null>(null);
+  const setError = (value: unknown, subject?: string) =>
+    setFailure(value === "" ? null : errorText(value, subject));
   const [busy, setBusy] = useState(false);
   const [hslChannel, setHslChannel] = useState<HslChannel>("red");
   const [curveChannel, setCurveChannel] = useState<CurveChannel>("master");
@@ -537,7 +665,7 @@ export function Inspector({
     try {
       await onCommand(method, params);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e, method === "color.importLut" ? "LUT 파일" : undefined);
       if (selected) preview(selected.id, null);
     } finally {
       setBusy(false);
@@ -562,6 +690,7 @@ export function Inspector({
   const draftColor = (key: string, value: number) => selected && draft({ color: { ...selected.color, [key]: value } });
   const draftText = (key: string, value: unknown) => selected && draft({ text: { ...selected.text, [key]: value } });
   const chooseFont = (value: string) => {
+    if (value === addFontValue) return void addFont();
     const imported = catalog.fonts.find((font) => font.id === value);
     if (imported && selected) void run("fonts.apply", { id: imported.id, clipId: selected.id, expectedRevision: project.revision });
     else patch({ text: { fontFamily: value } });
@@ -574,8 +703,24 @@ export function Inspector({
       const font = await rpc<StudioFont>("fonts.import", { path: files[0] });
       notifyAssetsChanged(); await registerFont(font);
       if (selected) await onCommand("fonts.apply", { id: font.id, clipId: selected.id, expectedRevision: project.revision });
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e) { setError(e, "글꼴 파일"); }
     finally { setBusy(false); }
+  };
+  const addPositionKeyframes = () => {
+    if (!selected) return;
+    const time = localTime(selected, now?.() ?? playhead);
+    const withX = withKeyframe(
+      selected,
+      { property: "transform.x", time, value: selected.transform.x },
+      project.fps,
+    );
+    patch({
+      keyframes: withKeyframe(
+        { ...selected, keyframes: withX },
+        { property: "transform.y", time, value: selected.transform.y },
+        project.fps,
+      ),
+    });
   };
   const addKeyframe = (property: string, value: number) => {
     if (!selected) return;
@@ -592,19 +737,24 @@ export function Inspector({
   const visual = selected && !isAudio;
   const selectedMedia = project.media.find((m) => m.id === selected?.mediaId);
   const hasAudio = selected && (isAudio || selectedMedia?.hasAudio);
+  const timed = selected?.kind === "video" || isAudio;
   const tabs = selected
-    ? isAudio
-      ? [
-          { id: "basic", label: "오디오" },
-          { id: "speed", label: "속도" },
-          { id: "animation", label: "애니메이션" },
-        ]
-      : [
-          { id: "basic", label: isText ? "텍스트" : "영상" },
-          ...(!isText ? [{ id: "speed", label: "속도" }] : []),
-          { id: "animation", label: "애니메이션" },
-          ...(!isText ? [{ id: "adjust", label: "조정" }] : []),
-        ]
+    ? [
+        {
+          id: "basic",
+          label: isText
+            ? "텍스트"
+            : isAudio
+              ? "오디오"
+              : selected.kind === "image"
+                ? "이미지"
+                : "영상",
+        },
+        // A still image or a text has no playback speed; audio animates only its volume.
+        ...(timed ? [{ id: "speed", label: "속도" }] : []),
+        ...(visual ? [{ id: "animation", label: "애니메이션" }] : []),
+        ...(visual && !isText ? [{ id: "adjust", label: "조정" }] : []),
+      ]
     : [{ id: "basic", label: "프로젝트" }];
   const transform = selected?.transform || {
     x: 0,
@@ -644,13 +794,13 @@ export function Inspector({
   };
   const browseLut = async () => {
     try {
-      const paths = await pickFiles();
+      const paths = await pickFiles(["cube", "3dl"]);
       if (paths?.[0]) {
         setLutPath(paths[0]);
         await importLut(paths[0]);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e, "LUT 파일");
     }
   };
   const text = selected?.text || {
@@ -668,7 +818,31 @@ export function Inspector({
     commands.length
       ? run("edit.batch", { commands, expectedRevision: project.revision })
       : undefined;
-  const joined = !!selected && overlapWithPrevious(project, selected) > 0;
+  const before = selected ? previousClip(project, selected) : null;
+  const overlap = selected ? overlapWithPrevious(project, selected) : 0;
+  const joined = overlap > 0;
+  /** The transition between this clip and the one before it; `null` separates them. */
+  const setJoin = (type: TransitionType | null, duration: number) =>
+    selected &&
+    batch(
+      type
+        ? incomingTransitionCommands(project, selected, { type, duration })
+        : separateTransitionCommands(project, selected),
+    );
+  /**
+   * A visual clip's own in/out transition. The panel no longer creates these
+   * (entrances and exits are animations); an existing one can still be removed.
+   */
+  const ownTransitions =
+    selected && !isAudio
+      ? (["in", "out"] as const).flatMap((edge) => {
+          if (edge === "in" && joined) return [];
+          const stored = transitionOf(selected, edge);
+          const fade = edge === "in" ? selected.fadeIn : selected.fadeOut;
+          const type = stored?.type ?? (fade > 0 ? ("fade" as const) : null);
+          return type ? [{ edge, type, length: stored?.duration ?? fade }] : [];
+        })
+      : [];
   const setTransition = (
     edge: Edge,
     type: TransitionType | null,
@@ -676,10 +850,7 @@ export function Inspector({
   ) => {
     if (!selected) return;
     // A joined clip overlaps the previous one by exactly its in transition.
-    if (edge === "in" && joined)
-      return batch(
-        incomingTransitionCommands(project, selected, type && { type, duration }),
-      );
+    if (edge === "in" && joined) return setJoin(type, duration);
     return patch(transitionPatch(selected, edge, type, duration));
   };
   const crop = { x: 0, y: 0, width: 1, height: 1, ...selected?.crop };
@@ -737,6 +908,131 @@ export function Inspector({
     patch({ crop: { x: (1 - width) / 2, y: (1 - height) / 2, width, height } });
   };
 
+  const resetMask = () =>
+    patch({
+      mask: { type: "none", x: 0.5, y: 0.5, width: 1, height: 1, feather: 0 },
+    });
+  const flipsAndBlend = selected && (
+    <>
+      <div className="inspector-flips">
+        <span>뒤집기</span>
+        <button
+          aria-label="좌우 뒤집기"
+          aria-pressed={!!transform.flipX}
+          className={transform.flipX ? "active" : ""}
+          onClick={() =>
+            patchTransform("flipX", !transform.flipX)
+          }
+        >
+          <FlipHorizontal2 size={16} />
+          <span>좌우</span>
+        </button>
+        <button
+          aria-label="상하 뒤집기"
+          aria-pressed={!!transform.flipY}
+          className={transform.flipY ? "active" : ""}
+          onClick={() =>
+            patchTransform("flipY", !transform.flipY)
+          }
+        >
+          <FlipVertical2 size={16} />
+          <span>상하</span>
+        </button>
+      </div>
+      <label className="inspector-select-field">
+        <span>블렌드 모드</span>
+        <select
+          aria-label="블렌드 모드"
+          value={selected.blendMode ?? "normal"}
+          onChange={(e) =>
+            patch({ blendMode: e.target.value as BlendMode })
+          }
+        >
+          {blendModes.map((mode) => (
+            <option key={mode.id} value={mode.id}>
+              {mode.name}
+            </option>
+          ))}
+        </select>
+      </label>
+    </>
+  );
+  const maskControls = selected && (
+    <>
+      <div className="mask-shapes">
+        {[
+          { value: "none", label: "없음", Icon: Square },
+          { value: "circle", label: "원형", Icon: Circle },
+          { value: "rectangle", label: "사각형", Icon: Square },
+        ].map(({ value, label, Icon }) => (
+          <button
+            key={value}
+            aria-label={`${label} 마스크`}
+            aria-pressed={mask.type === value}
+            className={mask.type === value ? "active" : ""}
+            onClick={() => patchMask("type", value)}
+          >
+            <Icon
+              size={19}
+              strokeWidth={value === "none" ? 1 : 1.5}
+            />
+            <span>{label}</span>
+          </button>
+        ))}
+      </div>
+      {mask.type !== "none" && (
+        <>
+          <NumberPair
+            label="위치"
+            fields={
+              (["x", "y"] as const).map((key) => ({
+                label: `마스크 ${key.toUpperCase()}`,
+                prefix: key.toUpperCase(),
+                value: mask[key] * 100,
+                min: 0,
+                max: 100,
+                onCommit: (v: number) => patchMask(key, v / 100),
+                onPreview: (v: number) => draftMask(key, v / 100),
+                onCancelPreview: clearDraft,
+              }))
+            }
+          />
+          <NumberPair
+            label="크기"
+            fields={
+              (
+                [
+                  ["width", "너비", "W"],
+                  ["height", "높이", "H"],
+                ] as const
+              ).map(([key, name, prefix]) => ({
+                label: `마스크 ${name}`,
+                prefix,
+                value: mask[key] * 100,
+                min: 1,
+                max: 200,
+                onCommit: (v: number) => patchMask(key, v / 100),
+                onPreview: (v: number) => draftMask(key, v / 100),
+                onCancelPreview: clearDraft,
+              }))
+            }
+          />
+          <NumberField
+            label="가장자리 부드럽게"
+            value={mask.feather * 100}
+            min={0}
+            max={100}
+            unit="%"
+            range
+            onCommit={(v) => patchMask("feather", v / 100)}
+          onPreview={(v) => draftMask("feather", v / 100)}
+          onCancelPreview={clearDraft}
+          />
+        </>
+      )}
+    </>
+  );
+
   return (
     <section
       className="studio-inspector"
@@ -754,135 +1050,156 @@ export function Inspector({
             {t.label}
           </button>
         ))}
+        {busy && (
+          <span className="inspector-busy" role="status" aria-label="변경 사항 적용 중">
+            <LoaderCircle size={13} className="panel-spin" />
+          </span>
+        )}
       </nav>
       <div className="inspector-scroll">
         {!selected ? (
-          <>
-            <div className="project-inspector-title">
-              <Settings2 size={18} />
-              <h2>프로젝트 설정</h2>
-            </div>
-            <Section title="프로젝트">
-              <TextField
-                label="이름"
-                value={project.name}
-                onCommit={(name) =>
-                  void run("project.update", { patch: { name } })
-                }
-              />
-              <div className="project-stat-row">
-                <span>전체 길이</span>
-                <strong>{timecode(durationOf(project), project.fps)}</strong>
-              </div>
-              <div className="project-stat-row">
-                <span>클립 / 소재</span>
-                <strong>
-                  {project.clips.length} / {project.media.length}
-                </strong>
-              </div>
-            </Section>
-            <Section title="화면 설정">
-              <div className="aspect-ratios">
-                {[
-                  { label: "16:9", width: 1920, height: 1080 },
-                  { label: "9:16", width: 1080, height: 1920 },
-                  { label: "1:1", width: 1080, height: 1080 },
-                  { label: "4:3", width: 1440, height: 1080 },
-                ].map((r) => (
-                  <button
-                    key={r.label}
-                    className={
-                      Math.abs(
-                        project.width / project.height - r.width / r.height,
-                      ) < 0.01
-                        ? "active"
-                        : ""
-                    }
-                    onClick={() =>
-                      void run("project.update", {
-                        patch: { width: r.width, height: r.height },
-                      })
-                    }
-                  >
-                    {r.label}
-                  </button>
-                ))}
-              </div>
-              <NumberField
-                label="가로"
-                value={project.width}
-                min={16}
-                max={7680}
-                step={2}
-                unit="px"
-                onCommit={(width) =>
-                  void run("project.update", { patch: { width } })
-                }
-              />
-              <NumberField
-                label="세로"
-                value={project.height}
-                min={16}
-                max={7680}
-                step={2}
-                unit="px"
-                onCommit={(height) =>
-                  void run("project.update", { patch: { height } })
-                }
-              />
-              <label className="inspector-select-field">
-                <span>프레임 속도</span>
-                <select
-                  value={project.fps}
-                  onChange={(e) =>
+          <div className="inspector-flat">
+            <TextField
+              label="이름"
+              value={project.name}
+              onCommit={(name) =>
+                void run("project.update", { patch: { name } })
+              }
+            />
+            <div className="aspect-ratios" role="group" aria-label="화면 비율">
+              {[
+                { label: "16:9", width: 1920, height: 1080 },
+                { label: "9:16", width: 1080, height: 1920 },
+                { label: "1:1", width: 1080, height: 1080 },
+                { label: "4:3", width: 1440, height: 1080 },
+              ].map((r) => (
+                <button
+                  key={r.label}
+                  className={
+                    Math.abs(
+                      project.width / project.height - r.width / r.height,
+                    ) < 0.01
+                      ? "active"
+                      : ""
+                  }
+                  onClick={() =>
                     void run("project.update", {
-                      patch: { fps: Number(e.target.value) },
+                      patch: { width: r.width, height: r.height },
                     })
                   }
                 >
-                  {[24, 25, 30, 50, 60].map((f) => (
+                  {r.label}
+                </button>
+              ))}
+            </div>
+            <NumberPair
+              label="해상도"
+              fields={[
+                {
+                  label: "가로",
+                  prefix: "W",
+                  value: project.width,
+                  min: 16,
+                  max: 7680,
+                  step: 2,
+                  onCommit: (width) =>
+                    void run("project.update", { patch: { width } }),
+                },
+                {
+                  label: "세로",
+                  prefix: "H",
+                  value: project.height,
+                  min: 16,
+                  max: 7680,
+                  step: 2,
+                  onCommit: (height) =>
+                    void run("project.update", { patch: { height } }),
+                },
+              ]}
+            />
+            <label className="inspector-select-field">
+              <span>프레임 속도</span>
+              <select
+                value={project.fps}
+                onChange={(e) =>
+                  void run("project.update", {
+                    patch: { fps: Number(e.target.value) },
+                  })
+                }
+              >
+                {Array.from(new Set([24, 25, 30, 50, 60, project.fps]))
+                  .sort((x, y) => x - y)
+                  .map((f) => (
                     <option key={f} value={f}>
                       {f} fps
                     </option>
                   ))}
-                </select>
-              </label>
-              <ColorField
-                label="배경"
-                name="프로젝트 배경 색상"
-                value={project.background || "#000000"}
-                onCommit={(value) =>
-                  run("project.update", { patch: { background: value } })
-                }
-              />
-            </Section>
-            <div className="inspector-empty-hint">
-              <Film size={25} />
-              <p>
-                타임라인에서 클립을 선택하면
-                <br />
-                세부 속성을 편집할 수 있습니다.
-              </p>
+              </select>
+            </label>
+            <ColorField
+              label="배경"
+              name="프로젝트 배경 색상"
+              value={project.background || "#000000"}
+              onCommit={(value) =>
+                run("project.update", { patch: { background: value } })
+              }
+            />
+            <div className="project-stat-row">
+              <span>전체 길이</span>
+              <strong>{timecode(durationOf(project), project.fps)}</strong>
             </div>
-          </>
+          </div>
         ) : (
           <>
-            <div className="selected-clip-name">
-              <span title={selected.name}>{selected.name}</span>
-              <small>
-                {selected.kind === "text"
-                  ? "텍스트"
-                  : selected.kind === "audio"
-                    ? "오디오"
-                    : selected.kind === "image"
-                      ? "이미지"
-                      : "동영상"}
-              </small>
+            <div className="clip-header">
+              <InlineText
+                label="클립 이름"
+                value={selected.name}
+                onCommit={(v) => patch({ name: v })}
+              />
+              <div className="clip-timing">
+                <label>
+                  <span>시작</span>
+                  <CommitNumber
+                    label="시작 시간"
+                    value={selected.start}
+                    min={0}
+                    step={Number((1 / project.fps).toFixed(4))}
+                    onCommit={(v) => patch({ start: v })}
+                  />
+                  <small>s</small>
+                </label>
+                <label>
+                  <span>길이</span>
+                  <CommitNumber
+                    label="길이"
+                    value={selected.duration}
+                    min={Number((1 / project.fps).toFixed(4))}
+                    step={Number((1 / project.fps).toFixed(4))}
+                    onCommit={(v) => patch({ duration: v })}
+                  />
+                  <small>s</small>
+                </label>
+                {timed && (
+                  <label>
+                    <span>소스</span>
+                    <CommitNumber
+                      label="소스 시작"
+                      value={selected.sourceIn}
+                      min={0}
+                      max={selectedMedia?.duration}
+                      step={Number((1 / project.fps).toFixed(4))}
+                      onCommit={(v) => patch({ sourceIn: v })}
+                    />
+                    <small>s</small>
+                  </label>
+                )}
+              </div>
             </div>
             {tab === "basic" && (
               <>
                 {isText && (
-                  <Section title="텍스트">
+                  <Section title="텍스트" defaultOpen>
                     <TextField
                       label="내용"
                       value={text.content}
@@ -907,9 +1224,9 @@ export function Inspector({
                         ))}
                         {text.fontId && !catalog.fonts.some((font) => font.id === text.fontId) && <option value={text.fontId}>저장된 사용자 글꼴</option>}
                         {catalog.fonts.length > 0 && <optgroup label="내 글꼴">{catalog.fonts.map((font) => <option value={font.id} key={font.id}>{font.name}</option>)}</optgroup>}
+                        {isTauri() && <option value={addFontValue}>글꼴 추가…</option>}
                       </select>
                     </label>
-                    <button className="panel-action-button inspector-font-add" disabled={busy} onClick={() => void addFont()}><Plus size={13} />글꼴 추가</button>
                     <NumberField
                       label="글자 크기"
                       value={text.fontSize}
@@ -1001,7 +1318,6 @@ export function Inspector({
                 {isText && (
                   <Section
                     title="텍스트 스타일"
-                    defaultOpen={false}
                     onReset={() =>
                       patch({
                         text: {
@@ -1015,7 +1331,7 @@ export function Inspector({
                       })
                     }
                   >
-                    <div className="number-pair">
+                    <>
                       <NumberField
                         label="자간"
                         value={text.letterSpacing ?? 0}
@@ -1037,7 +1353,7 @@ export function Inspector({
                         onPreview={(v) => draftText("lineHeight", v)}
                         onCancelPreview={clearDraft}
                       />
-                    </div>
+                    </>
                     <NumberField
                       label="외곽선 두께"
                       value={outline.width}
@@ -1095,30 +1411,23 @@ export function Inspector({
                               : draftText("shadow", { ...shadow, color: value })
                           }
                         />
-                        <div className="number-pair">
-                          {(
-                            [
-                              ["x", "그림자 X"],
-                              ["y", "그림자 Y"],
-                            ] as const
-                          ).map(([key, label]) => (
-                            <NumberField
-                              key={key}
-                              label={label}
-                              value={shadow[key]}
-                              min={-100}
-                              max={100}
-                              unit="px"
-                              onCommit={(v) =>
-                                patchText("shadow", { ...shadow, [key]: v })
-                              }
-                              onPreview={(v) =>
-                                draftText("shadow", { ...shadow, [key]: v })
-                              }
-                              onCancelPreview={clearDraft}
-                            />
-                          ))}
-                        </div>
+                        <NumberPair
+                          label="그림자 위치"
+                          fields={
+                            (["x", "y"] as const).map((key) => ({
+                              label: `그림자 ${key.toUpperCase()}`,
+                              prefix: key.toUpperCase(),
+                              value: shadow[key],
+                              min: -100,
+                              max: 100,
+                              onCommit: (v: number) =>
+                                patchText("shadow", { ...shadow, [key]: v }),
+                              onPreview: (v: number) =>
+                                draftText("shadow", { ...shadow, [key]: v }),
+                              onCancelPreview: clearDraft,
+                            }))
+                          }
+                        />
                         <NumberField
                           label="그림자 흐림"
                           value={shadow.blur}
@@ -1137,6 +1446,7 @@ export function Inspector({
                 {visual && (
                   <Section
                     title="변형"
+                    defaultOpen={!isText}
                     onReset={() =>
                       patch({
                         transform: {
@@ -1164,30 +1474,21 @@ export function Inspector({
                         addKeyframe("transform.scale", transform.scale)
                       }
                     />
-                    <div className="number-pair">
-                      <NumberField
-                        label="위치 X"
-                        value={transform.x}
-                        step={1}
-                        unit="px"
-                        onCommit={(v) => patchTransform("x", v)}
-                      onPreview={(v) => draftTransform("x", v)} onCancelPreview={clearDraft}
-                        onKeyframe={() =>
-                          addKeyframe("transform.x", transform.x)
-                        }
-                      />
-                      <NumberField
-                        label="위치 Y"
-                        value={transform.y}
-                        step={1}
-                        unit="px"
-                        onCommit={(v) => patchTransform("y", v)}
-                      onPreview={(v) => draftTransform("y", v)} onCancelPreview={clearDraft}
-                        onKeyframe={() =>
-                          addKeyframe("transform.y", transform.y)
-                        }
-                      />
-                    </div>
+                    <NumberPair
+                      label="위치"
+                      onKeyframe={addPositionKeyframes}
+                      fields={
+                        (["x", "y"] as const).map((key) => ({
+                          label: `위치 ${key.toUpperCase()}`,
+                          prefix: key.toUpperCase(),
+                          value: transform[key],
+                          step: 1,
+                          onCommit: (v: number) => patchTransform(key, v),
+                          onPreview: (v: number) => draftTransform(key, v),
+                          onCancelPreview: clearDraft,
+                        }))
+                      }
+                    />
                     <NumberField
                       label="회전"
                       value={transform.rotation}
@@ -1213,53 +1514,12 @@ export function Inspector({
                         addKeyframe("transform.opacity", transform.opacity)
                       }
                     />
-                    <div className="inspector-flips">
-                      <span>뒤집기</span>
-                      <button
-                        aria-label="좌우 뒤집기"
-                        aria-pressed={!!transform.flipX}
-                        className={transform.flipX ? "active" : ""}
-                        onClick={() =>
-                          patchTransform("flipX", !transform.flipX)
-                        }
-                      >
-                        <FlipHorizontal2 size={16} />
-                        <span>좌우</span>
-                      </button>
-                      <button
-                        aria-label="상하 뒤집기"
-                        aria-pressed={!!transform.flipY}
-                        className={transform.flipY ? "active" : ""}
-                        onClick={() =>
-                          patchTransform("flipY", !transform.flipY)
-                        }
-                      >
-                        <FlipVertical2 size={16} />
-                        <span>상하</span>
-                      </button>
-                    </div>
-                    <label className="inspector-select-field">
-                      <span>블렌드 모드</span>
-                      <select
-                        aria-label="블렌드 모드"
-                        value={selected.blendMode ?? "normal"}
-                        onChange={(e) =>
-                          patch({ blendMode: e.target.value as BlendMode })
-                        }
-                      >
-                        {blendModes.map((mode) => (
-                          <option key={mode.id} value={mode.id}>
-                            {mode.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                    {!isText && flipsAndBlend}
                   </Section>
                 )}
                 {visual && !isText && (
                   <Section
                     title="자르기"
-                    defaultOpen={false}
                     onReset={() =>
                       patch({ crop: { x: 0, y: 0, width: 1, height: 1 } })
                     }
@@ -1287,163 +1547,87 @@ export function Inspector({
                         </button>
                       ))}
                     </div>
-                    <div className="number-pair">
-                      <NumberField
-                        label="크롭 X"
-                        value={crop.x * 100}
-                        min={0}
-                        max={(1 - crop.width) * 100}
-                        step={0.1}
-                        unit="%"
-                        onCommit={(v) => patchCrop("x", v / 100)}
-                        onPreview={(v) => draftCrop("x", v / 100)}
-                        onCancelPreview={clearDraft}
-                      />
-                      <NumberField
-                        label="크롭 Y"
-                        value={crop.y * 100}
-                        min={0}
-                        max={(1 - crop.height) * 100}
-                        step={0.1}
-                        unit="%"
-                        onCommit={(v) => patchCrop("y", v / 100)}
-                        onPreview={(v) => draftCrop("y", v / 100)}
-                        onCancelPreview={clearDraft}
-                      />
-                    </div>
-                    <div className="number-pair">
-                      <NumberField
-                        label="크롭 너비"
-                        value={crop.width * 100}
-                        min={1}
-                        max={(1 - crop.x) * 100}
-                        step={0.1}
-                        unit="%"
-                        onCommit={(v) => patchCrop("width", v / 100)}
-                        onPreview={(v) => draftCrop("width", v / 100)}
-                        onCancelPreview={clearDraft}
-                      />
-                      <NumberField
-                        label="크롭 높이"
-                        value={crop.height * 100}
-                        min={1}
-                        max={(1 - crop.y) * 100}
-                        step={0.1}
-                        unit="%"
-                        onCommit={(v) => patchCrop("height", v / 100)}
-                        onPreview={(v) => draftCrop("height", v / 100)}
-                        onCancelPreview={clearDraft}
-                      />
-                    </div>
-                    <p className="panel-help">
-                      원본 안에서 사용할 영역을 지정합니다. 비율 프리셋은 중앙을
-                      기준으로 자릅니다.
-                    </p>
+                    <NumberPair
+                      label="위치"
+                      fields={[
+                        {
+                          label: "크롭 X",
+                          prefix: "X",
+                          value: crop.x * 100,
+                          min: 0,
+                          max: (1 - crop.width) * 100,
+                          step: 0.1,
+                          onCommit: (v) => patchCrop("x", v / 100),
+                          onPreview: (v) => draftCrop("x", v / 100),
+                          onCancelPreview: clearDraft,
+                        },
+                        {
+                          label: "크롭 Y",
+                          prefix: "Y",
+                          value: crop.y * 100,
+                          min: 0,
+                          max: (1 - crop.height) * 100,
+                          step: 0.1,
+                          onCommit: (v) => patchCrop("y", v / 100),
+                          onPreview: (v) => draftCrop("y", v / 100),
+                          onCancelPreview: clearDraft,
+                        },
+                      ]}
+                    />
+                    <NumberPair
+                      label="크기"
+                      fields={[
+                        {
+                          label: "크롭 너비",
+                          prefix: "W",
+                          value: crop.width * 100,
+                          min: 1,
+                          max: (1 - crop.x) * 100,
+                          step: 0.1,
+                          onCommit: (v) => patchCrop("width", v / 100),
+                          onPreview: (v) => draftCrop("width", v / 100),
+                          onCancelPreview: clearDraft,
+                        },
+                        {
+                          label: "크롭 높이",
+                          prefix: "H",
+                          value: crop.height * 100,
+                          min: 1,
+                          max: (1 - crop.y) * 100,
+                          step: 0.1,
+                          onCommit: (v) => patchCrop("height", v / 100),
+                          onPreview: (v) => draftCrop("height", v / 100),
+                          onCancelPreview: clearDraft,
+                        },
+                      ]}
+                    />
                   </Section>
                 )}
-                {visual && (
+                {visual && !isText && (
+                  <Section title="마스크" onReset={resetMask}>
+                    {maskControls}
+                  </Section>
+                )}
+                {isText && (
+                  // Rarely needed on a title: one folded group keeps the text tab short.
                   <Section
-                    title="마스크"
-                    defaultOpen={false}
+                    title="고급"
                     onReset={() =>
                       patch({
-                        mask: {
-                          type: "none",
-                          x: 0.5,
-                          y: 0.5,
-                          width: 1,
-                          height: 1,
-                          feather: 0,
-                        },
+                        transform: { ...selected.transform, flipX: false, flipY: false },
+                        blendMode: "normal",
+                        mask: { type: "none", x: 0.5, y: 0.5, width: 1, height: 1, feather: 0 },
                       })
                     }
                   >
-                    <div className="mask-shapes">
-                      {[
-                        { value: "none", label: "없음", Icon: Square },
-                        { value: "circle", label: "원형", Icon: Circle },
-                        { value: "rectangle", label: "사각형", Icon: Square },
-                      ].map(({ value, label, Icon }) => (
-                        <button
-                          key={value}
-                          aria-label={`${label} 마스크`}
-                          aria-pressed={mask.type === value}
-                          className={mask.type === value ? "active" : ""}
-                          onClick={() => patchMask("type", value)}
-                        >
-                          <Icon
-                            size={19}
-                            strokeWidth={value === "none" ? 1 : 1.5}
-                          />
-                          <span>{label}</span>
-                        </button>
-                      ))}
-                    </div>
-                    {mask.type !== "none" && (
-                      <>
-                        <div className="number-pair">
-                          <NumberField
-                            label="마스크 X"
-                            value={mask.x * 100}
-                            min={0}
-                            max={100}
-                            unit="%"
-                            onCommit={(v) => patchMask("x", v / 100)}
-                        onPreview={(v) => draftMask("x", v / 100)}
-                        onCancelPreview={clearDraft}
-                          />
-                          <NumberField
-                            label="마스크 Y"
-                            value={mask.y * 100}
-                            min={0}
-                            max={100}
-                            unit="%"
-                            onCommit={(v) => patchMask("y", v / 100)}
-                        onPreview={(v) => draftMask("y", v / 100)}
-                        onCancelPreview={clearDraft}
-                          />
-                        </div>
-                        <div className="number-pair">
-                          <NumberField
-                            label="마스크 너비"
-                            value={mask.width * 100}
-                            min={1}
-                            max={200}
-                            unit="%"
-                            onCommit={(v) => patchMask("width", v / 100)}
-                        onPreview={(v) => draftMask("width", v / 100)}
-                        onCancelPreview={clearDraft}
-                          />
-                          <NumberField
-                            label="마스크 높이"
-                            value={mask.height * 100}
-                            min={1}
-                            max={200}
-                            unit="%"
-                            onCommit={(v) => patchMask("height", v / 100)}
-                        onPreview={(v) => draftMask("height", v / 100)}
-                        onCancelPreview={clearDraft}
-                          />
-                        </div>
-                        <NumberField
-                          label="가장자리 부드럽게"
-                          value={mask.feather * 100}
-                          min={0}
-                          max={100}
-                          unit="%"
-                          range
-                          onCommit={(v) => patchMask("feather", v / 100)}
-                        onPreview={(v) => draftMask("feather", v / 100)}
-                        onCancelPreview={clearDraft}
-                        />
-                      </>
-                    )}
+                    {flipsAndBlend}
+                    <div className="inspector-subheading">마스크</div>
+                    {maskControls}
                   </Section>
                 )}
                 {visual && !isText && (
                   <Section
                     title="크로마키"
-                    defaultOpen={false}
                     onReset={() =>
                       patch({
                         chromaKey: {
@@ -1521,7 +1705,6 @@ export function Inspector({
                 {selected.kind === "video" && (
                   <Section
                     title="흔들림 보정"
-                    defaultOpen={false}
                     onReset={() =>
                       patch({ stabilize: { enabled: false, strength: 1 } })
                     }
@@ -1570,6 +1753,7 @@ export function Inspector({
                 {hasAudio && (
                   <Section
                     title="오디오"
+                    defaultOpen={isAudio}
                     onReset={() =>
                       patch({
                         volume: 1,
@@ -1641,7 +1825,6 @@ export function Inspector({
                 {hasAudio && (
                   <Section
                     title="이퀄라이저"
-                    defaultOpen={false}
                     onReset={() =>
                       patch({
                         audio: { ...audio, eq: { bass: 0, mid: 0, treble: 0 } },
@@ -1677,138 +1860,133 @@ export function Inspector({
                     ))}
                   </Section>
                 )}
-                <Section
-                  title={isAudio ? "페이드" : "전환"}
-                  onReset={() =>
-                    joined
-                      ? batch(
-                          separateTransitionCommands(project, selected, {
-                            transitionOut: null,
-                            fadeOut: 0,
-                          }),
-                        )?.then(() => undefined)
-                      : patch({
-                          transitionIn: null,
-                          transitionOut: null,
-                          fadeIn: 0,
-                          fadeOut: 0,
-                        })
-                  }
-                >
-                  {(["in", "out"] as const).map((edge) => {
-                    const name = edge === "in" ? "등장" : "퇴장";
-                    const stored = transitionOf(selected, edge);
-                    const fade = edge === "in" ? selected.fadeIn : selected.fadeOut;
-                    // Projects saved before transitions only carry the fade length.
-                    const type = stored?.type ?? (fade > 0 ? "fade" : null);
-                    const length = stored?.duration ?? fade;
-                    return (
-                      <div className="transition-edge" key={edge}>
-                        <label className="inspector-select-field">
-                          <span>{name}</span>
-                          <select
-                            aria-label={`${name} 전환`}
-                            value={type ?? ""}
-                            onChange={(e) =>
-                              void setTransition(
-                                edge,
-                                (e.target.value || null) as TransitionType | null,
-                                length || 0.5,
-                              )
-                            }
-                          >
-                            <option value="">없음</option>
-                            {transitionsFor(selected).map((item) => (
-                              <option key={item.id} value={item.id}>
-                                {item.name}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        {type && (
-                          <NumberField
-                            label={`${name} 길이`}
-                            value={length}
-                            min={0.1}
-                            max={selected.duration}
-                            step={0.1}
-                            unit="s"
-                            onCommit={(v) => void setTransition(edge, type, v)}
-                            onPreview={(v) =>
-                              draft(transitionPatch(selected, edge, type, v))
-                            }
-                            onCancelPreview={clearDraft}
-                          />
+                {isAudio &&
+                  selected.keyframes.some(
+                    (k) => canonicalProperty(k.property) === "volume",
+                  ) && (
+                    <Section title="볼륨 키프레임">
+                      <KeyframeEditor
+                        clip={selected}
+                        fps={project.fps}
+                        time={localTime(selected, playhead)}
+                        now={now && (() => localTime(selected, now()))}
+                        properties={keyframeProperties.filter(
+                          (info) => info.id === "volume",
                         )}
-                      </div>
-                    );
-                  })}
-                  {!joined && previousClip(project, selected) && (
-                    <button
-                      className="panel-wide-button secondary"
-                      disabled={busy}
-                      onClick={() =>
-                        void batch(
-                          joinTransitionCommands(
-                            project,
-                            selected,
-                            transitionOf(selected, "in")?.type ??
-                              (isAudio ? "fade" : "dissolve"),
-                            transitionOf(selected, "in")?.duration ?? 0.5,
+                        onChange={(keyframes) => patch({ keyframes })}
+                      />
+                    </Section>
+                  )}
+                {(isAudio || before || ownTransitions.length > 0) && (
+                  <Section
+                    title={isAudio ? "페이드" : "전환"}
+                    onReset={() =>
+                      joined
+                        ? batch(
+                            separateTransitionCommands(project, selected, {
+                              transitionOut: null,
+                              fadeOut: 0,
+                            }),
+                          )
+                        : patch({
+                            transitionIn: null,
+                            transitionOut: null,
+                            fadeIn: 0,
+                            fadeOut: 0,
+                          })
+                    }
+                  >
+                    {isAudio &&
+                      (["in", "out"] as const).map(
+                        (edge) =>
+                          !(edge === "in" && joined) && (
+                            <NumberField
+                              key={edge}
+                              label={edge === "in" ? "페이드 인" : "페이드 아웃"}
+                              value={edge === "in" ? selected.fadeIn : selected.fadeOut}
+                              min={0}
+                              max={selected.duration}
+                              step={0.1}
+                              unit="s"
+                              onCommit={(v) =>
+                                void setTransition(edge, v > 0 ? "fade" : null, v)
+                              }
+                              onPreview={(v) =>
+                                draft(
+                                  transitionPatch(selected, edge, v > 0 ? "fade" : null, v),
+                                )
+                              }
+                              onCancelPreview={clearDraft}
+                            />
                           ),
-                        )
-                      }
-                    >
-                      앞 클립과 겹쳐 전환
-                    </button>
-                  )}
-                  {joined && (
-                    <p className="panel-help">
-                      앞 클립 위로 겹쳐 등장합니다. 등장 전환을 ‘없음’으로 바꾸면
-                      뒤 클립들이 원래 자리로 돌아갑니다.
-                    </p>
-                  )}
-                </Section>
-                <Section title="타이밍">
-                  <NumberField
-                    label="시작 시간"
-                    value={selected.start}
-                    min={0}
-                    step={1 / project.fps}
-                    unit="s"
-                    onCommit={(v) => patch({ start: v })}
-                  />
-                  <NumberField
-                    label="길이"
-                    value={selected.duration}
-                    min={1 / project.fps}
-                    step={1 / project.fps}
-                    unit="s"
-                    onCommit={(v) => patch({ duration: v })}
-                  />
-                  {selected.kind !== "text" && selected.kind !== "image" && (
-                    <NumberField
-                      label="소스 시작"
-                      value={selected.sourceIn}
-                      min={0}
-                      max={selectedMedia?.duration}
-                      step={1 / project.fps}
-                      unit="s"
-                      onCommit={(v) => patch({ sourceIn: v })}
-                    />
-                  )}
-                  <TextField
-                    label="클립 이름"
-                    value={selected.name}
-                    onCommit={(v) => patch({ name: v })}
-                  />
-                </Section>
+                      )}
+                    {before && (
+                      <label className="inspector-select-field">
+                        <span>앞 클립과 전환</span>
+                        <select
+                          aria-label="앞 클립과 전환"
+                          disabled={busy}
+                          value={joined ? (selected.transitionIn?.type ?? "") : ""}
+                          onChange={(e) =>
+                            void setJoin(
+                              (e.target.value || null) as TransitionType | null,
+                              joined ? overlap : 0.5,
+                            )
+                          }
+                        >
+                          <option value="">없음</option>
+                          {transitionsFor(selected).map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {before && joined && (
+                      <NumberField
+                        label="전환 길이"
+                        value={selected.transitionIn?.duration ?? overlap}
+                        min={Number((1 / project.fps).toFixed(4))}
+                        max={maxTransitionDuration({ before, after: selected })}
+                        step={0.1}
+                        unit="s"
+                        onCommit={(v) =>
+                          void setJoin(
+                            selected.transitionIn?.type ??
+                              (isAudio ? "fade" : "dissolve"),
+                            v,
+                          )
+                        }
+                      />
+                    )}
+                    {ownTransitions.map(({ edge, type, length }) => (
+                      // Set by an older version or an agent: shown so it can be removed.
+                      <div className="project-stat-row" key={edge}>
+                        <span>
+                          {edge === "in" ? "등장" : "퇴장"} 전환 ·{" "}
+                          {transitionCatalog.find((item) => item.id === type)?.name ?? type}{" "}
+                          {Number(length.toFixed(2))}초
+                        </span>
+                        <button
+                          className="panel-action-button"
+                          aria-label={`${edge === "in" ? "등장" : "퇴장"} 전환 제거`}
+                          disabled={busy}
+                          onClick={() => void setTransition(edge, null, 0)}
+                        >
+                          제거
+                        </button>
+                      </div>
+                    ))}
+                  </Section>
+                )}
               </>
             )}
             {tab === "speed" && (
               <>
                 <Section
                   title="일반 속도"
+                  defaultOpen
                   onReset={() =>
                     patch({
                       speed: 1,
@@ -1857,21 +2035,14 @@ export function Inspector({
                     />
                     <span>역재생</span>
                   </label>
-                  <div className="project-stat-row">
-                    <span>변경 후 길이</span>
-                    <strong>{selected.duration.toFixed(2)}초</strong>
-                  </div>
                 </Section>
-                <p className="panel-help">
-                  속도를 바꾸면 사용한 원본 구간을 유지하며 클립 길이를
-                  조절합니다.
-                </p>
               </>
             )}
             {tab === "adjust" && (
               <>
                 <Section
                   title="밝기 · 대비"
+                  defaultOpen
                   onReset={() =>
                     patch({
                       color: { ...color, brightness: 0, contrast: 1 },
@@ -1900,6 +2071,7 @@ export function Inspector({
                 </Section>
                 <Section
                   title="색상"
+                  defaultOpen
                   onReset={() =>
                     patch({
                       color: { ...color, saturation: 1, temperature: 0, hue: 0 },
@@ -1942,7 +2114,6 @@ export function Inspector({
                 </Section>
                 <Section
                   title="HSL"
-                  defaultOpen={false}
                   onReset={() =>
                     patch({
                       color: {
@@ -2016,7 +2187,6 @@ export function Inspector({
                 </Section>
                 <Section
                   title="곡선"
-                  defaultOpen={false}
                   onReset={() =>
                     patch({
                       color: {
@@ -2126,7 +2296,7 @@ export function Inspector({
                     }
                   />
                 </Section>
-                <Section title="LUT" defaultOpen={false}>
+                <Section title="LUT">
                   {color.lut?.path && (
                     <>
                       <div className="lut-current">
@@ -2167,114 +2337,141 @@ export function Inspector({
                       </button>
                     </>
                   )}
-                  <label className="inspector-text-field">
-                    <span>LUT 파일 경로</span>
-                    <input
-                      aria-label="LUT 파일 경로"
-                      value={lutPath}
-                      placeholder="/Users/…/look.cube"
-                      onChange={(event) => setLutPath(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void importLut(lutPath);
-                      }}
-                    />
-                  </label>
-                  <div className="lut-import-actions">
-                    {isTauri() && (
-                      <button
-                        className="panel-wide-button secondary"
-                        disabled={busy}
-                        onClick={() => void browseLut()}
-                      >
-                        파일 선택
-                      </button>
-                    )}
+                  {isTauri() ? (
                     <button
                       className="panel-wide-button secondary"
-                      disabled={busy || !lutPath.trim()}
-                      onClick={() => void importLut(lutPath)}
+                      title=".cube · .3dl 파일을 프로젝트에 복사해 적용합니다"
+                      disabled={busy}
+                      onClick={() => void browseLut()}
                     >
-                      LUT 가져오기
+                      LUT 파일 선택
                     </button>
-                  </div>
-                  <p className="panel-help">
-                    .cube · .3dl 파일을 가져옵니다. LUT는 프로젝트에 복사해
-                    보관합니다.
-                  </p>
+                  ) : (
+                    // The browser build has no file dialog for local paths.
+                    <>
+                      <label className="inspector-text-field">
+                        <span>LUT 파일 경로</span>
+                        <input
+                          aria-label="LUT 파일 경로"
+                          value={lutPath}
+                          placeholder="/Users/…/look.cube"
+                          onChange={(event) => setLutPath(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") void importLut(lutPath);
+                          }}
+                        />
+                      </label>
+                      <button
+                        className="panel-wide-button secondary"
+                        disabled={busy || !lutPath.trim()}
+                        onClick={() => void importLut(lutPath)}
+                      >
+                        LUT 가져오기
+                      </button>
+                    </>
+                  )}
                 </Section>
               </>
             )}
             {tab === "animation" && (
               <>
-                {visual && (
-                  <Section title="인 · 아웃 애니메이션">
-                    <div className="transition-controls">
-                      <div className="segmented" role="group" aria-label="애니메이션 위치">
-                        {(
-                          [
-                            ["in", "인"],
-                            ["out", "아웃"],
-                          ] as const
-                        ).map(([id, label]) => (
-                          <button
-                            key={id}
-                            className={animationEdge === id ? "active" : ""}
-                            aria-pressed={animationEdge === id}
-                            onClick={() => setAnimationEdge(id)}
-                          >
-                            {label}
-                          </button>
-                        ))}
-                      </div>
-                      <label>
-                        길이
-                        <CommitNumber
-                          label="애니메이션 길이"
-                          value={animationLength}
-                          min={0.1}
-                          max={Math.max(0.1, selected.duration / 2)}
-                          step={0.1}
-                          onCommit={setAnimationLength}
-                        />
-                        <small>초</small>
-                      </label>
+                <Section title="등장 · 퇴장" defaultOpen>
+                  <div className="transition-controls">
+                    <div className="segmented" role="group" aria-label="애니메이션 위치">
+                      {(
+                        [
+                          ["in", "등장"],
+                          ["out", "퇴장"],
+                        ] as const
+                      ).map(([id, label]) => (
+                        <button
+                          key={id}
+                          className={animationEdge === id ? "active" : ""}
+                          aria-pressed={animationEdge === id}
+                          onClick={() => setAnimationEdge(id)}
+                        >
+                          {label}
+                        </button>
+                      ))}
                     </div>
-                    <div className="animation-presets">
-                      {[null, ...animationPresets].map((preset) => {
-                        const active =
-                          (activeAnimationPreset(selected, project, animationEdge)
-                            ?.id ?? null) === (preset?.id ?? null);
-                        return (
-                          <button
-                            key={preset?.id ?? "none"}
-                            className={active ? "active" : ""}
-                            aria-pressed={active}
-                            aria-label={`${animationEdge === "in" ? "인" : "아웃"} 애니메이션 ${preset?.name ?? "없음"}`}
-                            disabled={busy}
-                            onClick={() =>
-                              patch({
-                                keyframes: animationPresetKeyframes(
-                                  selected,
-                                  project,
-                                  animationEdge,
-                                  preset,
-                                  animationLength,
-                                ),
-                              })
-                            }
-                          >
-                            {preset?.name ?? "없음"}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    <p className="panel-help">
-                      프리셋은 클립의 {animationEdge === "in" ? "처음" : "끝"}에
-                      키프레임으로 기록되어 아래에서 그대로 고칠 수 있습니다.
-                    </p>
-                  </Section>
-                )}
-                <Section title="키프레임">
+                    <label>
+                      길이
+                      <CommitNumber
+                        label="애니메이션 길이"
+                        value={animationLength}
+                        min={0.1}
+                        max={Math.max(0.1, selected.duration / 2)}
+                        step={0.1}
+                        onCommit={setAnimationLength}
+                      />
+                      <small>초</small>
+                    </label>
+                  </div>
+                  <div className="animation-presets">
+                    {[null, ...animationPresets].map((preset) => {
+                      const active =
+                        (activeAnimationPreset(selected, project, animationEdge)
+                          ?.id ?? null) === (preset?.id ?? null);
+                      return (
+                        <button
+                          key={preset?.id ?? "none"}
+                          className={active ? "active" : ""}
+                          aria-pressed={active}
+                          aria-label={`${animationEdge === "in" ? "등장" : "퇴장"} 애니메이션 ${preset?.name ?? "없음"}`}
+                          disabled={busy}
+                          onClick={() =>
+                            patch({
+                              keyframes: animationPresetKeyframes(
+                                selected,
+                                project,
+                                animationEdge,
+                                preset,
+                                animationLength,
+                              ),
+                            })
+                          }
+                        >
+                          {preset?.name ?? "없음"}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </Section>
+                <Section title="움직임" defaultOpen>
+                  <div className="animation-presets">
+                    {[null, ...motionPresets].map((preset) => {
+                      const active =
+                        (activeMotionPreset(selected)?.id ?? null) ===
+                        (preset?.id ?? null);
+                      return (
+                        <button
+                          key={preset?.id ?? "none"}
+                          className={active ? "active" : ""}
+                          aria-pressed={active}
+                          aria-label={`움직임 ${preset?.name ?? "없음"}`}
+                          title={
+                            preset
+                              ? `클립 전체에 걸쳐 크기 ${Math.round(preset.start * 100)}% → ${Math.round(preset.end * 100)}%`
+                              : "크기 키프레임 지우기"
+                          }
+                          disabled={
+                            busy ||
+                            (!preset &&
+                              !selected.keyframes.some(
+                                (k) => canonicalProperty(k.property) === "transform.scale",
+                              ))
+                          }
+                          onClick={() =>
+                            patch({ keyframes: motionPresetKeyframes(selected, preset) })
+                          }
+                        >
+                          {preset?.name ?? "없음"}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </Section>
+                <Section title="키프레임" defaultOpen>
                   <div className="project-stat-row">
                     <span>클립 내 현재 위치</span>
                     <strong>
@@ -2291,31 +2488,18 @@ export function Inspector({
                     )}
                     onChange={(keyframes) => patch({ keyframes })}
                   />
-                  <p className="panel-help">
-                    다이아몬드를 누르면 현재 재생 위치의 값을 기록합니다.
-                    가속은 그 키프레임에서 다음 키프레임까지 적용됩니다.
-                  </p>
                 </Section>
               </>
             )}
           </>
         )}
-        {error && (
-          <p className="panel-inline-error" role="alert">
-            {error}
-          </p>
-        )}
       </div>
-      <footer className="inspector-footer">
-        <SlidersHorizontal size={12} />
-        <span>
-          {busy
-            ? "변경 사항 적용 중…"
-            : selected
-              ? "변경 사항은 자동 저장됩니다"
-              : "프로젝트 설정"}
-        </span>
-      </footer>
+      {/* Outside the scroll area: a failed edit near the top must not hide its reason below the fold. */}
+      {error && (
+        <p className="panel-inline-error pinned" role="alert" title={error.detail}>
+          {error.message}
+        </p>
+      )}
     </section>
   );
 }

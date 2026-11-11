@@ -1,30 +1,30 @@
-.preview-mode {
+.panel-heading > .heading-meta {
   margin-left: auto;
-  margin-right: 10px;
-  max-width: 112px;
-  color: var(--text, #f0f2f5);
-  border: 1px solid #41464f;
-  border-radius: 4px;
-  background: #292c31;
-  font: inherit;
-  font-size: 11px;
-  padding: 3px 5px;
+}
+.panel-heading > .preview-mode {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--muted);
+}
+.panel-heading > .preview-mode.active {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .preview-mode:focus-visible {
-  outline: 2px solid #37d7cb;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .preview-draft-badge {
-  color: #a7adb7;
-  font-size: 10px;
+  color: var(--muted);
+  font-size: var(--fs-supporting);
   white-space: nowrap;
-  margin-right: 8px;
 }
 .preview-playback-error {
   padding: 4px 12px;
-  color: var(--text, #f0f2f5);
-  font-size: 11px;
+  color: var(--text);
+  font-size: var(--fs-label);
   line-height: 1.5;
 }
 .layer-wipe {
@@ -59,40 +59,27 @@
 .player-viewport:fullscreen .composition {
   box-shadow: none;
 }
-.player-loop {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.player-loop > button {
-  min-width: 20px;
-  height: 22px;
-  border-radius: 3px;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--muted, #a7adb7);
-}
-.player-loop > button.active {
-  color: var(--accent, #37d7cb);
-  background: #263b3a;
+.player-options > .player-loop.active {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .player-volume {
   width: 64px;
-  accent-color: var(--accent, #37d7cb);
+  accent-color: var(--accent);
 }
 .player-zoom {
-  height: 22px;
-  border: 1px solid #41464f;
-  border-radius: 4px;
-  background: #292c31;
-  color: var(--text, #f0f2f5);
+  height: 24px;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-control);
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
-  font-size: 10px;
-  padding: 1px 3px;
+  font-size: var(--fs-label);
+  padding: 1px 4px;
 }
 .player-zoom:focus-visible,
 .player-volume:focus-visible,
-.player-loop > button:focus-visible {
-  outline: 2px solid var(--accent, #37d7cb);
+.player-loop:focus-visible {
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }

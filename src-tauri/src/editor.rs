@@ -417,10 +417,8 @@ impl Editor {
             // the old proxy does not count until it has been rebuilt. Without the
             // note it does not count either: the service deletes such a proxy.
             let proxy_file = media::proxy_path(&self.root, id);
-            let proxy = safe_project_id(id)
-                && proxy_file.is_file()
-                && std::fs::read_to_string(proxy_file.with_extension("source"))
-                    .is_ok_and(|source| source == string(item, "path", ""));
+            let proxy =
+                safe_project_id(id) && media::proxy_is_of(&proxy_file, string(item, "path", ""));
             let Some(object) = item.as_object_mut() else {
                 continue;
             };
@@ -562,12 +560,75 @@ impl Editor {
             }
             if let Ok(bytes) = std::fs::read(entry.path()) {
                 if let Ok(p) = serde_json::from_slice::<Value>(&bytes) {
-                    list.push(json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]}));
+                    let mut item =
+                        json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]});
+                    if let Some((media_id, path)) = self.cover(&p) {
+                        item["thumbnail"] = json!({"mediaId":media_id,"path":path});
+                    }
+                    // Nothing in it yet: the home screen leaves out the unnamed ones.
+                    let none = |key: &str| p[key].as_array().is_none_or(|list| list.is_empty());
+                    if none("clips") && none("media") {
+                        item["empty"] = json!(true);
+                    }
+                    list.push(item);
                 }
             }
         }
         list.sort_by_key(|p| std::cmp::Reverse(p["updatedAt"].as_u64().unwrap_or(0)));
         Ok(json!(list))
+    }
+
+    /// A thumbnail this app made: only files in the store's thumbnail folder are
+    /// offered for a project that is not open.
+    fn stored_thumbnail(&self, item: &Value) -> Option<PathBuf> {
+        let path = PathBuf::from(item["thumbnail"].as_str()?);
+        let ours = path.starts_with(self.root.join("thumbnails"))
+            && !path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir);
+        (ours && path.is_file()).then_some(path)
+    }
+
+    /// The picture that stands for a project: the earliest video or image clip whose
+    /// media already has a thumbnail. Nothing is generated here.
+    fn cover(&self, p: &Value) -> Option<(String, PathBuf)> {
+        let mut clips: Vec<&Value> = p["clips"]
+            .as_array()?
+            .iter()
+            .filter(|c| matches!(string(c, "kind", ""), "video" | "image"))
+            .collect();
+        clips.sort_by(|a, b| number(a, "start", 0.0).total_cmp(&number(b, "start", 0.0)));
+        let media = p["media"].as_array()?;
+        clips.iter().find_map(|clip| {
+            let item = media.iter().find(|m| m["id"] == clip["mediaId"])?;
+            Some((
+                item["id"].as_str()?.to_owned(),
+                self.stored_thumbnail(item)?,
+            ))
+        })
+    }
+
+    /// The thumbnail of a media item of any stored project, open or not, so a
+    /// project list can show the covers `project.list` names.
+    pub fn project_thumbnail(&self, project_id: &str, media_id: &str) -> Option<PathBuf> {
+        if !safe_project_id(project_id) {
+            return None;
+        }
+        let stored;
+        let project = if self.project["id"] == project_id {
+            &self.project
+        } else {
+            stored = serde_json::from_slice::<Value>(
+                &std::fs::read(self.project_file(project_id)).ok()?,
+            )
+            .ok()?;
+            &stored
+        };
+        let item = project["media"]
+            .as_array()?
+            .iter()
+            .find(|m| m["id"] == media_id)?;
+        self.stored_thumbnail(item)
     }
 
     /// App state lives in the store; its `exports` folder is ordinary output space
@@ -644,11 +705,10 @@ impl Editor {
         Ok((self.project.clone(), self.root.clone()))
     }
 
-    pub fn preview_is_current(&self, snapshot: &Value) -> Result<(), String> {
-        if &self.project != snapshot {
-            return Err("미리보기 중 프로젝트가 변경되었습니다. (PREVIEW_STALE)".into());
-        }
-        Ok(())
+    /// Files the editor is serving as preview assets (frames and precise-playback
+    /// videos); the storage cleaner leaves them alone.
+    pub fn preview_asset_paths(&self) -> Vec<PathBuf> {
+        self.preview_assets.values().cloned().collect()
     }
 
     pub fn register_preview_asset(&mut self, id: String, path: PathBuf) {
@@ -1083,7 +1143,10 @@ impl Editor {
                 let mut insertion = params.get("start").and_then(Value::as_f64);
                 for path in paths {
                     let path = Path::new(path.as_str().ok_or("파일 경로가 올바르지 않습니다.")?);
-                    let asset = media::probe_info(path, &self.root).await?;
+                    let mut asset = media::probe_info(path, &self.root).await?;
+                    if let Some(name) = uploaded_name(path, &self.root) {
+                        asset["name"] = json!(name);
+                    }
                     let existing = p["media"]
                         .as_array()
                         .unwrap()
@@ -1253,13 +1316,15 @@ impl Editor {
                 let time = params["time"]
                     .as_f64()
                     .ok_or("정지 프레임 위치가 필요합니다.")?;
+                let fps = number(&self.project, "fps", 30.0);
                 let hold = match params.get("duration") {
                     None => 2.0,
                     Some(value) => value
                         .as_f64()
-                        .filter(|d| (1.0 / number(&self.project, "fps", 30.0)..=3600.0).contains(d))
+                        .filter(|d| (1.0 / fps..=3600.0).contains(d))
                         .ok_or("정지 프레임 길이는 1프레임 이상 1시간 이하여야 합니다.")?,
                 };
+                let hold = snap_length(hold, fps);
                 let clip = self.project["clips"]
                     .as_array()
                     .unwrap()
@@ -1273,6 +1338,8 @@ impl Editor {
                 // Splitting first checks the position and the lock before any file work.
                 let mut p = self.project.clone();
                 mutate(&mut p, "edit.split", &json!({"id":id,"time":time}))?;
+                // The frame the split really landed on.
+                let time = split_time(&self.project, &clip, time)?;
                 let source = p["media"]
                     .as_array()
                     .unwrap()
@@ -1790,16 +1857,195 @@ fn trim_keyframes(clip: &Value, start: f64, duration: f64) -> Value {
     json!(result)
 }
 
-// No fade or transition outlasts its clip.
+// No fade or transition outlasts its clip, and the two never overlap: each is
+// first limited to the clip's length, and if together they are still longer than
+// the clip, both shrink by the same ratio so that they meet.
 fn fit_clip_fades(clip: &mut Value) {
     let duration = number(clip, "duration", 0.0);
-    for (fade, transition) in [("fadeIn", "transitionIn"), ("fadeOut", "transitionOut")] {
-        // Anything but a number is left for validation to refuse.
-        if let Some(length) = clip[fade].as_f64() {
-            clip[fade] = json!(length.min(duration));
+    // Anything but a number is left for validation to refuse.
+    for fade in ["fadeIn", "fadeOut"] {
+        if clip[fade].as_f64().is_some_and(|length| length > duration) {
+            clip[fade] = json!(duration);
         }
-        sync_transition(clip, fade, transition);
     }
+    if let (Some(fade_in), Some(fade_out)) = (clip["fadeIn"].as_f64(), clip["fadeOut"].as_f64()) {
+        if fade_in >= 0.0 && fade_out >= 0.0 && fade_in + fade_out > duration {
+            let fade_in = fade_in * duration / (fade_in + fade_out);
+            clip["fadeIn"] = json!(fade_in);
+            clip["fadeOut"] = json!(duration - fade_in);
+        }
+    }
+    sync_transition(clip, "fadeIn", "transitionIn");
+    sync_transition(clip, "fadeOut", "transitionOut");
+}
+
+// New edits place clips on the project's frame grid. Stored projects are never
+// migrated, so every helper below tolerates clips that are off the grid.
+fn snap(time: f64, fps: f64) -> f64 {
+    (time * fps).round() / fps
+}
+
+/// A whole number of frames, at least one.
+fn snap_length(length: f64, fps: f64) -> f64 {
+    (length * fps).round().max(1.0) / fps
+}
+
+/// Removes float noise from arithmetic on grid values; off-grid values are kept.
+fn settle(time: f64, fps: f64) -> f64 {
+    let snapped = snap(time, fps);
+    if (snapped - time).abs() < 1e-6 {
+        snapped
+    } else {
+        time
+    }
+}
+
+/// Snaps a clip's length to whole frames. A media clip that rounding pushed past
+/// the end of its source gives the partial frame back; keyframes that rounding
+/// left just past the end move to it.
+fn snap_clip_length(p: &Value, clip: &mut Value) {
+    if let Some(length) = clip["duration"].as_f64().filter(|d| d.is_finite()) {
+        let snapped = snap_length(length, number(p, "fps", 30.0));
+        set_clip_length(p, clip, length, snapped);
+    }
+}
+
+/// Gives a clip the whole-frame length `snapped`, chosen for a requested `length`.
+fn set_clip_length(p: &Value, clip: &mut Value, length: f64, mut snapped: f64) {
+    let fps = number(p, "fps", 30.0);
+    if snapped > length
+        && snapped > 1.5 / fps
+        && matches!(string(clip, "kind", ""), "video" | "audio")
+    {
+        let available = p["media"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["id"] == clip["mediaId"])
+            .map(|m| number(m, "duration", 0.0) - number(clip, "sourceIn", 0.0));
+        if available.is_some_and(|a| snapped * number(clip, "speed", 1.0) > a + 1e-6) {
+            snapped -= 1.0 / fps;
+            snapped = snap(snapped, fps);
+        }
+    }
+    clip["duration"] = json!(snapped);
+    if let Some(frames) = clip["keyframes"].as_array_mut() {
+        for frame in frames {
+            let time = number(frame, "time", 0.0);
+            if time > snapped && time < snapped + 1.0 / fps {
+                frame["time"] = json!(snapped);
+            }
+        }
+    }
+}
+
+/// A negative start is left as it is, for validation to refuse: rounding must not
+/// turn a position before the timeline into frame 0 (or into -0.0).
+fn snap_clip_start(p: &Value, clip: &mut Value) {
+    if let Some(start) = clip["start"]
+        .as_f64()
+        .filter(|s| s.is_finite() && *s >= 0.0)
+    {
+        clip["start"] = json!(snap(start, number(p, "fps", 30.0)) + 0.0);
+    }
+}
+
+/// Snaps a clip given by start and length: both ends go to their nearest frame,
+/// so clips that touched before rounding still touch after it. Rounding the
+/// length on its own could move the end one frame away from where it was asked.
+fn snap_clip_span(p: &Value, clip: &mut Value) {
+    let fps = number(p, "fps", 30.0);
+    let finite = |key: &str| clip[key].as_f64().filter(|value| value.is_finite());
+    let (Some(start), Some(length)) = (finite("start").filter(|s| *s >= 0.0), finite("duration"))
+    else {
+        snap_clip_start(p, clip);
+        snap_clip_length(p, clip);
+        return;
+    };
+    let first = (start * fps).round();
+    let frames = (((start + length) * fps).round() - first).max(1.0);
+    clip["start"] = json!(first / fps + 0.0);
+    set_clip_length(p, clip, length, frames / fps);
+}
+
+/// The stretch of source a speed change keeps. A clip remembers it (`sourceSpan`)
+/// from its last speed change, because its whole-frame length no longer tells it
+/// exactly; the memory counts only while it still accounts for the clip's length,
+/// so any later trim, split or resize makes the length the reference again.
+fn source_span(p: &Value, clip: &Value) -> f64 {
+    let length = number(clip, "duration", 1.0);
+    let speed = number(clip, "speed", 1.0);
+    clip["sourceSpan"]
+        .as_f64()
+        .filter(|span| span.is_finite() && *span > 0.0)
+        .filter(|span| {
+            let mut probe = clip.clone();
+            probe["duration"] = json!(span / speed);
+            snap_clip_length(p, &mut probe);
+            (number(&probe, "duration", 0.0) - length).abs() < 1e-6
+        })
+        .unwrap_or(length * speed)
+}
+
+/// Where a split of `clip` at `time` lands: the nearest frame that leaves both
+/// halves at least one frame long (an off-grid legacy clip may keep `time` itself).
+fn split_time(p: &Value, clip: &Value, time: f64) -> Result<f64, String> {
+    let fps = number(p, "fps", 30.0);
+    let start = number(clip, "start", 0.0);
+    let duration = number(clip, "duration", 0.0);
+    let fits = |time: &f64| {
+        let relative = time - start;
+        relative + 1e-8 >= 1.0 / fps && duration - relative + 1e-8 >= 1.0 / fps
+    };
+    if !time.is_finite() || !fits(&time) {
+        return Err(
+            "분할한 두 클립의 길이가 각각 최소 1프레임이 되도록 위치를 선택해 주세요.".into(),
+        );
+    }
+    Ok(Some(snap(time, fps)).filter(fits).unwrap_or(time))
+}
+
+/// Moves every clip on `track` that starts at or after `from` by `delta` seconds.
+/// Grouped clips on other tracks follow, so a group is not pulled apart: all of
+/// them when the whole group moves, and those at or after `from` when the group
+/// has a clip that stays on `track`. A locked track with such a clip refuses.
+fn shift_track(p: &mut Value, track: &Value, from: f64, delta: f64) -> Result<(), String> {
+    let fps = number(p, "fps", 30.0);
+    let clips = p["clips"].as_array().unwrap();
+    let after = |clip: &Value| number(clip, "start", 0.0) >= from - 1e-6;
+    let (mut moving, mut staying) = (HashSet::new(), HashSet::new());
+    for clip in clips.iter().filter(|clip| clip["trackId"] == *track) {
+        if let Some(group) = clip["groupId"].as_str() {
+            let side = if after(clip) {
+                &mut moving
+            } else {
+                &mut staying
+            };
+            side.insert(group);
+        }
+    }
+    let mut moved = Vec::new();
+    for (index, clip) in clips.iter().enumerate() {
+        if clip["trackId"] == *track {
+            if after(clip) {
+                moved.push(index);
+            }
+        } else if clip["groupId"].as_str().is_some_and(|group| {
+            moving.contains(group) && (after(clip) || !staying.contains(group))
+        }) {
+            ensure_unlocked(p, string(clip, "trackId", ""))?;
+            moved.push(index);
+        }
+    }
+    for index in moved {
+        let clip = &mut p["clips"][index];
+        let start = settle(number(clip, "start", 0.0) + delta, fps);
+        if start < -1e-6 {
+            return Err("클립을 타임라인 시작보다 앞으로 옮길 수 없습니다.".into());
+        }
+        clip["start"] = json!(start.max(0.0));
+    }
+    Ok(())
 }
 
 // fadeIn/fadeOut time the audio fade (and the picture's too for fade/dissolve);
@@ -1859,7 +2105,19 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             } else {
                 "video"
             };
-            let track = if let Some(id) = args["trackId"].as_str() {
+            // `newTrack` (its name) puts the clip on a track made for it, so that the
+            // track and the clip are one undo step.
+            let new_track = match args.get("newTrack") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(name)) if !name.trim().is_empty() => {
+                    if args.get("trackId").is_some_and(|id| !id.is_null()) {
+                        return Err("trackId와 newTrack은 함께 쓸 수 없습니다.".into());
+                    }
+                    Some(insert_track(p, wanted, name.trim()))
+                }
+                Some(_) => return Err("새 트랙 이름이 올바르지 않습니다.".into()),
+            };
+            let track = if let Some(id) = new_track.as_deref().or(args["trackId"].as_str()) {
                 p["tracks"]
                     .as_array()
                     .unwrap()
@@ -1885,6 +2143,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             {
                 return Err("소재와 트랙 종류가 맞지 않습니다.".into());
             }
+            let fps = number(p, "fps", 30.0);
             let default_start = p["clips"]
                 .as_array()
                 .unwrap()
@@ -1892,6 +2151,8 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 .filter(|c| c["trackId"] == track_id)
                 .map(|c| number(c, "start", 0.0) + number(c, "duration", 0.0))
                 .fold(0.0, f64::max);
+            // After an off-grid legacy clip, the next frame rather than an overlap.
+            let default_start = (default_start * fps - 1e-6).ceil().max(0.0) / fps;
             let duration = number(
                 args,
                 "duration",
@@ -1936,6 +2197,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             if args["transform"].is_object() {
                 merge(&mut clip["transform"], &args["transform"]);
             }
+            snap_clip_span(p, &mut clip);
             p["clips"].as_array_mut().unwrap().push(clip);
         }
         "edit.update" => {
@@ -1989,17 +2251,43 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 }
                 sync_transition(&mut p["clips"][index], fade, transition);
             }
-            if patch.contains_key("speed") && !patch.contains_key("duration") {
-                let speed = number(&p["clips"][index], "speed", 1.0);
-                if speed.is_finite() && speed > 0.0 {
-                    let ratio = number(&original, "speed", 1.0) / speed;
-                    p["clips"][index]["duration"] =
-                        json!(number(&original, "duration", 1.0) * ratio);
-                    if !patch.contains_key("keyframes") {
-                        if let Some(frames) = p["clips"][index]["keyframes"].as_array_mut() {
-                            for frame in frames {
-                                frame["time"] = json!(number(frame, "time", 0.0) * ratio);
-                            }
+            // A speed change keeps the clip's source span. It comes either alone or
+            // with the length that follows from it (what the inspector sends); any
+            // other length given with a speed is a resize and is taken as given.
+            let speed = number(&p["clips"][index], "speed", 1.0);
+            let length = number(&original, "duration", 1.0);
+            let retimed = patch.contains_key("speed")
+                && speed.is_finite()
+                && speed > 0.0
+                && patch.get("duration").is_none_or(|wanted| {
+                    wanted.as_f64().is_some_and(|wanted| {
+                        (wanted - length * number(&original, "speed", 1.0) / speed).abs() < 1e-6
+                    })
+                });
+            let mut clip = p["clips"][index].take();
+            match (
+                patch.contains_key("start"),
+                patch.contains_key("duration") && !retimed,
+            ) {
+                (true, true) => snap_clip_span(p, &mut clip),
+                (true, false) => snap_clip_start(p, &mut clip),
+                (false, true) => snap_clip_length(p, &mut clip),
+                (false, false) => {}
+            }
+            p["clips"][index] = clip;
+            if retimed {
+                let span = source_span(p, &original);
+                let mut clip = p["clips"][index].take();
+                clip["duration"] = json!(span / speed);
+                snap_clip_length(p, &mut clip);
+                clip["sourceSpan"] = json!(span);
+                p["clips"][index] = clip;
+                // Keyframes follow the length the clip really got.
+                let ratio = number(&p["clips"][index], "duration", length) / length;
+                if !patch.contains_key("duration") && !patch.contains_key("keyframes") {
+                    if let Some(frames) = p["clips"][index]["keyframes"].as_array_mut() {
+                        for frame in frames {
+                            frame["time"] = json!(number(frame, "time", 0.0) * ratio);
                         }
                     }
                 }
@@ -2056,37 +2344,74 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                         .ok_or_else(|| format!("트림 {key} 위치는 유효한 숫자여야 합니다.")),
                 }
             };
-            let start = boundary("start", old_start)?;
-            let end = boundary("end", old_end)?;
-            let duration = end - start;
+            let raw = (boundary("start", old_start)?, boundary("end", old_end)?);
             const TIME_EPSILON: f64 = 1e-8;
-            if start < 0.0 || duration + TIME_EPSILON < 1.0 / number(p, "fps", 30.0) {
+            let fps = number(p, "fps", 30.0);
+            let long_enough =
+                |(start, end): (f64, f64)| start >= 0.0 && end - start + TIME_EPSILON >= 1.0 / fps;
+            if !long_enough(raw) {
                 return Err(
                     "트림 시작 위치는 0 이상이고 클립 길이는 최소 1프레임이어야 합니다.".into(),
                 );
             }
-            let mut trimmed = original.clone();
-            if matches!(string(&original, "kind", ""), "video" | "audio") {
-                let speed = number(&original, "speed", 1.0);
+            let media_duration = if matches!(string(&original, "kind", ""), "video" | "audio") {
+                Some(
+                    p["media"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|m| m["id"] == original["mediaId"])
+                        .map(|m| number(m, "duration", 0.0))
+                        .ok_or("클립 원본을 찾을 수 없습니다.")?,
+                )
+            } else {
+                None
+            };
+            let speed = number(&original, "speed", 1.0);
+            let source_in = |(start, end): (f64, f64)| {
                 let offset = if original["reverse"] == true {
                     old_end - end
                 } else {
                     start - old_start
                 };
-                let source = number(&original, "sourceIn", 0.0) + offset * speed;
-                let media_duration = p["media"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|m| m["id"] == original["mediaId"])
-                    .map(|m| number(m, "duration", 0.0))
-                    .ok_or("클립 원본을 찾을 수 없습니다.")?;
-                if source < -TIME_EPSILON
-                    || source + duration * speed > media_duration + TIME_EPSILON
-                {
-                    return Err("트림 범위가 원본 미디어 길이를 벗어납니다.".into());
+                number(&original, "sourceIn", 0.0) + offset * speed
+            };
+            let in_source = |range: (f64, f64)| {
+                media_duration.is_none_or(|media_duration| {
+                    let source = source_in(range);
+                    source >= -TIME_EPSILON
+                        && source + (range.1 - range.0) * speed <= media_duration + TIME_EPSILON
+                })
+            };
+            if !in_source(raw) {
+                return Err("트림 범위가 원본 미디어 길이를 벗어납니다.".into());
+            }
+            // A given boundary goes to the nearest frame, or to the frame inside the
+            // requested range when the nearest one is past the source. A boundary that
+            // was not given stays where it is.
+            let pick = |key: &str, value: f64, snapped: f64| {
+                if args.get(key).is_some() {
+                    snapped
+                } else {
+                    value
                 }
-                trimmed["sourceIn"] = json!(source.max(0.0));
+            };
+            let nearest = (
+                pick("start", raw.0, snap(raw.0, fps)),
+                pick("end", raw.1, snap(raw.1, fps)),
+            );
+            let inward = (
+                pick("start", raw.0, (raw.0 * fps - 1e-6).ceil() / fps),
+                pick("end", raw.1, (raw.1 * fps + 1e-6).floor() / fps),
+            );
+            let (start, end) = [nearest, inward]
+                .into_iter()
+                .find(|range| long_enough(*range) && in_source(*range))
+                .unwrap_or(raw);
+            let duration = settle(end - start, fps);
+            let mut trimmed = original.clone();
+            if media_duration.is_some() {
+                trimmed["sourceIn"] = json!(source_in((start, end)).max(0.0));
             }
             trimmed["start"] = json!(start);
             trimmed["duration"] = json!(duration);
@@ -2105,20 +2430,15 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             let clip = p["clips"][i].clone();
             ensure_unlocked(p, string(&clip, "trackId", ""))?;
             let time = args["time"].as_f64().ok_or("분할 위치가 필요합니다.")?;
+            let time = split_time(p, &clip, time)?;
+            let fps = number(p, "fps", 30.0);
             let start = number(&clip, "start", 0.0);
             let duration = number(&clip, "duration", 0.0);
-            let relative = time - start;
-            let frame = 1.0 / number(p, "fps", 30.0);
-            if !time.is_finite() || relative + 1e-8 < frame || duration - relative + 1e-8 < frame {
-                return Err(
-                    "분할한 두 클립의 길이가 각각 최소 1프레임이 되도록 위치를 선택해 주세요."
-                        .into(),
-                );
-            }
+            let relative = settle(time - start, fps);
             let mut right = clip.clone();
             right["id"] = json!(media::id("clip"));
             right["start"] = json!(time);
-            right["duration"] = json!(duration - relative);
+            right["duration"] = json!(settle(duration - relative, fps));
             let speed = number(&clip, "speed", 1.0);
             let source = number(&clip, "sourceIn", 0.0);
             if matches!(string(&clip, "kind", ""), "video" | "audio") {
@@ -2151,7 +2471,10 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             let mut groups = HashMap::new();
             for mut c in selected {
                 c["id"] = json!(media::id("clip"));
-                c["start"] = json!(number(&c, "start", 0.0) + end - start);
+                c["start"] = json!(settle(
+                    number(&c, "start", 0.0) + end - start,
+                    number(p, "fps", 30.0)
+                ));
                 if let Some(group) = c["groupId"].as_str() {
                     let new = groups
                         .entry(group.to_owned())
@@ -2200,6 +2523,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 ensure_unlocked(p, string(c, "trackId", ""))?;
             }
             let ripple = args["ripple"].as_bool().unwrap_or(false);
+            let fps = number(p, "fps", 30.0);
             let clips = p["clips"].as_array_mut().unwrap();
             clips.retain(|c| !ids.contains(&c["id"]));
             if ripple {
@@ -2242,7 +2566,9 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                         .flatten()
                         .map(|(a, b)| (b.min(start + 0.0001) - a).max(0.0))
                         .sum();
-                    c["start"] = json!((start - shift).max(0.0));
+                    if shift > 0.0 {
+                        c["start"] = json!(settle(start - shift, fps).max(0.0));
+                    }
                 }
             }
         }
@@ -2388,6 +2714,8 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 clip["trackId"] = track["id"].clone();
                 clip["id"] = json!(media::id("clip"));
                 clip["start"] = json!(at + number(&clip, "start", 0.0) - earliest);
+                snap_clip_span(p, &mut clip);
+                fit_clip_fades(&mut clip);
                 if let Some(group) = clip["groupId"].as_str() {
                     let new = groups
                         .entry(group.to_owned())
@@ -2397,6 +2725,22 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 }
                 p["clips"].as_array_mut().unwrap().push(clip);
             }
+        }
+        // One command for a ripple: every clip on the track that starts at or after
+        // `from` moves by `delta` (whole frames), however many clips that is.
+        "edit.shift" => {
+            let track = required(args, "trackId")?;
+            ensure_unlocked(p, track)?;
+            let finite = |key: &str| args[key].as_f64().filter(|value| value.is_finite());
+            let from = finite("from").ok_or("이동을 시작할 위치(from)가 필요합니다.")?;
+            let delta = snap(
+                finite("delta").ok_or("이동할 길이(delta)가 필요합니다.")?,
+                number(p, "fps", 30.0),
+            );
+            if delta == 0.0 {
+                return Err("이동할 길이는 최소 1프레임이어야 합니다.".into());
+            }
+            shift_track(p, &json!(track), from, delta)?;
         }
         _ => return Err(format!("배치에서 지원하지 않는 편집 명령입니다: {method}")),
     }
@@ -2415,11 +2759,7 @@ fn insert_freeze(
     shorten(&mut still["name"]);
     let media_id = still["id"].clone();
     p["media"].as_array_mut().unwrap().push(still);
-    for other in p["clips"].as_array_mut().unwrap() {
-        if other["trackId"] == clip["trackId"] && number(other, "start", 0.0) >= time - 1e-6 {
-            other["start"] = json!(number(other, "start", 0.0) + hold);
-        }
-    }
+    shift_track(&mut p, &clip["trackId"], time, hold)?;
     mutate(
         &mut p,
         "edit.add",
@@ -2448,6 +2788,19 @@ fn insert_freeze(
     }
     validate_project(&p)?;
     Ok(p)
+}
+
+/// The service stores an uploaded file in its imports folder as `<uuid>-<name>`;
+/// the library shows the name the file came with.
+fn uploaded_name(path: &Path, root: &Path) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    let (prefix, name) = (file.get(..36)?, file.get(37..)?);
+    let stored = media::same_path(path.parent()?, &root.join("imports"));
+    (stored
+        && file.as_bytes()[36] == b'-'
+        && !name.is_empty()
+        && uuid::Uuid::parse_str(prefix).is_ok())
+    .then(|| name.to_string())
 }
 
 fn insert_track(p: &mut Value, kind: &str, name: &str) -> String {
@@ -2886,6 +3239,9 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
         }
         validate_options(c)?;
         validate_color(&c["color"])?;
+        if c.get("sourceSpan").is_some_and(|v| !v.is_null()) {
+            bounded(c, "sourceSpan", 0.0, 86400.0 * 16.0)?;
+        }
         if let Some(group) = c.get("groupId").filter(|v| !v.is_null()) {
             if !group.as_str().is_some_and(safe_project_id) {
                 return Err("그룹 ID가 올바르지 않습니다.".into());
@@ -3851,9 +4207,10 @@ mod tests {
             &json!({"id":"trim-clip","start":10.0,"end":11.0}),
         )
         .unwrap();
+        // Each fade is limited to the 1 s clip, then the two share it.
         for (fade, transition) in [("fadeIn", "transitionIn"), ("fadeOut", "transitionOut")] {
-            assert_eq!(p["clips"][0][fade], 1.0);
-            assert_eq!(p["clips"][0][transition]["duration"], 1.0);
+            assert_eq!(p["clips"][0][fade], 0.5);
+            assert_eq!(p["clips"][0][transition]["duration"], 0.5);
         }
         assert_eq!(p["clips"][0]["sourceIn"], 8.0);
     }
@@ -3983,8 +4340,8 @@ mod tests {
             &mut p,
             "edit.update",
             &json!({"id":"trim-clip","patch":{
-                "transitionIn":{"type":"fade","duration":3.0},
-                "transitionOut":{"type":"fade","duration":4.0}
+                "transitionIn":{"type":"fade","duration":1.5},
+                "transitionOut":{"type":"fade","duration":2.5}
             }}),
         )
         .unwrap();
@@ -4003,7 +4360,7 @@ mod tests {
         assert_eq!(p["clips"][0]["fadeIn"], 1.0);
         assert_eq!(p["clips"][0]["fadeOut"], 0.0);
         assert_eq!(p["clips"][1]["fadeIn"], 0.0);
-        assert_eq!(p["clips"][1]["fadeOut"], 3.0);
+        assert_eq!(p["clips"][1]["fadeOut"], 2.5);
         assert!(p["clips"][0]["transitionOut"].is_null());
         assert!(p["clips"][1]["transitionIn"].is_null());
         let mut image = trim_project("image", false, 2.0);
@@ -5125,10 +5482,11 @@ mod tests {
             p["clips"][0]["transitionIn"],
             json!({"type":"fade","duration":2.0})
         );
+        // 1.5 s + 0.5 s of fades no longer fit: both shrink by the same ratio.
         update(&mut p, json!({"duration":1.5})).unwrap();
-        assert_eq!(p["clips"][0]["fadeIn"], 1.5);
-        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.5);
-        assert_eq!(p["clips"][0]["fadeOut"], 0.5);
+        assert_eq!(p["clips"][0]["fadeIn"], 1.125);
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.125);
+        assert_eq!(p["clips"][0]["fadeOut"], 0.375);
         update(&mut p, json!({"fadeIn":0.0})).unwrap();
         assert!(p["clips"][0]["transitionIn"].is_null());
         update(
@@ -5480,9 +5838,9 @@ mod tests {
             p["clips"][0]["transitionIn"],
             json!({"type":"zoom","duration":0.4})
         );
-        update(&mut p, &video, json!({"duration":0.25})).unwrap();
-        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 0.25);
-        assert_eq!(p["clips"][0]["fadeIn"], 0.25);
+        update(&mut p, &video, json!({"duration":0.2})).unwrap();
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 0.2);
+        assert_eq!(p["clips"][0]["fadeIn"], 0.2);
         update(&mut p, &video, json!({"duration":4.0,"transitionIn":{"type":"zoom","duration":1.0},"transitionOut":{"type":"dissolve","duration":1.0}})).unwrap();
         let mut split = p.clone();
         mutate(
@@ -5763,9 +6121,11 @@ mod tests {
         std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
         std::fs::write(&proxy, b"proxy").unwrap();
         // Without the service's note of its source a proxy file does not count.
-        assert!(e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
-            .get("proxy")
-            .is_none());
+        assert!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
+                .get("proxy")
+                .is_none()
+        );
         std::fs::write(
             proxy.with_extension("source"),
             e.project["media"][0]["path"].as_str().unwrap(),
@@ -5785,12 +6145,17 @@ mod tests {
         );
         // A proxy noted as made from another file (relinked since) does not count.
         std::fs::write(proxy.with_extension("source"), "/another/file.mp4").unwrap();
-        assert!(e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
-            .get("proxy")
-            .is_none());
+        assert!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
+                .get("proxy")
+                .is_none()
+        );
         let path = e.project["media"][0]["path"].as_str().unwrap().to_owned();
         std::fs::write(proxy.with_extension("source"), path).unwrap();
-        assert_eq!(e.dispatch("project.get", json!({})).await.unwrap()["media"][0]["proxy"], true);
+        assert_eq!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]["proxy"],
+            true
+        );
         std::fs::remove_file(&proxy).unwrap();
         let full = e.dispatch("project.get", conditional).await.unwrap();
         assert!(full["media"][0].get("proxy").is_none());
@@ -5966,7 +6331,8 @@ mod tests {
         let p = e
             .dispatch(
                 "edit.freeze",
-                json!({"id":first,"time":1.0,"expectedRevision":revision}),
+                // Off-grid requests land on the 30 fps frame grid: 1.0 s and 2.0 s.
+                json!({"id":first,"time":1.01,"duration":2.01,"expectedRevision":revision}),
             )
             .await
             .unwrap();
@@ -6171,7 +6537,10 @@ mod tests {
         assert_eq!(clip["kind"], "audio");
         assert_eq!(clip["transitionIn"], json!({"type":"fade","duration":0.25}));
         assert_eq!(clip["transitionOut"], json!({"type":"fade","duration":0.5}));
-        assert_eq!((&clip["fadeIn"], &clip["fadeOut"]), (&json!(0.25), &json!(0.5)));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(0.25), &json!(0.5))
+        );
         assert!(clip.get("blendMode").is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -6180,22 +6549,698 @@ mod tests {
     fn transitions_and_fades_set_on_a_clip_never_outlast_it() {
         let mut p = trim_project("video", false, 1.0); // a 4 s clip
         let mut update = |patch: Value| {
-            mutate(&mut p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            mutate(
+                &mut p,
+                "edit.update",
+                &json!({"id":"trim-clip","patch":patch}),
+            )
+            .unwrap();
             validate_project(&p).unwrap();
             p["clips"][0].clone()
         };
         let clip = update(json!({"transitionIn":{"type":"wipeLeft","duration":10.0}}));
-        assert_eq!(clip["transitionIn"], json!({"type":"wipeLeft","duration":4.0}));
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":4.0})
+        );
         assert_eq!(clip["fadeIn"], 4.0);
+        // Together they may not be longer than the clip either: they share it.
         let clip = update(json!({"fadeOut":9.0}));
-        assert_eq!(clip["fadeOut"], 4.0);
-        let clip = update(json!({"transitionOut":{"type":"zoom","duration":86400.0}}));
-        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":4.0}));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(2.0), &json!(2.0))
+        );
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":2.0})
+        );
         // A transition of no length is no transition.
         let clip = update(json!({"transitionIn":{"type":"slideLeft","duration":0.0}}));
         assert!(clip["transitionIn"].is_null());
         assert_eq!(clip["fadeIn"], 0.0);
+        let clip = update(json!({"transitionOut":{"type":"zoom","duration":86400.0}}));
+        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":4.0}));
+        let clip = update(json!({"fadeIn":1.0,"fadeOut":5.0}));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(0.8), &json!(3.2))
+        );
+        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":3.2}));
         let clip = update(json!({"transitionOut":{"type":"zoom","duration":1.0}}));
         assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":1.0}));
+    }
+
+    #[test]
+    fn add_can_make_its_own_track_in_the_same_step() {
+        let mut p = trim_project("video", false, 1.0);
+        let tracks = p["tracks"].as_array().unwrap().len();
+        let clips = p["clips"].as_array().unwrap().len();
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"제목"},"start":0.0,"duration":2.0,"newTrack":"자막·텍스트 2"}),
+        )
+        .unwrap();
+        validate_project(&p).unwrap();
+        let track = p["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|track| track["name"] == "자막·텍스트 2")
+            .expect("the new track")
+            .clone();
+        assert_eq!(track["kind"], "text");
+        assert_eq!(p["tracks"].as_array().unwrap().len(), tracks + 1);
+        let added = p["clips"].as_array().unwrap().last().unwrap();
+        assert_eq!(p["clips"].as_array().unwrap().len(), clips + 1);
+        assert_eq!(added["trackId"], track["id"]);
+        // A refused add leaves no track behind, and the two ways to name a track exclude each other.
+        let mut refused = p.clone();
+        for params in [
+            json!({"text":{"content":"x"},"newTrack":"t","trackId":track["id"]}),
+            json!({"text":{"content":"x"},"newTrack":""}),
+            json!({"text":{"content":"x"},"newTrack":3}),
+            json!({"mediaId":"none","newTrack":"t"}),
+        ] {
+            assert!(
+                mutate(&mut refused, "edit.add", &params).is_err(),
+                "{params}"
+            );
+        }
+        assert_eq!(refused["tracks"], p["tracks"]);
+    }
+
+    #[tokio::test]
+    async fn shift_moves_every_later_clip_on_one_track_in_one_command() {
+        let mut p = trim_project("video", false, 1.0);
+        let template = p["clips"][0].clone();
+        // 700 one-second clips from 0 s: more than a batch of updates could carry.
+        let clips: Vec<Value> = (0..700)
+            .map(|i| {
+                let mut clip = template.clone();
+                clip["id"] = json!(format!("clip-{i}"));
+                clip["start"] = json!(i as f64);
+                clip["duration"] = json!(1.0);
+                clip
+            })
+            .chain([p["clips"][1].clone()])
+            .collect();
+        p["clips"] = json!(clips);
+        validate_project(&p).unwrap();
+        let before = p.clone();
+        // 0.51 s is 15.3 frames at 30 fps: the shift is 15 whole frames.
+        mutate(
+            &mut p,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":100.0,"delta":-0.51}),
+        )
+        .unwrap();
+        for (i, clip) in p["clips"].as_array().unwrap().iter().enumerate() {
+            let was = number(&before["clips"][i], "start", -1.0);
+            let moved = clip["trackId"] == "video-1" && was >= 100.0;
+            assert_eq!(
+                clip["start"],
+                if moved { was - 0.5 } else { was },
+                "clip {i}"
+            );
+            assert_eq!(clip["duration"], before["clips"][i]["duration"]);
+        }
+        // Repeated shifts leave no float noise behind.
+        for _ in 0..7 {
+            mutate(
+                &mut p,
+                "edit.shift",
+                &json!({"trackId":"video-1","from":50.0,"delta":0.1}),
+            )
+            .unwrap();
+        }
+        assert_eq!(p["clips"][49]["start"], 49.0);
+        assert_eq!(p["clips"][50]["start"], 50.7);
+        assert_eq!(p["clips"][100]["start"], 100.2);
+
+        let unchanged = p.clone();
+        for params in [
+            json!({"trackId":"video-1","from":0.0,"delta":-0.5}), // start below zero
+            json!({"trackId":"video-1","from":0.0,"delta":0.01}), // under one frame
+            json!({"trackId":"video-1","from":0.0}),
+            json!({"trackId":"video-1","delta":1.0}),
+            json!({"trackId":"video-1","from":"0","delta":1.0}),
+            json!({"trackId":"missing","from":0.0,"delta":1.0}),
+            json!({"from":0.0,"delta":1.0}),
+        ] {
+            let mut attempt = p.clone();
+            assert!(
+                mutate(&mut attempt, "edit.shift", &params).is_err(),
+                "accepted {params}"
+            );
+        }
+        p["tracks"][0]["locked"] = json!(true);
+        assert!(mutate(
+            &mut p,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":0.0,"delta":1.0})
+        )
+        .is_err());
+        p["tracks"][0]["locked"] = json!(false);
+        assert_eq!(p, unchanged);
+
+        // Through dispatch: usable in a batch, revision-guarded, atomic, one undo.
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        for start in [0.0, 2.0, 4.0] {
+            e.dispatch("edit.add", json!({"text":"t","start":start,"duration":2.0}))
+                .await
+                .unwrap();
+        }
+        let track = e.project["clips"][0]["trackId"].clone();
+        let before = e.project.clone();
+        let undo = e.undo.len();
+        assert!(e
+            .dispatch(
+                "edit.shift",
+                json!({"trackId":track,"from":2.0,"delta":1.0,"expectedRevision":0})
+            )
+            .await
+            .unwrap_err()
+            .contains("REVISION_CONFLICT"));
+        assert!(e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":3,"commands":[
+                    {"method":"edit.shift","params":{"trackId":track,"from":2.0,"delta":1.0}},
+                    {"method":"edit.shift","params":{"trackId":track,"from":0.0,"delta":-5.0}}
+                ]})
+            )
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":3,"commands":[
+                    {"method":"edit.shift","params":{"trackId":track,"from":2.0,"delta":-0.5}},
+                    {"method":"edit.update","params":{"id":p_id(&before, 1),"patch":{"transitionIn":{"type":"fade","duration":0.5}}}}
+                ]}),
+            )
+            .await
+            .unwrap();
+        let starts: Vec<&Value> = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| &c["start"])
+            .collect();
+        assert_eq!(starts, [&json!(0.0), &json!(1.5), &json!(3.5)]);
+        assert_eq!((p["revision"].clone(), e.undo.len()), (json!(4), undo + 1));
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn p_id(p: &Value, index: usize) -> Value {
+        p["clips"][index]["id"].clone()
+    }
+
+    fn frames(value: &Value) -> f64 {
+        value.as_f64().unwrap() * 30.0
+    }
+
+    #[test]
+    fn new_edits_land_on_the_frame_grid_and_stored_off_grid_clips_are_left_alone() {
+        let mut p = trim_project("video", false, 1.0); // 30 fps
+        let text_track = p["clips"][1]["trackId"].clone();
+        // add: nearest frame, at least one frame long.
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"a","start":1.01,"duration":0.99}),
+        )
+        .unwrap();
+        let added = p["clips"][2].clone();
+        assert_eq!(
+            (&added["start"], &added["duration"]),
+            (&json!(1.0), &json!(1.0))
+        );
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"b","start":20.0,"duration":0.001}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][3]["duration"], 1.0 / 30.0);
+
+        // update: start, duration and a duration derived from speed.
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        let clip = update(
+            &mut p,
+            json!({"start":2.02,"duration":0.51,"volume":0.333,"sourceIn":8.011}),
+        );
+        assert_eq!(
+            (&clip["start"], &clip["duration"]),
+            (&json!(61.0 / 30.0), &json!(0.5))
+        );
+        // Values that are not timeline positions are not touched.
+        assert_eq!(
+            (&clip["volume"], &clip["sourceIn"]),
+            (&json!(0.333), &json!(8.011))
+        );
+        update(
+            &mut p,
+            json!({"start":10.0,"duration":4.0,"sourceIn":8.0,"keyframes":[
+            {"property":"x","time":0.0,"value":0.0},{"property":"x","time":4.0,"value":100.0}]}),
+        );
+        let clip = update(&mut p, json!({"speed":1.7})); // 4 / 1.7 s = 70.59 frames
+        assert_eq!(clip["duration"], 71.0 / 30.0);
+        assert_eq!(clip["keyframes"][1]["time"], clip["duration"]);
+        let clip = update(&mut p, json!({"speed":1.0,"keyframes":[]}));
+        assert_eq!(frames(&clip["duration"]).fract(), 0.0);
+        update(&mut p, json!({"duration":4.0}));
+
+        // trim: given boundaries go to the nearest frame.
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":10.26,"end":13.49}),
+        )
+        .unwrap();
+        let clip = p["clips"][0].clone();
+        assert_eq!(clip["start"], 308.0 / 30.0);
+        assert_eq!(frames(&clip["duration"]).round(), 97.0);
+        assert_close(frames(&clip["duration"]), 97.0);
+        assert_close(number(&clip, "sourceIn", 0.0), 8.0 + 8.0 / 30.0);
+        // A source that ends between frames: the last partial frame is not used,
+        // and the request is still accepted.
+        p["media"][0]["duration"] = json!(30.02);
+        let source_end = number(&clip, "start", 0.0) + 30.02 - number(&clip, "sourceIn", 0.0);
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","end":source_end}),
+        )
+        .unwrap();
+        let clip = p["clips"][0].clone();
+        let end = number(&clip, "start", 0.0) + number(&clip, "duration", 0.0);
+        assert_close(end * 30.0, (source_end * 30.0).floor());
+        assert!(number(&clip, "sourceIn", 0.0) + number(&clip, "duration", 0.0) <= 30.02);
+        assert!(mutate(
+            &mut p.clone(),
+            "edit.trim",
+            &json!({"id":"trim-clip","end":source_end + 0.05})
+        )
+        .is_err());
+
+        // split: the cut is on a frame and both halves are whole frames.
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":10.0,"end":14.0}),
+        )
+        .unwrap();
+        mutate(
+            &mut p,
+            "edit.split",
+            &json!({"id":"trim-clip","time":11.51}),
+        )
+        .unwrap();
+        let (left, right) = (p["clips"][0].clone(), p["clips"][1].clone());
+        assert_eq!(
+            (&left["duration"], &right["start"]),
+            (&json!(1.5), &json!(11.5))
+        );
+        assert_eq!(right["duration"], 2.5);
+
+        // paste: position and length.
+        let mut copy = added.clone();
+        copy["start"] = json!(0.013);
+        copy["duration"] = json!(1.26);
+        copy["fadeIn"] = json!(1.0);
+        copy["fadeOut"] = json!(1.0);
+        mutate(&mut p, "edit.paste", &json!({"clips":[copy],"at":5.01})).unwrap();
+        let pasted = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(pasted["start"], 5.0);
+        assert_eq!(pasted["duration"], 38.0 / 30.0);
+        assert_close(
+            number(&pasted, "fadeIn", 0.0) + number(&pasted, "fadeOut", 0.0),
+            38.0 / 30.0,
+        );
+
+        // A stored project with off-grid clips still validates, an unrelated edit
+        // does not move them, and the next clip starts on the frame after them.
+        let mut legacy = trim_project("video", false, 1.0);
+        legacy["clips"][0]["start"] = json!(10.013);
+        legacy["clips"][0]["duration"] = json!(4.021);
+        legacy["clips"][1]["start"] = json!(16.004);
+        legacy["clips"][1]["duration"] = json!(2.003);
+        validate_project(&legacy).unwrap();
+        mutate(
+            &mut legacy,
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{"volume":0.5,"trackId":"video-1"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                &legacy["clips"][0]["start"],
+                &legacy["clips"][0]["duration"]
+            ),
+            (&json!(10.013), &json!(4.021))
+        );
+        // Shifting keeps the spacing of off-grid clips exactly.
+        mutate(
+            &mut legacy,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":0.0,"delta":1.0}),
+        )
+        .unwrap();
+        assert_close(number(&legacy["clips"][0], "start", 0.0), 11.013);
+        mutate(
+            &mut legacy,
+            "edit.add",
+            &json!({"text":"next","trackId":text_track}),
+        )
+        .unwrap();
+        let next = legacy["clips"].as_array().unwrap().last().unwrap();
+        assert_eq!(next["start"], 541.0 / 30.0); // the track ends at 18.007 s, in frame 540
+                                                 // Only one boundary of an off-grid clip was asked to move.
+        mutate(
+            &mut legacy,
+            "edit.trim",
+            &json!({"id":"trim-clip","end":13.01}),
+        )
+        .unwrap();
+        assert_close(number(&legacy["clips"][0], "start", 0.0), 11.013);
+        assert_close(number(&legacy["clips"][0], "duration", 0.0), 13.0 - 11.013);
+
+        // A source shorter than the rounded length gives the partial frame back.
+        let mut short = trim_project("video", false, 1.0);
+        short["media"][0]["duration"] = json!(10.02); // 300.6 frames
+        short["clips"] = json!([]);
+        mutate(&mut short, "edit.add", &json!({"mediaId":"trim-media"})).unwrap();
+        assert_eq!(short["clips"][0]["duration"], 10.0);
+    }
+
+    #[tokio::test]
+    async fn project_list_names_a_cover_thumbnail_that_is_served_for_closed_projects() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let thumbnails = e.root.join("thumbnails");
+        std::fs::create_dir_all(&thumbnails).unwrap();
+        let (late, early) = (thumbnails.join("late.jpg"), thumbnails.join("early.jpg"));
+        std::fs::write(&late, b"late").unwrap();
+        std::fs::write(&early, b"early").unwrap();
+        let outside = e.root.join("outside.jpg");
+        std::fs::write(&outside, b"outside").unwrap();
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            e.dispatch("project.list", json!({})).await.unwrap()[0]["empty"],
+            true
+        );
+        assert!(e.dispatch("project.list", json!({})).await.unwrap()[0]
+            .get("thumbnail")
+            .is_none());
+
+        let mut p = e.project.clone();
+        p["media"] = json!([
+            {"id":"sound","path":"/tmp/a.wav","kind":"audio","duration":9.0,"hasAudio":true,"thumbnail":late},
+            {"id":"bare","path":"/tmp/bare.png","kind":"image","duration":5.0},
+            {"id":"foreign","path":"/tmp/foreign.png","kind":"image","duration":5.0,"thumbnail":outside},
+            {"id":"late","path":"/tmp/late.mp4","kind":"video","duration":9.0,"hasAudio":true,"thumbnail":late},
+            {"id":"early","path":"/tmp/early.png","kind":"image","duration":5.0,"thumbnail":early},
+            {"id":"gone","path":"/tmp/gone.png","kind":"image","duration":5.0,"thumbnail":thumbnails.join("gone.jpg")}
+        ]);
+        let clip = |kind: &str, media: &str, track: &str, start: f64| {
+            let mut clip = default_clip(kind, media, track, start, 1.0);
+            clip["mediaId"] = json!(media);
+            clip
+        };
+        // The earliest picture clips have no usable thumbnail; "early" is the first that has.
+        p["clips"] = json!([
+            clip("audio", "sound", "audio-1", 0.0),
+            clip("video", "late", "video-1", 6.0),
+            clip("image", "bare", "video-1", 0.0),
+            clip("image", "foreign", "video-1", 1.0),
+            clip("image", "gone", "video-1", 2.0),
+            clip("image", "early", "video-1", 3.0)
+        ]);
+        e.commit(p).unwrap();
+        let cover = json!({"mediaId":"early","path":early});
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list[0]["thumbnail"], cover);
+        assert_eq!(e.project_thumbnail(&first, "early"), Some(early.clone()));
+
+        // Still there, and still served, once another project is open.
+        e.dispatch("project.new", json!({"name":"둘째"}))
+            .await
+            .unwrap();
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        let listed = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(listed(&first)["thumbnail"], cover);
+        assert!(listed(e.project["id"].as_str().unwrap())
+            .get("thumbnail")
+            .is_none());
+        assert_eq!(e.asset_path("early", true), None);
+        assert_eq!(e.project_thumbnail(&first, "early"), Some(early));
+        assert_eq!(e.project_thumbnail(&first, "late"), Some(late));
+        // Nothing outside the thumbnail folder, missing, unknown or with an unsafe id.
+        for (project, media) in [
+            (first.as_str(), "foreign"),
+            (first.as_str(), "gone"),
+            (first.as_str(), "bare"),
+            (first.as_str(), "missing"),
+            ("missing", "early"),
+            ("../current", "early"),
+        ] {
+            assert_eq!(
+                e.project_thumbnail(project, media),
+                None,
+                "{project} {media}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn span(clip: &Value) -> (f64, f64) {
+        // Frame numbers; anything off the grid stays visibly fractional.
+        let frame = |seconds: f64| (seconds * 30.0 * 1e6).round() / 1e6;
+        let start = number(clip, "start", -1.0);
+        (frame(start), frame(start + number(clip, "duration", -1.0)))
+    }
+
+    #[tokio::test]
+    async fn clips_that_touch_before_frame_rounding_still_touch_after_it() {
+        // 1.017 s = 30.51 frames, 2.534 s = 76.02 frames: rounding start and length
+        // separately would end the first clip on frame 77 and start the second on 76.
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let srt = dir.join("touching.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:01,017 --> 00:00:02,534\nfirst\n\n2\n00:00:02,534 --> 00:00:04,000\nsecond\n",
+        )
+        .unwrap();
+        let p = e
+            .dispatch("captions.import", json!({"path":srt}))
+            .await
+            .unwrap();
+        assert_eq!(span(&p["clips"][0]), (31.0, 76.0));
+        assert_eq!(span(&p["clips"][1]), (76.0, 120.0));
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut p = trim_project("video", false, 1.0);
+        for (start, duration) in [(1.017, 1.517), (2.534, 1.466)] {
+            mutate(
+                &mut p,
+                "edit.add",
+                &json!({"text":"t","start":start,"duration":duration}),
+            )
+            .unwrap();
+        }
+        assert_eq!(span(&p["clips"][2]), (31.0, 76.0));
+        assert_eq!(span(&p["clips"][3]), (76.0, 120.0));
+        // update with both values: the same ends as add.
+        let neighbour = p_id(&p, 1);
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":neighbour,"patch":{"start":1.017,"duration":1.517}}),
+        )
+        .unwrap();
+        assert_eq!(span(&p["clips"][1]), (31.0, 76.0));
+        // paste: a touching pair pasted at an off-grid time stays touching.
+        let copies = json!([p["clips"][2], p["clips"][3]]);
+        mutate(&mut p, "edit.paste", &json!({"clips":copies,"at":10.017})).unwrap();
+        let (first, second) = (span(&p["clips"][4]), span(&p["clips"][5]));
+        assert_eq!(first.0, 301.0);
+        assert_eq!(first.1, second.0);
+        assert_eq!(second.1 - second.0, 44.0);
+        // A length under half a frame is still one frame.
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"t","start":1.017,"duration":0.001}),
+        )
+        .unwrap();
+        assert_eq!(span(&p["clips"][6]), (31.0, 32.0));
+    }
+
+    #[test]
+    fn a_speed_change_and_back_restores_the_length() {
+        // Frames 60..180 of the timeline, 4 s of a 30 s source.
+        let project = || {
+            let mut p = trim_project("video", false, 1.0);
+            p["clips"][0]["start"] = json!(2.0);
+            p
+        };
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        let mut p = project();
+        let clip = update(&mut p, json!({"speed":1.7})); // 70.59 frames
+        assert_eq!(frames(&clip["duration"]), 71.0);
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+        // Several steps away and back.
+        for speed in [0.3, 2.9, 1.1, 1.0] {
+            update(&mut p, json!({"speed":speed}));
+        }
+        assert_eq!(span(&p["clips"][0]), (60.0, 180.0));
+
+        // The inspector sends the length it derived along with the speed.
+        let mut p = project();
+        let clip = update(&mut p, json!({"speed":1.7,"duration":4.0 / 1.7}));
+        assert_eq!(frames(&clip["duration"]), 71.0);
+        let length = number(&clip, "duration", 0.0) * 1.7;
+        let clip = update(&mut p, json!({"speed":1.0,"duration":length}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+
+        // A clip that ends with its source gives the partial frame back while
+        // faster, and still returns to its length.
+        let mut p = project();
+        p["media"][0]["duration"] = json!(12.0);
+        let clip = update(&mut p, json!({"speed":1.7}));
+        assert_eq!(frames(&clip["duration"]), 70.0);
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+
+        // A resize after the speed change makes the new length the reference.
+        let mut p = project();
+        update(&mut p, json!({"speed":1.7}));
+        update(&mut p, json!({"duration":2.0}));
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(frames(&clip["duration"]), 102.0);
+        // A length given with a speed that is not the derived one is a resize.
+        let clip = update(&mut p, json!({"speed":2.0,"duration":1.0}));
+        assert_eq!(frames(&clip["duration"]), 30.0);
+        validate_project(&p).unwrap();
+        p["clips"][0]["sourceSpan"] = json!("4");
+        assert!(validate_project(&p).is_err());
+    }
+
+    #[test]
+    fn shift_keeps_grouped_clips_on_other_tracks_together() {
+        let mut p = trim_project("video", false, 1.0);
+        let text_track = p["clips"][1]["trackId"].clone();
+        let mut clips = Vec::new();
+        for (id, start, group) in [("a", 0.0, "one"), ("b", 2.0, "two"), ("c", 4.0, "three")] {
+            let mut clip = p["clips"][0].clone();
+            clip["id"] = json!(id);
+            clip["start"] = json!(start);
+            clip["duration"] = json!(2.0);
+            clip["groupId"] = json!(group);
+            clips.push(clip);
+        }
+        // Captions: one before `from` grouped with a moving clip, one loose, and
+        // two in a group that also has a clip staying on the shifted track.
+        for (id, start, group) in [
+            ("cap-b", 1.9, Some("two")),
+            ("cap-loose", 3.0, None),
+            ("cap-a-early", 0.5, Some("one")),
+            ("cap-a-late", 2.5, Some("one")),
+        ] {
+            let mut clip = p["clips"][1].clone();
+            clip["id"] = json!(id);
+            clip["start"] = json!(start);
+            clip["duration"] = json!(0.5);
+            if let Some(group) = group {
+                clip["groupId"] = json!(group);
+            }
+            clips.push(clip);
+        }
+        p["clips"] = json!(clips);
+        p["clips"][2]["groupId"] = json!("one"); // a stays, c moves: group one is split
+        validate_project(&p).unwrap();
+        let starts = |p: &Value| -> Vec<f64> {
+            p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| number(c, "start", -1.0))
+                .collect()
+        };
+        let before = p.clone();
+        let shift = json!({"trackId":"video-1","from":2.0,"delta":-0.5});
+        mutate(&mut p, "edit.shift", &shift).unwrap();
+        assert_eq!(starts(&p), [0.0, 1.5, 3.5, 1.4, 3.0, 0.5, 2.0]);
+
+        // A grouped clip on a locked track, or one that would start before 0,
+        // refuses the whole shift.
+        let mut locked = before.clone();
+        for track in locked["tracks"].as_array_mut().unwrap() {
+            if track["id"] == text_track {
+                track["locked"] = json!(true);
+            }
+        }
+        let unchanged = locked.clone();
+        assert!(mutate(&mut locked, "edit.shift", &shift).is_err());
+        assert_eq!(locked, unchanged);
+        let mut early = before.clone();
+        early["clips"][3]["start"] = json!(0.2);
+        assert!(mutate(&mut early, "edit.shift", &shift).is_err());
+    }
+
+    #[test]
+    fn a_start_before_the_timeline_is_refused_not_rounded_to_zero() {
+        let mut p = trim_project("video", false, 1.0);
+        let before = p.clone();
+        for (method, params) in [
+            ("edit.add", json!({"text":"t","start":-0.01,"duration":1.0})),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"start":-0.01}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"start":-0.01,"duration":1.0}}),
+            ),
+        ] {
+            let mut attempt = p.clone();
+            assert!(
+                mutate(&mut attempt, method, &params).is_err(),
+                "accepted {params}"
+            );
+        }
+        assert_eq!(p, before);
+        // Under half a frame after 0 is frame 0, stored as a plain zero.
+        for start in [0.01, -0.0] {
+            mutate(
+                &mut p,
+                "edit.update",
+                &json!({"id":"trim-clip","patch":{"start":start}}),
+            )
+            .unwrap();
+            let stored = p["clips"][0]["start"].as_f64().unwrap();
+            assert!(stored == 0.0 && stored.is_sign_positive());
+        }
     }
 }

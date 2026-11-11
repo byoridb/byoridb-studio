@@ -41,6 +41,7 @@ const mount = (overrides: Partial<React.ComponentProps<typeof Timeline>> = {}) =
 };
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   vi.stubGlobal("PointerEvent", MouseEvent);
   act(() => playbackClock.seek(0));
 });
@@ -58,9 +59,9 @@ describe("timeline with a large project", () => {
     expect(thumbnails).toBe(drawn);
     const playhead = container.querySelector<HTMLElement>(".playhead")!;
     for (let frame = 1; frame <= 120; frame++) act(() => playbackClock.set(frame / 60));
-    // Two seconds of playback moved the playhead and the timecode only.
+    // Two seconds of playback moved the playhead only; the timecode lives in the player.
     expect(playhead.style.left).toBe(`${2 * 68}px`);
-    expect(container.querySelector(".track-label-spacer")).toHaveTextContent("00:00:02:00");
+    expect(container.querySelector(".track-label-spacer")).toBeEmptyDOMElement();
     expect(assetUrl.mock.calls.length).toBe(thumbnails);
     expect(container.querySelectorAll(".timeline-clip").length).toBe(drawn);
     console.info(`[perf] timeline 500 clips: ${drawn} clip elements, ${nodes} DOM nodes, 0 clip re-renders over 120 playback frames`);
@@ -89,10 +90,13 @@ describe("timeline with a large project", () => {
   });
   it("derives the split state from the clock without a time prop", () => {
     const { props } = mount({ selectedIds: ["a"], selectedId: "a" });
-    const split = screen.getByTitle("나누기 (⌘B)");
+    const split = screen.getByRole("button", { name: "나누기" });
     expect(split).toBeDisabled();
+    // The reason is on the button, not in a standing line of text.
+    expect(split).toHaveAttribute("title", "나누기 (⌘B) · 재생 헤드를 클립 안으로 옮기세요 · 양쪽 1프레임 이상");
     act(() => playbackClock.seek(1));
     expect(split).toBeEnabled();
+    expect(split).toHaveAttribute("title", "나누기 (⌘B)");
     fireEvent.click(split);
     expect(props.onCommand).toHaveBeenCalledWith("edit.split", { id: "a", time: 1, expectedRevision: 7 });
   });
@@ -107,8 +111,9 @@ describe("timeline transitions", () => {
     expect(props.onCommand).toHaveBeenCalledWith("edit.batch", {
       expectedRevision: 7,
       commands: [
-        { method: "edit.update", params: { id: "b", patch: { start: 1.5, transitionIn: { type: "wipeLeft", duration: 0.5 } } } },
-        { method: "edit.update", params: { id: "c", patch: { start: 5.5 } } },
+        { method: "edit.update", params: { id: "b", patch: { transitionIn: { type: "wipeLeft", duration: 0.5 } } } },
+        // One ripple command for the later clip and everything after it.
+        { method: "edit.shift", params: { trackId: "v1", from: 2, delta: -0.5 } },
       ],
     });
     const project = fixture([clip("a", 0), clip("b", 1.5, { transitionIn: { type: "wipeLeft", duration: 0.5 } }), clip("c", 5.5)]);
@@ -120,14 +125,14 @@ describe("timeline transitions", () => {
     fireEvent.change(duration, { target: { value: "1" } });
     fireEvent.blur(duration);
     expect(vi.mocked(props.onCommand).mock.calls[0][1]).toMatchObject({ commands: [
-      { params: { id: "b", patch: { start: 1, transitionIn: { type: "wipeLeft", duration: 1 } } } },
-      { params: { id: "c", patch: { start: 5 } } },
+      { params: { id: "b", patch: { transitionIn: { type: "wipeLeft", duration: 1 } } } },
+      { method: "edit.shift", params: { trackId: "v1", from: 1.5, delta: -0.5 } },
     ] });
     vi.mocked(props.onCommand).mockClear();
     fireEvent.click(screen.getByRole("button", { name: "전환 제거" }));
     expect(vi.mocked(props.onCommand).mock.calls[0][1]).toMatchObject({ commands: [
-      { params: { id: "b", patch: { start: 2, transitionIn: null } } },
-      { params: { id: "c", patch: { start: 6 } } },
+      { params: { id: "b", patch: { transitionIn: null } } },
+      { method: "edit.shift", params: { trackId: "v1", from: 1.5, delta: 0.5 } },
     ] });
     expect(screen.queryByLabelText("전환 종류")).toBeNull();
   });
@@ -216,6 +221,84 @@ describe("timeline markers and loop", () => {
     fireEvent.keyDown(marker, { key: "Enter" });
     expect(screen.getByLabelText("마커 이름")).toHaveValue("인트로");
     expect(marker).toHaveAttribute("aria-expanded", "true");
+  });
+  it("marks the repeated range by ⌥-dragging the ruler, without scrubbing", () => {
+    const onLoop = vi.fn();
+    const { props, container } = mount({ onLoop });
+    const ruler = container.querySelector(".timeline-ruler")!;
+    fireEvent.pointerDown(ruler, { clientX: 136, altKey: true });
+    fireEvent.pointerMove(ruler, { clientX: 68, altKey: true });
+    expect(onLoop).toHaveBeenLastCalledWith({ start: 1, end: 2 });
+    fireEvent.pointerUp(ruler);
+    fireEvent.pointerMove(ruler, { clientX: 300 });
+    expect(onLoop).toHaveBeenCalledTimes(1);
+    expect(props.onTime).not.toHaveBeenCalled();
+  });
+  it("remembers zoom and snapping for each project", () => {
+    const first = mount();
+    fireEvent.click(screen.getByTitle("타임라인 확대"));
+    fireEvent.click(screen.getByTitle("스냅 켜기/끄기"));
+    first.unmount();
+    const other = { ...fixture([clip("a", 0)]), id: "other" };
+    const second = mount();
+    expect(screen.getByTitle("스냅 켜기/끄기")).toHaveAttribute("aria-pressed", "false");
+    expect(second.container.querySelector<HTMLElement>(".timeline-clip")!.style.width).toBe(`${2 * 68 * 1.25}px`);
+    // Another project starts from the defaults; coming back restores the stored view.
+    second.rerender(<Timeline {...second.props} project={other} />);
+    expect(screen.getByTitle("스냅 켜기/끄기")).toHaveAttribute("aria-pressed", "true");
+    expect(second.container.querySelector<HTMLElement>(".timeline-clip")!.style.width).toBe(`${2 * 68}px`);
+    second.rerender(<Timeline {...second.props} />);
+    expect(screen.getByTitle("스냅 켜기/끄기")).toHaveAttribute("aria-pressed", "false");
+  });
+  it("lists the shortcuts in one popover instead of standing hints", () => {
+    const { container } = mount();
+    expect(container.querySelector(".timeline-footer, .timeline-edit-guide, .timeline-title")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "단축키" }));
+    expect(screen.getByRole("dialog", { name: "단축키" })).toHaveTextContent("재생 헤드에서 나누기");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "단축키" })).toBeNull();
+  });
+  it("closes the shortcut popover with Escape without letting the editor clear the selection", () => {
+    mount();
+    // Stands in for App's window key handler, whose Escape clears the selection.
+    const editor = vi.fn();
+    window.addEventListener("keydown", editor);
+    try {
+      const toggle = screen.getByRole("button", { name: "단축키" });
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(toggle).not.toHaveAttribute("aria-controls");
+      toggle.focus();
+      fireEvent.click(toggle);
+      const popover = screen.getByRole("dialog", { name: "단축키" });
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
+      expect(toggle).toHaveAttribute("aria-controls", popover.id);
+      expect(popover).toHaveFocus();
+      fireEvent.keyDown(popover, { key: "Escape" });
+      expect(screen.queryByRole("dialog", { name: "단축키" })).toBeNull();
+      expect(editor).not.toHaveBeenCalled();
+      expect(toggle).toHaveFocus();
+      // Other keys still reach the editor while it is open, and Escape does once it is closed.
+      fireEvent.click(toggle);
+      fireEvent.keyDown(document.body, { key: "m" });
+      expect(editor).toHaveBeenCalledTimes(1);
+      fireEvent.pointerDown(document.body);
+      expect(screen.queryByRole("dialog", { name: "단축키" })).toBeNull();
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      expect(editor).toHaveBeenCalledTimes(2);
+    } finally {
+      window.removeEventListener("keydown", editor);
+    }
+  });
+  it("shows only the switches that apply to each kind of track and one line per text clip", () => {
+    const project = fixture(
+      [clip("a", 0), clip("t", 0, { kind: "text", trackId: "t1", mediaId: undefined, text: { content: "자막" } as Clip["text"] })],
+      [track("v1"), track("a1", "audio"), track("t1", "text")],
+    );
+    const { container } = mount({ project });
+    const names = Array.from(container.querySelectorAll(".track-switches button")).map((button) => button.getAttribute("aria-label"));
+    expect(names).toEqual(["v1 잠금", "v1 표시", "v1 음소거", "a1 잠금", "a1 음소거", "t1 잠금", "t1 표시"]);
+    expect(container.querySelector(".clip-text-preview")).toBeNull();
+    expect(container.querySelectorAll(".timeline-marker-line")).toHaveLength(0);
   });
   it("draws the repeated range on the ruler", () => {
     const { container } = mount({ loop: { start: 1, end: 3 } });

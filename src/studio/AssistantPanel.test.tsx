@@ -317,4 +317,49 @@ describe("AssistantPanel", () => {
     render(panel());
     expect(await screen.findByText("도입부를 다듬는 중")).toBeInTheDocument();
   });
+
+  it("opens on the request box: no logo or slogan, one Korean title", () => {
+    serve({});
+    const { container } = render(panel());
+    expect(screen.getByText("어시스턴트")).toBeInTheDocument();
+    expect(screen.queryByText(/Byori Assistant/)).toBeNull();
+    expect(container.querySelector(".assistant-orbit")).toBeNull();
+    expect(container.querySelector(".assistant-intro h2")).toBeNull();
+    expect(screen.getByText("원하는 편집을 말해 주세요.")).toBeInTheDocument();
+    expect(container.querySelectorAll(".suggestion-list > button")).toHaveLength(3);
+  });
+
+  it("shows the undo note only until the first request was sent", async () => {
+    localStorage.removeItem("byori.assistant.introduced");
+    serve({ "agent.start": () => ({ id: "job1" }), "agent.status": () => ({ id: "job1", state: "running", logs: [] }) });
+    const note = "변경 내용은 타임라인에 반영되며 실행 취소할 수 있습니다.";
+    const first = render(panel());
+    expect(screen.getByText(note)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("편집 요청"), { target: { value: "도입부를 줄여줘" } });
+    fireEvent.click(screen.getByTitle("편집 요청 보내기 (⌘Enter)"));
+    await waitFor(() => expect(calls("agent.start")).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByText(note)).toBeNull());
+    first.unmount();
+    serve({});
+    render(panel({ project: { ...project, id: "p2" } }));
+    expect(screen.queryByText(note)).toBeNull();
+  });
+
+  it("confirms a saved concept field beside its label for a moment", async () => {
+    vi.useFakeTimers();
+    serve({});
+    const onCommand = vi.fn().mockResolvedValue(project);
+    render(panel({ onCommand }));
+    fireEvent.click(screen.getByRole("button", { name: "컨셉" }));
+    const message = screen.getByPlaceholderText("보고 난 뒤 남기고 싶은 한 가지");
+    expect(message).toHaveAttribute("rows", "2");
+    fireEvent.change(message, { target: { value: "바다" } });
+    fireEvent.blur(message);
+    await act(async () => {});
+    expect(screen.getByRole("status")).toHaveTextContent("저장됨");
+    await act(async () => {
+      vi.advanceTimersByTime(1600);
+    });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
 });

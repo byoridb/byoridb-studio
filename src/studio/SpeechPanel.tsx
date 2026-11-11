@@ -9,6 +9,7 @@ import {
   Square,
 } from "lucide-react";
 import { rpc } from "./api";
+import { errorText, type ErrorText } from "./errorText";
 import type { Command, Project } from "./types";
 
 interface SpeechStatus {
@@ -28,6 +29,18 @@ interface SpeechJob {
   revision?: number;
 }
 type Operation = "transcribe" | "synthesize";
+/** "Eddy (한국어(한국))" with "ko-KR" reads as "Eddy · 한국어". */
+export function voiceLabel(voice: { name: string; language: string }) {
+  const name = voice.name.replace(/\s*\(.*$/, "").trim() || voice.name;
+  const code = voice.language.split(/[-_]/)[0];
+  let language = voice.language;
+  try {
+    language = new Intl.DisplayNames(["ko"], { type: "language" }).of(code) || language;
+  } catch {
+    // An unknown code is shown as it is.
+  }
+  return language ? `${name} · ${language}` : name;
+}
 interface SpeechPanelProps {
   mode: Operation;
   visible: boolean;
@@ -46,7 +59,9 @@ export default function SpeechPanel({
   const [status, setStatus] = useState<SpeechStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setFailure] = useState<ErrorText | null>(null);
+  const setError = (value: unknown) =>
+    setFailure(value === "" ? null : errorText(value));
   const [language, setLanguage] = useState("ko");
   const [model, setModel] = useState("base");
   const [translate, setTranslate] = useState(false);
@@ -77,7 +92,7 @@ export default function SpeechPanel({
             "",
       );
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -104,7 +119,7 @@ export default function SpeechPanel({
           await onCommand("project.get");
         }
       } catch (e) {
-        if (!disposed) setError(e instanceof Error ? e.message : String(e));
+        if (!disposed) setError(e);
       } finally {
         polling = false;
       }
@@ -133,7 +148,7 @@ export default function SpeechPanel({
       );
       setJob({ ...next, state: next.state || "queued" });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     } finally {
       setStarting(false);
     }
@@ -142,7 +157,7 @@ export default function SpeechPanel({
     try {
       setJob(await rpc<SpeechJob>("speech.cancel", { id: job!.id }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(e);
     }
   };
   const unavailable =
@@ -173,9 +188,6 @@ export default function SpeechPanel({
       </div>
       {mode === "transcribe" ? (
         <>
-          <p className="panel-hint">
-            타임라인의 음성을 인식해 편집 가능한 자막으로 만듭니다.
-          </p>
           <div className="speech-option-pair">
             <label>
               영상 언어
@@ -236,9 +248,6 @@ export default function SpeechPanel({
         </>
       ) : (
         <>
-          <p className="panel-hint">
-            입력한 문장을 음성으로 만들고 현재 재생 위치에 추가합니다.
-          </p>
           <textarea
             aria-label="음성으로 만들 텍스트"
             placeholder="여기에 내레이션을 입력하세요."
@@ -257,11 +266,13 @@ export default function SpeechPanel({
               onChange={(e) => setVoice(e.target.value)}
             >
               {!status?.voices.length && (
-                <option value="">사용 가능한 목소리 없음</option>
+                <option value="">
+                  {status ? "사용 가능한 목소리 없음" : "목소리 불러오는 중…"}
+                </option>
               )}
               {status?.voices.map((v) => (
                 <option key={v.id} value={v.id}>
-                  {v.name} · {v.language}
+                  {voiceLabel(v)}
                 </option>
               ))}
             </select>
@@ -351,8 +362,8 @@ export default function SpeechPanel({
         </div>
       )}
       {error && (
-        <p className="panel-inline-error" role="alert">
-          {error}
+        <p className="panel-inline-error" role="alert" title={error.detail}>
+          {error.message}
         </p>
       )}
     </section>

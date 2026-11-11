@@ -21,13 +21,15 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       - name: Install FFmpeg
         run: brew install ffmpeg
       - run: npm ci
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       # Frontend tests, Rust tests, the real-service integration tests and the production build.
       - run: npm run verify
       # After verify: the desktop binary embeds the built frontend (dist/).

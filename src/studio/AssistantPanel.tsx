@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type TextareaHTMLAttributes,
+} from "react";
 import {
   ArrowUp,
   BookOpen,
@@ -57,6 +64,29 @@ const when = (value: number | string) => {
         minute: "2-digit",
       });
 };
+const introducedKey = "byori.assistant.introduced";
+/** Whether an edit request was ever sent: the undo note is only for the first one. */
+const introduced = () => {
+  try {
+    return localStorage.getItem(introducedKey) === "1";
+  } catch {
+    return false;
+  }
+};
+
+/** A textarea as tall as its content, at least two lines. */
+function AutoTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    element.style.height = "auto";
+    // jsdom has no layout: leave the stylesheet's minimum in charge there.
+    if (element.scrollHeight) element.style.height = `${element.scrollHeight + 2}px`;
+  }, [props.value]);
+  return <textarea ref={ref} rows={2} {...props} />;
+}
+
 /** The job last shown, so a reopened panel can show how it ended. */
 let lastJob: { projectId: string; id: string } | null = null;
 
@@ -90,6 +120,13 @@ function Panel({
   const [search, setSearch] = useState("");
   const [note, setNote] = useState("");
   const [draft, setDraft] = useState<Partial<Project["concept"]>>({});
+  const [savedKey, setSavedKey] = useState<ConceptKey | null>(null);
+  const [firstRun, setFirstRun] = useState(() => !introduced());
+  useEffect(() => {
+    if (!savedKey) return;
+    const timer = setTimeout(() => setSavedKey(null), 1500);
+    return () => clearTimeout(timer);
+  }, [savedKey]);
   const [ownRuntime, setOwnRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeFailed, setRuntimeFailed] = useState(false);
   const feed = useRef<HTMLDivElement>(null);
@@ -173,6 +210,12 @@ function Panel({
       setJobProvider(provider);
       lastJob = { projectId: project.id, id: result.id };
       setPrompt("");
+      setFirstRun(false);
+      try {
+        localStorage.setItem(introducedKey, "1");
+      } catch {
+        // The note then shows again next time; nothing else depends on it.
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -286,14 +329,17 @@ function Panel({
     void onCommand("project.update", {
       patch: { concept: { ...project.concept, [key]: value } },
     })
-      .then(settle)
+      .then(() => {
+        settle();
+        setSavedKey(key);
+      })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
   return (
     <aside className="assistant-panel" aria-label="편집 어시스턴트">
       <div className="panel-heading">
         <span className="assistant-brand">
-          <span className="byori-mark small">b</span> Byori Assistant
+          <span className="byori-mark small">b</span> 어시스턴트
         </span>
         <button title="어시스턴트 닫기" onClick={onClose}>
           <X size={16} />
@@ -332,17 +378,7 @@ function Panel({
           <div className="assistant-feed" ref={feed}>
             {!job && (
               <div className="assistant-intro">
-                <div className="assistant-orbit">
-                  <span className="byori-mark">b</span>
-                </div>
-                <h2>
-                  함께 만드는,
-                  <br />더 나은 다음 장면.
-                </h2>
-                <p>
-                  원하는 편집을 말해 주세요.
-                  <br />이 프로젝트의 맥락과 기억을 이어서 작업합니다.
-                </p>
+                <p>원하는 편집을 말해 주세요.</p>
                 <div className="suggestion-list">
                   {[
                     "현재 영상의 흐름을 살펴보고 편집 방향을 제안해줘",
@@ -355,9 +391,6 @@ function Panel({
                     </button>
                   ))}
                 </div>
-                <span className="agent-explanation">
-                  선택한 CLI가 Studio의 편집 도구를 사용합니다.
-                </span>
               </div>
             )}
             {shown && (
@@ -506,9 +539,11 @@ function Panel({
               )}
             </div>
           </div>
-          <div className="assistant-footnote">
-            변경 내용은 타임라인에 반영되며 실행 취소할 수 있습니다.
-          </div>
+          {firstRun && !job && (
+            <div className="assistant-footnote">
+              변경 내용은 타임라인에 반영되며 실행 취소할 수 있습니다.
+            </div>
+          )}
         </>
       )}
       {tab === "brief" && (
@@ -524,8 +559,11 @@ function Panel({
             ] as const
           ).map(([key, label, placeholder]) => (
             <label key={key}>
-              {label}
-              <textarea
+              <span className="brief-label">
+                {label}
+                {savedKey === key && <em role="status">저장됨</em>}
+              </span>
+              <AutoTextarea
                 value={draft[key] ?? project.concept[key]}
                 placeholder={placeholder}
                 onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}

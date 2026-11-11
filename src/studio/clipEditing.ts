@@ -118,25 +118,11 @@ export function clipJunctions(clips: Clip[], fps: number): ClipJunction[] {
 export const maxTransitionDuration = (junction: ClipJunction, _fps?: number) =>
   Math.min(junction.before.duration, junction.after.duration) / 2;
 
-/** edit.batch accepts at most this many commands (editor.rs). */
-export const BATCH_LIMIT = 500;
-
-/** Why a junction's transition cannot be edited as one batch, or null when it can. */
-export function junctionTransitionBlocked(project: Project, junction: ClipJunction): string | null {
-  const { before, after } = junction;
-  let moved = 1;
-  for (const clip of project.clips)
-    if (clip.trackId === after.trackId && clip.id !== after.id && clip.id !== before.id && clip.start > after.start - epsilon) moved++;
-  return moved > BATCH_LIMIT
-    ? `이 뒤로 같은 트랙에 클립이 ${moved - 1}개 있어 한 번에 옮길 수 없습니다(최대 ${BATCH_LIMIT - 1}개). 트랙을 나누거나 뒤쪽 접점부터 전환을 넣어 주세요.`
-    : null;
-}
-
 /**
  * Set, change or remove the transition between two neighbouring clips as one
- * batch: the later clip (and everything after it on the track) moves so that
- * the two clips overlap by exactly the transition duration, and the later clip
- * carries the transition as its transitionIn.
+ * batch: the later clip (and everything after it on the track) moves, by one
+ * edit.shift, so that the two clips overlap by the transition duration, and the
+ * later clip carries the transition as its transitionIn.
  */
 export function junctionTransitionCommands(
   project: Project,
@@ -145,22 +131,63 @@ export function junctionTransitionCommands(
 ): ClipEditCommand[] {
   const { before, after } = junction;
   const frame = frameDuration(project);
+  // Whole frames and at most half of the shorter clip, rounded down: the same
+  // length the Library and the Inspector (clipPresets) give the junction.
   const duration = transition
-    ? Math.max(frame, Math.min(maxTransitionDuration(junction, project.fps), Math.round(transition.duration / frame) * frame))
+    ? Math.max(
+        1,
+        Math.min(
+          Math.floor(maxTransitionDuration(junction, project.fps) / frame + 1e-6),
+          Math.round(transition.duration / frame),
+        ),
+      ) * frame
     : 0;
   const overlap = Math.max(0, before.start + before.duration - after.start);
-  const shift = overlap - duration;
+  // Whole frames, as edit.shift moves them; less than a frame is no move at all.
+  const shift = Math.round((overlap - duration) / frame) * frame;
   const commands: ClipEditCommand[] = [];
-  if (Math.abs(shift) > epsilon)
-    for (const clip of project.clips)
-      if (clip.trackId === after.trackId && clip.id !== after.id && clip.start > after.start - epsilon && clip.id !== before.id)
-        commands.push({ method: "edit.update", params: { id: clip.id, patch: { start: Math.max(0, clip.start + shift) } } });
   const next = transition && duration > 0 ? { type: transition.type, duration } : null;
-  const patch: Record<string, unknown> = {};
-  if (Math.abs(shift) > epsilon) patch.start = Math.max(0, after.start + shift);
   const current = after.transitionIn ?? null;
   if ((current?.type ?? null) !== (next?.type ?? null) || Math.abs((current?.duration ?? 0) - (next?.duration ?? 0)) > epsilon)
-    patch.transitionIn = next;
-  if (Object.keys(patch).length) commands.unshift({ method: "edit.update", params: { id: after.id, patch } });
+    commands.push({ method: "edit.update", params: { id: after.id, patch: { transitionIn: next } } });
+  // One ripple command, however many clips follow: the core moves the later clip
+  // and everything at or after it on this track (other tracks stay where they are).
+  if (Math.abs(shift) > epsilon)
+    commands.push({ method: "edit.shift", params: { trackId: after.trackId, from: after.start, delta: shift } });
   return commands;
+}
+
+/** Where a new overlay clip (text, sticker) goes so that it covers nothing already there. */
+export type OverlayPlacement = { trackId: string } | { create: "video" | "text" } | null;
+
+/**
+ * A text or sticker added at `start` must not land on top of a clip of its own
+ * track: the preferred track if it is free there, else the topmost free track
+ * of the kind, else a new track (the core inserts it above its kind). Locked
+ * and hidden tracks are skipped.
+ * Null leaves the choice to the core (nothing overlaps, or no track is usable).
+ */
+export function overlayPlacement(
+  project: Project,
+  kind: "video" | "text",
+  start: number,
+  duration: number,
+  preferredTrackId?: string | null,
+): OverlayPlacement {
+  const end = start + Math.max(duration, frameDuration(project));
+  const free = (trackId: string) =>
+    !project.clips.some((clip) =>
+      clip.trackId === trackId && clip.start < end - epsilon && clip.start + clip.duration > start + epsilon);
+  // A hidden track is never a target: the clip would be added where the preview cannot show it.
+  const tracks = project.tracks.filter((track) => track.kind === kind && !track.locked && !track.hidden);
+  const preferred = tracks.find((track) => track.id === preferredTrackId);
+  if (preferred && free(preferred.id)) return { trackId: preferred.id };
+  // The core's own default is the first unlocked track of the kind, hidden or not;
+  // leave the choice to it only when that is also the first usable one.
+  const coreDefault = project.tracks.find((track) => track.kind === kind && !track.locked);
+  if (!preferred && tracks[0] && free(tracks[0].id))
+    return coreDefault?.id === tracks[0].id ? null : { trackId: tracks[0].id };
+  // Later tracks composite on top, so an overlay prefers the topmost free one.
+  const open = [...tracks].reverse().find((track) => free(track.id));
+  return open ? { trackId: open.id } : { create: kind };
 }

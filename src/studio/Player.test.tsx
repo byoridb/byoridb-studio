@@ -102,7 +102,10 @@ describe("canvas", () => {
     expect(aspectLabel(2560, 1080)).toBe("64:27");
     expect(aspectLabel(1080, 1080)).toBe("1:1");
     render(<Player project={{ ...project, width: 1440, height: 1080, clips: [] }} time={0} playing={false} onTime={vi.fn()} onPlaying={vi.fn()} selectedId={null} onSelect={vi.fn()} onCommand={vi.fn()} />);
-    expect(screen.getByText("4:3")).toBeInTheDocument();
+    // The ratio is not repeated as a chip; the header carries the frame size once.
+    expect(screen.queryByText("4:3")).toBeNull();
+    expect(screen.getByLabelText("미리보기 확대")).toHaveAttribute("title", "미리보기 확대 · 화면 비율 4:3");
+    expect(screen.getByText(/1440 × 1080/)).toBeInTheDocument();
   });
   it("drags an animated layer from its on-screen position into a revision-guarded keyframe", () => {
     const image: Clip = { ...visual, kind: "image", keyframes: [

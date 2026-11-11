@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
+  Crosshair,
   LoaderCircle,
   Maximize,
   Pause,
@@ -155,6 +156,7 @@ export default function Player({
   previewMode = "fast",
   onPreviewMode,
   loop = null,
+  loopTarget = null,
   onLoop,
 }: {
   project: Project;
@@ -174,6 +176,8 @@ export default function Player({
   onPreviewMode?: (mode: "fast" | "precise") => void;
   /** The repeated range; playback wraps from its end to its start. */
   loop?: LoopRange | null;
+  /** What the repeat button repeats when it is switched on (the selection); the whole project otherwise. */
+  loopTarget?: LoopRange | null;
   onLoop?: (range: LoopRange | null) => void;
 }) {
   useProjectFonts(project);
@@ -297,33 +301,10 @@ export default function Player({
       : selectedLayout?.frame ?? size;
   const total = durationOf(project);
   const live = (clip: Clip) => (liveTransform && selectedId === clip.id ? liveTransform : null);
-  const setLoopEdge = (edge: "start" | "end") => {
-    if (!onLoop) return;
-    const at = Math.max(0, Math.min(total, time));
-    const range = loop ?? { start: 0, end: total };
-    const next = edge === "start"
-      ? { start: at, end: range.end > at ? range.end : total }
-      : { start: range.start < at ? range.start : 0, end: at };
-    onLoop(next.end - next.start >= 1 / project.fps ? next : null);
-  };
   return (
     <section className="player-panel" aria-label="영상 미리보기">
       <div className="panel-heading">
         <span>플레이어</span>
-        {onPreviewMode && (
-          <select
-            className="preview-mode"
-            aria-label="미리보기 모드"
-            title="빠른 재생은 즉시 시작합니다. LUT·크로마키·곡선·오디오 효과·역재생 등은 정밀 재생에서 확인하세요."
-            value={previewMode}
-            onChange={(event) =>
-              onPreviewMode(event.target.value as "fast" | "precise")
-            }
-          >
-            <option value="fast">빠른 재생</option>
-            <option value="precise">정밀 재생</option>
-          </select>
-        )}
         {!playbackUrl && (!frame || playing || draftActive) && (
           <span
             className="preview-draft-badge"
@@ -336,6 +317,19 @@ export default function Player({
           {project.width} × {project.height}{" "}
           <span className="small-divider">/</span> {project.fps} fps
         </span>
+        {onPreviewMode && (
+          <button
+            className={`preview-mode ${previewMode === "precise" ? "active" : ""}`}
+            aria-label="정밀 재생"
+            aria-pressed={previewMode === "precise"}
+            title={previewMode === "precise"
+              ? "정밀 재생 켜짐 · 내보내기와 같은 화면을 렌더한 뒤 재생합니다. 눌러서 빠른 재생으로"
+              : "빠른 재생 중 · LUT·크로마키·곡선·오디오 효과·역재생은 정밀 재생에서 확인하세요. 눌러서 정밀 재생으로"}
+            onClick={() => onPreviewMode(previewMode === "precise" ? "fast" : "precise")}
+          >
+            <Crosshair size={14} />
+          </button>
+        )}
       </div>
       <div className={`player-viewport ${zoom !== "fit" && !fullscreen ? "zoomed" : ""}`} ref={viewport}>
         {/* The frame clips its layers; selection handles sit beside it so they may reach past the edge. */}
@@ -657,22 +651,18 @@ export default function Player({
         </div>
         <div className="player-options">
           {onLoop && (
-            <div className="player-loop" role="group" aria-label="구간 반복">
-              <button title="반복 시작점을 재생 헤드로 (I)" aria-label="반복 시작점 지정" disabled={!total} onClick={() => setLoopEdge("start")}>I</button>
-              <button title="반복 끝점을 재생 헤드로 (O)" aria-label="반복 끝점 지정" disabled={!total} onClick={() => setLoopEdge("end")}>O</button>
-              <button
-                className={loop ? "active" : ""}
-                aria-pressed={!!loop}
-                aria-label="구간 반복"
-                title={loop
-                  ? `구간 반복 끄기 · ${timecode(loop.start, project.fps)} – ${timecode(loop.end, project.fps)}`
-                  : "전체 구간 반복 켜기"}
-                disabled={!total}
-                onClick={() => onLoop(loop ? null : { start: 0, end: total })}
-              >
-                <Repeat size={14} />
-              </button>
-            </div>
+            <button
+              className={`player-loop ${loop ? "active" : ""}`}
+              aria-pressed={!!loop}
+              aria-label="구간 반복"
+              title={loop
+                ? `반복 끄기 · ${timecode(loop.start, project.fps)} – ${timecode(loop.end, project.fps)}`
+                : `${loopTarget ? "선택한 클립 구간" : "전체"} 반복 · I·O 키나 눈금 ⌥ 드래그로 구간 지정`}
+              disabled={!total}
+              onClick={() => onLoop(loop ? null : loopTarget ?? { start: 0, end: total })}
+            >
+              <Repeat size={15} />
+            </button>
           )}
           <button
             title={muted || !volume ? "소리 켜기" : "소리 끄기"}
@@ -701,9 +691,6 @@ export default function Player({
             <option value="fit">맞춤</option>
             {ZOOMS.map((value) => <option key={value} value={value}>{value * 100}%</option>)}
           </select>
-          <span className="ratio-label">
-            {aspectLabel(project.width, project.height)}
-          </span>
           <button
             title="미리보기 전체 화면"
             onClick={() => {

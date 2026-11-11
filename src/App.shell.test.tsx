@@ -15,9 +15,18 @@ vi.mock("./studio/api", () => ({
   uploadFile: vi.fn(),
 }));
 // The side panels belong to another area; here they only count their renders.
-const renders = vi.hoisted(() => ({ library: 0, inspector: 0, playheads: [] as number[] }));
+const renders = vi.hoisted(() => ({
+  library: 0, inspector: 0, playheads: [] as number[],
+  /** The command the library is given, for adding text and stickers. */
+  libraryCommand: null as null | ((method: string, params?: Record<string, unknown>) => Promise<unknown>),
+}));
 vi.mock("./studio/Library", () => ({
-  default: ({ playhead }: { playhead: number }) => { renders.library++; renders.playheads.push(playhead); return <section aria-label="라이브러리" />; },
+  default: ({ playhead, onCommand }: { playhead: number; onCommand: (method: string, params?: Record<string, unknown>) => Promise<unknown> }) => {
+    renders.library++;
+    renders.playheads.push(playhead);
+    renders.libraryCommand = onCommand;
+    return <section aria-label="라이브러리" />;
+  },
 }));
 vi.mock("./studio/Inspector", () => ({
   default: () => { renders.inspector++; return <section aria-label="속성" />; },
@@ -158,6 +167,92 @@ describe("playback clock", () => {
   });
 });
 
+describe("playback and project state", () => {
+  it("keeps fast playback running through an edit and stops it for another project", async () => {
+    const raf = vi.spyOn(globalThis, "requestAnimationFrame").mockReturnValue(1);
+    const cancel = vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation(() => {});
+    try {
+      render(<App />);
+      await screen.findByLabelText("프로젝트 이름");
+      fireEvent.click(screen.getByTitle("재생 (Space)"));
+      expect(screen.getByTitle("일시정지 (Space)")).toBeInTheDocument();
+      // A newer revision of the same project (here: a marker) arrives while playing.
+      served = { ...served, revision: 2, markers: [{ id: "m", time: 1, label: "마커" }] };
+      fireEvent.keyDown(document.body, { key: "m", code: "KeyM" });
+      await screen.findByRole("button", { name: "마커 마커" });
+      expect(screen.getByTitle("일시정지 (Space)")).toBeInTheDocument();
+      // Another project is never playing, and coming back does not resume.
+      fireEvent.click(screen.getByRole("button", { name: "홈" }));
+      fireEvent.click(await screen.findByRole("button", { name: "다른 편집 열기" }));
+      expect(await screen.findByLabelText("프로젝트 이름")).toHaveValue("다른 편집");
+      expect(screen.getByTitle("재생 (Space)")).toBeInTheDocument();
+    } finally {
+      raf.mockRestore();
+      cancel.mockRestore();
+    }
+  });
+  it("reports the length and the selection in the status bar, and nothing shown elsewhere", async () => {
+    const { container } = render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const status = container.querySelector(".studio-statusbar")!;
+    expect(status).toHaveTextContent("전체 200.00초");
+    expect(status).not.toHaveTextContent("fps");
+    expect(status).not.toHaveTextContent("소재");
+    const clip = screen.getByRole("button", { name: /^c0,/ });
+    fireEvent.pointerDown(clip, { clientX: 10 });
+    fireEvent.pointerUp(clip);
+    expect(status).toHaveTextContent("전체 200.00초1개 선택");
+  });
+  it("opens the example that already exists instead of making another", async () => {
+    const fallback = vi.mocked(rpc).getMockImplementation()!;
+    vi.mocked(rpc).mockImplementation(async (method: string, params?: Record<string, unknown>, projectId?: string) =>
+      method === "project.list"
+        ? [{ id: served.id, name: served.name, updatedAt: 2 }, { id: "demo", name: "잠시, 멈추는 여행 · 예제", updatedAt: 1 }]
+        : fallback(method, params, projectId));
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    fireEvent.click(screen.getByRole("button", { name: "메뉴" }));
+    fireEvent.click(screen.getByRole("button", { name: "예제 프로젝트 열기" }));
+    await waitFor(() => expect(rpc).toHaveBeenCalledWith("project.open", { id: "demo" }, undefined));
+    expect(rpc).not.toHaveBeenCalledWith("project.demo", expect.anything(), undefined);
+    // Opening an example needs no announcement.
+    expect(screen.queryByText(/예제 프로젝트 ·/)).toBeNull();
+  });
+});
+
+describe("text and stickers from the library", () => {
+  const calls = (method: string) => vi.mocked(rpc).mock.calls.filter(([name]) => name === method).map(([, params]) => params);
+  it("adds to a free track, or makes a track above when every one is covered at that time", async () => {
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const add = renders.libraryCommand!;
+    const sticker = { mediaId: "image1", duration: 3, name: "별 스티커", transform: { scale: 0.35 } };
+    // Past the last clip nothing is covered: the request goes through untouched.
+    await act(async () => { await add("edit.add", { ...sticker, start: 300 }); });
+    expect(calls("edit.track")).toEqual([]);
+    expect(calls("edit.add")).toEqual([{ ...sticker, start: 300, expectedRevision: 1 }]);
+    // At 0s all five video tracks hold a clip: the one edit.add asks for a new track (one undo step).
+    vi.mocked(rpc).mockClear();
+    await act(async () => { await add("edit.add", { ...sticker, start: 0, trackId: "t0", expectedRevision: 1 }); });
+    expect(calls("edit.track")).toEqual([]);
+    expect(calls("edit.add")).toEqual([{ ...sticker, start: 0, newTrack: "영상 6", expectedRevision: 1 }]);
+    // A full-frame picture from the media tab (no transform) is not an overlay.
+    vi.mocked(rpc).mockClear();
+    await act(async () => { await add("edit.add", { mediaId: "image1", start: 0 }); });
+    expect(calls("edit.track")).toEqual([]);
+  });
+  it("puts text on a text track that is free at the playhead", async () => {
+    const text = (id: string, trackId: string): Clip => ({ ...clip(id, 0, trackId), kind: "text", mediaId: undefined, duration: 3 });
+    const track = (id: string) => ({ id, name: id, kind: "text" as const, muted: false, hidden: false, locked: false });
+    served = { ...structuredClone(base), tracks: [...base.tracks, track("x1"), track("x2")], clips: [...base.clips, text("caption", "x1")] };
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    await act(async () => { await renders.libraryCommand!("edit.add", { start: 1, duration: 3, text: { content: "제목" } }); });
+    expect(calls("edit.add")).toEqual([{ start: 1, duration: 3, text: { content: "제목" }, trackId: "x2", expectedRevision: 1 }]);
+    expect(calls("edit.track")).toEqual([]);
+  });
+});
+
 describe("home screen", () => {
   it("opens on home for an untouched project and enters the editor with the chosen frame", async () => {
     served = structuredClone(blank);
@@ -170,17 +265,18 @@ describe("home screen", () => {
     fireEvent.click(screen.getByRole("button", { name: "새 프로젝트 9:16 세로" }));
     await waitFor(() => expect(rpc).toHaveBeenCalledWith("project.new", { name: "이름 없는 프로젝트", width: 1080, height: 1920, fps: 30 }, undefined));
     expect(await screen.findByLabelText("타임라인")).toBeInTheDocument();
-    expect(screen.getByText("9:16")).toBeInTheDocument();
+    // The frame size is stated once, in the player header.
+    expect(screen.getByText(/1080 × 1920/)).toBeInTheDocument();
   });
-  it("goes home from the menu, returns to the open project without reloading it, and opens another", async () => {
+  it("goes home from the logo, returns to the open project without reloading it, and opens another", async () => {
     render(<App />);
     await screen.findByLabelText("프로젝트 이름");
-    fireEvent.click(screen.getByRole("button", { name: "메뉴" }));
+    // The mark and name in the top bar lead home.
     fireEvent.click(screen.getByRole("button", { name: "홈" }));
     fireEvent.click(await screen.findByRole("button", { name: "편집 테스트 열기" }));
     expect(await screen.findByLabelText("타임라인")).toBeInTheDocument();
     expect(rpc).not.toHaveBeenCalledWith("project.open", expect.anything(), undefined);
-    fireEvent.click(screen.getByRole("button", { name: "메뉴" }));
+    // The mark and name in the top bar lead home.
     fireEvent.click(screen.getByRole("button", { name: "홈" }));
     act(() => playbackClock.seek(3));
     fireEvent.click(await screen.findByRole("button", { name: "다른 편집 열기" }));
@@ -233,6 +329,9 @@ describe("workspace layout", () => {
     expect(fitPanelWidths({ library: 560, inspector: 520 }, 1600)).toEqual({ library: 560, inspector: 520 });
     expect(fitPanelWidths({ library: null, inspector: 278 }, 900)).toEqual({ library: null, inspector: null });
     // 560 + 520 + separators + the 250px player do not fit 1280px.
+    // With the assistant drawer in the inspector's place only the library is fitted.
+    expect(fitPanelWidths({ library: 560, inspector: 520 }, 700, false)).toEqual({ library: 444, inspector: null });
+    expect(fitPanelWidths({ library: null, inspector: 520 }, 700, false)).toEqual({ library: null, inspector: null });
     const fitted = fitPanelWidths({ library: 560, inspector: 520 }, 1280);
     expect(fitted.library! + fitted.inspector! + 262).toBeLessThanOrEqual(1280);
     expect(fitted.library!).toBeGreaterThanOrEqual(220);

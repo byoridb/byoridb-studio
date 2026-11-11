@@ -1,3 +1,5 @@
+// @ts-expect-error The app has no Node typings; the test runner provides the module.
+import { readFileSync } from "node:fs";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -42,16 +44,19 @@ describe("timeline layers", () => {
     expect(screen.getByRole("button", { name: "영상 2 트랙 선택" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.pointerDown(screen.getByLabelText("영상 1 트랙"), { clientX: 100 });
     expect(onTrackSelect).toHaveBeenLastCalledWith("v1");
-    fireEvent.change(screen.getByRole("combobox", { name: "트랙 추가" }), { target: { value: "text" } });
+    fireEvent.click(screen.getByRole("button", { name: "트랙 추가" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "자막·텍스트 트랙 추가" }));
     await waitFor(() => expect(onTrackSelect).toHaveBeenLastCalledWith("text-new"));
   });
   it("creates separate video, audio and subtitle tracks", () => {
     const command = vi.fn().mockResolvedValue(undefined);
     render(<Harness command={command} />);
-    const control = screen.getByRole("combobox", { name: "트랙 추가" });
-    fireEvent.change(control, { target: { value: "video" } });
-    fireEvent.change(control, { target: { value: "audio" } });
-    fireEvent.change(control, { target: { value: "text" } });
+    // One toolbar button opens the menu; it closes after each choice.
+    for (const name of ["영상 트랙 추가", "오디오 트랙 추가", "자막·텍스트 트랙 추가"]) {
+      fireEvent.click(screen.getByRole("button", { name: "트랙 추가" }));
+      fireEvent.click(screen.getByRole("menuitem", { name }));
+      expect(screen.queryByRole("menu")).toBeNull();
+    }
     expect(command.mock.calls).toEqual([
       ["edit.track", { kind: "video", name: "영상 3", expectedRevision: 7 }],
       ["edit.track", { kind: "audio", name: "오디오 1", expectedRevision: 7 }],
@@ -61,13 +66,16 @@ describe("timeline layers", () => {
   it("moves selected clips without changing their timing and can split them to a new layer atomically", () => {
     const command = vi.fn().mockResolvedValue(undefined);
     render(<Harness command={command} initial={["a", "b"]} />);
-    const control = screen.getByRole("combobox", { name: "선택 클립 트랙 이동" });
-    fireEvent.change(control, { target: { value: "v2" } });
+    // Moving to another track lives in the clip's context menu.
+    fireEvent.contextMenu(item("a"), { clientX: 10, clientY: 10 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "‘영상 2’ 트랙으로 이동" }));
     expect(command).toHaveBeenCalledWith("edit.batch", { expectedRevision: 7, commands: [
       { method: "edit.update", params: { id: "a", patch: { trackId: "v2" } } },
       { method: "edit.update", params: { id: "b", patch: { trackId: "v2" } } },
     ] });
-    fireEvent.change(control, { target: { value: "new" } });
+    fireEvent.contextMenu(item("a"), { clientX: 10, clientY: 10 });
+    expect(screen.queryByRole("menuitem", { name: "‘영상 1’ 트랙으로 이동" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "새 트랙으로 분리" }));
     expect(command).toHaveBeenCalledWith("edit.track", { kind: "video", name: "영상 3", clipIds: ["a", "b"], expectedRevision: 7 });
   });
   it("allows vertical dragging between compatible rows and keeps a locked destination unchanged", () => {
@@ -94,7 +102,9 @@ describe("timeline layers", () => {
     project.clips.push(clip("music", 0, { kind: "audio", trackId: "a1" }));
     const command = vi.fn();
     render(<Harness project={project} command={command} initial={["a", "music"]} />);
-    expect(screen.getByRole("combobox", { name: "선택 클립 트랙 이동" })).toBeDisabled();
+    fireEvent.contextMenu(item("a"), { clientX: 10, clientY: 10 });
+    expect(screen.getByRole("menuitem", { name: "새 트랙으로 분리" })).toBeDisabled();
+    expect(screen.queryByRole("menuitem", { name: /트랙으로 이동/ })).toBeNull();
     expect(moveSelectionToTrack(project, ["music"], "v2")).toEqual([]);
     expect(moveSelectionToTrack(project, ["a"], "a1")).toEqual([]);
   });
@@ -209,6 +219,8 @@ const item = (id: string) =>
   screen.getByRole("button", { name: new RegExp(`^${id},`) });
 beforeEach(() => {
   vi.stubGlobal("PointerEvent", MouseEvent);
+  // Zoom and snapping are remembered per project.
+  localStorage.clear();
 });
 
 describe("timeline multiple selection", () => {
@@ -356,9 +368,19 @@ describe("timeline clip editing", () => {
     fireEvent.pointerMove(handle, { clientX: 134 });
     expect(command).not.toHaveBeenCalled();
     expect(item("a")).toHaveAttribute("aria-label", "a, 1.5초, 1.5초");
-    expect(screen.getByRole("status")).toHaveTextContent("길이 1.50초");
+    // The live figures are drawn beside the dragged edge, not read out on every pointer move.
+    const readout = document.querySelector(".trim-readout")!;
+    expect(readout).toHaveTextContent("→");
+    expect(readout).toHaveTextContent("길이 1.50초");
+    expect(readout).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("status")).not.toHaveTextContent("길이");
+    expect(document.querySelector(".trim-result")).toBeEmptyDOMElement();
     fireEvent.pointerMove(handle, { clientX: 168 });
     fireEvent.pointerUp(handle);
+    expect(document.querySelector(".trim-readout")).toBeNull();
+    expect(document.querySelector(".trim-result")).toHaveAttribute("aria-live", "polite");
+    expect(document.querySelector(".trim-result")).toHaveTextContent("a · ");
+    expect(document.querySelector(".trim-result")).toHaveTextContent("길이 1.00초");
     expect(command).toHaveBeenCalledOnce();
     expect(command).toHaveBeenCalledWith("edit.trim", { id: "a", start: 2, end: 3, expectedRevision: 7 });
   });
@@ -597,13 +619,20 @@ describe("timeline basics", () => {
   it("deletes and reorders tracks, and protects a locked track", () => {
     const project = fixture();
     project.tracks[1].locked = true;
-    const { props } = mount({ project });
-    expect(screen.getByRole("button", { name: "영상 1 위로 이동" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "영상 2 아래로 이동" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "영상 2 삭제" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "영상 1 아래로 이동" }));
-    fireEvent.click(screen.getByRole("button", { name: "영상 2 위로 이동" }));
-    fireEvent.click(screen.getByRole("button", { name: "영상 1 삭제" }));
+    const { props, container } = mount({ project });
+    // Reordering and deleting live in the track header's context menu, not as standing buttons.
+    expect(screen.queryByRole("button", { name: /삭제$|이동$/ })).toBeNull();
+    const menu = (index: number) => fireEvent.contextMenu(container.querySelectorAll(".track-label")[index], { clientX: 5, clientY: 5 });
+    const entry = (name: string) => screen.getByRole("menuitem", { name });
+    menu(0);
+    expect(entry("위로 이동")).toBeDisabled();
+    fireEvent.click(entry("아래로 이동"));
+    menu(1);
+    expect(entry("아래로 이동")).toBeDisabled();
+    expect(entry("트랙 삭제")).toBeDisabled();
+    fireEvent.click(entry("위로 이동"));
+    menu(0);
+    fireEvent.click(entry("트랙 삭제"));
     expect(vi.mocked(props.onCommand).mock.calls).toEqual([
       ["edit.trackMove", { id: "v1", index: 1, expectedRevision: 7 }],
       ["edit.trackMove", { id: "v2", index: 0, expectedRevision: 7 }],
@@ -729,5 +758,27 @@ describe("timeline basics", () => {
     project.media[0].missing = true;
     const { container } = mount({ project });
     expect(container.querySelectorAll(".timeline-clip.missing")).toHaveLength(3);
+  });
+  it("outlines a missing clip with at least 3:1 contrast against the panel", () => {
+    const tokens: string = readFileSync("src/styles/index.css", "utf8");
+    const rule = /\.timeline-clip\.missing\s*\{([^}]*)\}/.exec(readFileSync("src/studio/timeline.css", "utf8") as string)![1];
+    const token = /outline:[^;]*var\((--[\w-]+)\)/.exec(rule)![1];
+    const opacity = +(/opacity:\s*([\d.]+)/.exec(rule)?.[1] ?? 1);
+    const rgb = (name: string) => {
+      const hex = new RegExp(`${name}:\\s*#([0-9a-f]{6})\\b`, "i").exec(tokens)![1];
+      return [0, 2, 4].map((at) => parseInt(hex.slice(at, at + 2), 16));
+    };
+    const luminance = (color: number[]) => {
+      const [r, g, b] = color.map((value) => {
+        const unit = value / 255;
+        return unit <= 0.04045 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const panel = rgb("--panel");
+    // The clip's own opacity dims the outline too.
+    const outline = rgb(token).map((value, index) => value * opacity + panel[index] * (1 - opacity));
+    const [light, dark] = [luminance(outline), luminance(panel)].sort((a, b) => b - a);
+    expect((light + 0.05) / (dark + 0.05)).toBeGreaterThanOrEqual(3);
   });
 });

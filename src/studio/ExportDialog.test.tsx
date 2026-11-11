@@ -265,7 +265,6 @@ it("names resolutions by the short side and drops encoder options for WebM", asy
     />,
   );
   fireEvent.change(screen.getByLabelText("해상도"), { target: { value: "720" } });
-  expect(screen.getByText("720×1280 · 30 fps")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "고급 설정" }));
   fireEvent.change(screen.getByLabelText("코덱"), { target: { value: "hevc" } });
   fireEvent.change(screen.getByLabelText("형식"), { target: { value: "webm" } });
@@ -281,4 +280,21 @@ it("names resolutions by the short side and drops encoder options for WebM", asy
   const sent = vi.mocked(rpc).mock.calls.find(([m]) => m === "export.start")![1];
   expect(sent).not.toHaveProperty("codec");
   expect(sent).not.toHaveProperty("hardware");
+});
+
+it("is a plain tool dialog: no slogan, one summary line, paired options", () => {
+  vi.mocked(rpc).mockResolvedValue({ id: "render" });
+  const { container } = render(<ExportDialog project={project} onClose={vi.fn()} />);
+  expect(screen.queryByText("마지막 프레임까지, 의도한 그대로.")).toBeNull();
+  // The size and rate are in their selects; the summary only tells how much is exported.
+  expect(screen.queryByText(/1920×1080/)).toBeNull();
+  expect(screen.getByText("전체 12.00초")).toBeInTheDocument();
+  expect(
+    Array.from(screen.getByLabelText("품질").querySelectorAll("option")).map((o) => o.textContent),
+  ).toEqual(["높음", "보통", "작은 파일"]);
+  expect(container.querySelectorAll(".export-pair")).toHaveLength(2);
+  fireEvent.change(screen.getByLabelText("내보낼 구간"), { target: { value: "range" } });
+  fireEvent.change(screen.getByLabelText("시작 (초)"), { target: { value: "2" } });
+  fireEvent.change(screen.getByLabelText("끝 (초)"), { target: { value: "5" } });
+  expect(screen.getByText("2.00–5.00초 구간 · 3.00초")).toBeInTheDocument();
 });

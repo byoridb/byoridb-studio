@@ -44,6 +44,38 @@ pub fn remove_partial_outputs() {
     }
 }
 
+/// The scratch folders and files in `previews/` and `renders/` that a running render
+/// reads or writes right now.
+fn active_scratch() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(Default::default)
+}
+/// Marks paths as in use until it is dropped, also when the render is cancelled.
+struct Scratch(Vec<PathBuf>);
+impl Scratch {
+    fn of(paths: Vec<PathBuf>) -> Self {
+        active_scratch()
+            .lock()
+            .unwrap()
+            .extend(paths.iter().cloned());
+        Self(paths)
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let mut active = active_scratch().lock().unwrap();
+        for path in &self.0 {
+            active.remove(path);
+        }
+    }
+}
+/// Whether a running render or export still needs this scratch file or folder.
+/// Cleaning up storage must leave such entries alone.
+pub fn scratch_in_use(path: &Path) -> bool {
+    active_scratch().lock().unwrap().contains(path)
+        || partial_outputs().lock().unwrap().contains(path)
+}
+
 /// `previews/` and `renders/` only hold scratch files of the running process, so
 /// whatever an earlier run left behind is removed before this one creates its own.
 fn clean_stale_once(root: &Path) {
@@ -57,7 +89,11 @@ fn clean_stale_once(root: &Path) {
         return;
     }
     for name in ["previews", "renders"] {
-        for entry in std::fs::read_dir(root.join(name)).into_iter().flatten().flatten() {
+        for entry in std::fs::read_dir(root.join(name))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 std::fs::remove_dir_all(entry.path())
             } else {
@@ -178,11 +214,17 @@ impl RenderJobs {
                 return Err("HEVC 코덱은 mp4 또는 mov 형식에서만 사용할 수 있습니다.".into());
             }
         }
-        if params.get("hardware").is_some_and(|v| !v.is_boolean() && !v.is_null()) {
+        if params
+            .get("hardware")
+            .is_some_and(|v| !v.is_boolean() && !v.is_null())
+        {
             return Err("하드웨어 인코딩 설정은 true 또는 false여야 합니다.".into());
         }
         if let Some(bitrate) = params.get("bitrate").filter(|v| !v.is_null()) {
-            if !bitrate.as_f64().is_some_and(|b| (100.0..=200_000.0).contains(&b)) {
+            if !bitrate
+                .as_f64()
+                .is_some_and(|b| (100.0..=200_000.0).contains(&b))
+            {
                 return Err("비트레이트는 100~200000 kbps 범위에서 지정해 주세요.".into());
             }
         }
@@ -205,7 +247,9 @@ impl RenderJobs {
                 let old = videos.pop_front().unwrap();
                 for job in self.states.lock().unwrap().values() {
                     if job["path"] == old.to_string_lossy().as_ref() {
-                        if let Some(cancel) = self.cancels.lock().unwrap().get(string(job, "id", "")) {
+                        if let Some(cancel) =
+                            self.cancels.lock().unwrap().get(string(job, "id", ""))
+                        {
                             cancel.store(true, Ordering::Relaxed);
                         }
                     }
@@ -304,6 +348,11 @@ async fn render_frame(
     root: &Path,
     cancel: Arc<AtomicBool>,
 ) -> Result<Value, String> {
+    // Preview frames take the export's path: composed at the project size, resized
+    // at the end. Composing at the frame's own size was measured and dropped: on 4K
+    // projects it saved 0-7% (decoding and reading the sources is the cost, not
+    // compositing), and at frame widths that do not divide the project evenly it
+    // could place text up to a pixel away from where the export has it.
     clean_stale_once(root);
     let duration = project_duration(project);
     let requested_time = number(params, "time", 0.0);
@@ -328,6 +377,7 @@ async fn render_frame(
     let id = media::id("preview");
     let output = directory.join(format!("{id}.png"));
     let temp = directory.join(&id);
+    let _scratch = Scratch::of(vec![temp.clone(), output.clone()]);
     std::fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
     let args = json!({"width":width,"height":height,"start":time,"end":(time+1.0/number(project,"fps",30.0)).min(duration)});
     let result = run_process(
@@ -417,7 +467,10 @@ fn transition(clip: &Value, enter: bool, length: f64) -> Option<(&str, f64)> {
     let fade = number(clip, fade, 0.0);
     let value = &clip[field];
     let (kind, duration) = if value.is_object() {
-        (string(value, "type", "fade"), number(value, "duration", fade))
+        (
+            string(value, "type", "fade"),
+            number(value, "duration", fade),
+        )
     } else {
         ("fade", fade)
     };
@@ -439,7 +492,13 @@ fn transition_progress(enter: bool, duration: f64, length: f64, time: &str) -> S
 /// every frame by a command. The edge moves in the named direction: entering reveals
 /// the clip behind it, leaving hides it behind it. Costs a fill of the hidden pixels,
 /// and only while the wipe lasts.
-fn wipe_filters(kind: &str, enter: bool, duration: f64, length: f64, label: &str) -> Option<String> {
+fn wipe_filters(
+    kind: &str,
+    enter: bool,
+    duration: f64,
+    length: f64,
+    label: &str,
+) -> Option<String> {
     let (option, size, forward) = match kind {
         "wipeRight" => ("x", "W", true),
         "wipeLeft" => ("x", "W", false),
@@ -451,7 +510,12 @@ fn wipe_filters(kind: &str, enter: bool, duration: f64, length: f64, label: &str
     // shown part is the near side, at -p (covering the near side) otherwise.
     let sign = if forward == enter { 1 } else { -1 };
     let (from, to, progress, during) = if enter {
-        (0.0, duration, format!("T/{duration}"), format!("lt(t,{duration})"))
+        (
+            0.0,
+            duration,
+            format!("T/{duration}"),
+            format!("lt(t,{duration})"),
+        )
     } else {
         (
             length - duration,
@@ -622,6 +686,7 @@ async fn run(
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let temp_dir = root.join("renders").join(id);
+    let _scratch = Scratch::of(vec![temp_dir.clone()]);
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(output.parent().ok_or("저장 위치가 올바르지 않습니다.")?)
         .map_err(|e| e.to_string())?;
@@ -631,7 +696,10 @@ async fn run(
         id,
         format
     ));
-    partial_outputs().lock().unwrap().insert(temp_output.clone());
+    partial_outputs()
+        .lock()
+        .unwrap()
+        .insert(temp_output.clone());
     let encoders = video_encoders(&params, format).await;
     let result = run_encoders(
         &project,
@@ -817,6 +885,8 @@ async fn run_process(
     let fps = number(params, "fps", number(p, "fps", 30.0));
     let audio_only = matches!(format, "mp3" | "wav");
     let still = format == "png";
+    // Every output, a preview frame included, is composed at the project size and
+    // resized at the end, so a frame shows exactly what the export has.
     let mut command = Command::new(media::executable("ffmpeg"));
     command.current_dir(temp);
     command.args([
@@ -897,7 +967,9 @@ async fn run_process(
                 match asset.and_then(|a| a["path"].as_str()) {
                     Some(path) => media::constant_frame_rate(Path::new(path))
                         .await
-                        .map_or(SEEK_MARGIN, |rate| (2.0 / rate).clamp(STEADY_SEEK_MARGIN, SEEK_MARGIN)),
+                        .map_or(SEEK_MARGIN, |rate| {
+                            (2.0 / rate).clamp(STEADY_SEEK_MARGIN, SEEK_MARGIN)
+                        }),
                     None => SEEK_MARGIN,
                 }
             } else {
@@ -1024,10 +1096,15 @@ async fn run_process(
                             ));
                         }
                     }
-                } else if !animated_scale && (static_scale - 1.0).abs() > 1e-6 {
-                    filters.push_str(&format!(
-                        ",scale=w='max(2,trunc(iw*{static_scale}/2)*2)':h='max(2,trunc(ih*{static_scale}/2)*2)'"
-                    ));
+                } else {
+                    // Text is drawn at the project size; only the clip's own fixed
+                    // scale resizes its picture.
+                    let text_scale = if animated_scale { 1.0 } else { static_scale };
+                    if (text_scale - 1.0).abs() > 1e-6 {
+                        filters.push_str(&format!(
+                            ",scale=w='max(2,trunc(iw*{text_scale}/2)*2)':h='max(2,trunc(ih*{text_scale}/2)*2)'"
+                        ));
+                    }
                 }
                 append_color_filters(&mut filters, &clip["color"], temp, idx)?;
                 if transform["flipX"] == true {
@@ -1128,8 +1205,12 @@ async fn run_process(
                 ));
                 graph.push(filters);
                 let local = format!("t-({})", position - start);
-                let rest = expression(clip, "x", number(transform, "x", 0.0), &local);
-                let y = expression(clip, "y", number(transform, "y", 0.0), &local);
+                // Offsets are in project pixels.
+                let offset = |property: &str| {
+                    expression(clip, property, number(transform, property, 0.0), &local)
+                };
+                let rest = offset("x");
+                let y = offset("y");
                 let mut x = rest.clone();
                 for (enters, slide) in sides {
                     if let Some(offset) = slide
@@ -1160,16 +1241,16 @@ async fn run_process(
                         // frame per 1/fps from time 0, so parts are cut by frame number
                         // and the joined frames get their numbers back as timestamps.
                         let first = ((position - start - FRAME_TOLERANCE) * fps).floor() - 1.0;
-                        let last = ((position + length - start - FRAME_TOLERANCE) * fps).ceil() + 1.0;
+                        let last =
+                            ((position + length - start - FRAME_TOLERANCE) * fps).ceil() + 1.0;
                         let before = first >= 1.0;
                         let after = last < span * fps - 1.0;
                         let within = match (before, after) {
                             (false, false) => String::new(),
                             (true, false) => format!(",trim=start_frame={first}"),
-                            (_, true) => format!(
-                                ",trim=start_frame={}:end_frame={last}",
-                                first.max(0.0)
-                            ),
+                            (_, true) => {
+                                format!(",trim=start_frame={}:end_frame={last}", first.max(0.0))
+                            }
                         };
                         let mut parts = vec![];
                         let mut cut = format!(
@@ -1300,13 +1381,7 @@ async fn run_process(
         _ => unreachable!(),
     }
     command
-        .args([
-            "-t",
-            &span.to_string(),
-            "-progress",
-            "pipe:1",
-            "-nostats",
-        ])
+        .args(["-t", &span.to_string(), "-progress", "pipe:1", "-nostats"])
         .arg(output)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1359,7 +1434,9 @@ fn append_color_filters(
         number(color, "saturation", 1.0),
     );
     // An ungraded clip skips the filter and the colour conversions around it.
-    if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001
+    if brightness.abs() > 0.0001
+        || (contrast - 1.0).abs() > 0.0001
+        || (saturation - 1.0).abs() > 0.0001
     {
         filters.push_str(&format!(
             ",eq=brightness={brightness}:contrast={contrast}:saturation={saturation}"
@@ -1542,9 +1619,40 @@ fn breaks_anywhere(ch: char) -> bool {
 fn closes(ch: char) -> bool {
     matches!(
         ch,
-        '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '…' | '’' | '”' | '»'
-            | '、' | '。' | '，' | '．' | '！' | '？' | '：' | '；' | '）' | '］' | '｝'
-            | '」' | '』' | '】' | '〕' | '〉' | '》' | '〗' | '〙' | '〛' | '・' | '々'
+        '.' | ','
+            | '!'
+            | '?'
+            | ':'
+            | ';'
+            | ')'
+            | ']'
+            | '}'
+            | '…'
+            | '’'
+            | '”'
+            | '»'
+            | '、'
+            | '。'
+            | '，'
+            | '．'
+            | '！'
+            | '？'
+            | '：'
+            | '；'
+            | '）'
+            | '］'
+            | '｝'
+            | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〉'
+            | '》'
+            | '〗'
+            | '〙'
+            | '〛'
+            | '・'
+            | '々'
     )
 }
 
@@ -1552,8 +1660,23 @@ fn closes(ch: char) -> bool {
 fn opens(ch: char) -> bool {
     matches!(
         ch,
-        '(' | '[' | '{' | '‘' | '“' | '«' | '（' | '［' | '｛' | '「' | '『' | '【' | '〔'
-            | '〈' | '《' | '〖' | '〘' | '〚'
+        '(' | '['
+            | '{'
+            | '‘'
+            | '“'
+            | '«'
+            | '（'
+            | '［'
+            | '｛'
+            | '「'
+            | '『'
+            | '【'
+            | '〔'
+            | '〈'
+            | '《'
+            | '〖'
+            | '〘'
+            | '〚'
     )
 }
 
@@ -1715,9 +1838,9 @@ fn rasterize_text(clip: &Value, canvas_width: u32, path: &Path) -> Result<(), St
     let outline_width = outline.map_or(0.0, |o| number(o, "width", 0.0).clamp(0.0, 20.0)) as f32;
     // A shadow with no offset and no blur sits exactly under the glyphs: the
     // inspector stores that for "off", so it is not drawn.
-    let shadow = text.get("shadow").filter(|v| {
-        v.is_object() && ["x", "y", "blur"].iter().any(|k| number(v, k, 0.0) != 0.0)
-    });
+    let shadow = text
+        .get("shadow")
+        .filter(|v| v.is_object() && ["x", "y", "blur"].iter().any(|k| number(v, k, 0.0) != 0.0));
     let (shadow_x, shadow_y, shadow_blur) = shadow.map_or((0, 0, 0.0), |s| {
         (
             number(s, "x", 0.0).clamp(-200.0, 200.0).round() as i32,
@@ -2560,9 +2683,31 @@ mod tests {
         assert_eq!(active.len(), MAX_JOBS + 5);
     }
     #[test]
+    fn scratch_of_a_running_render_is_in_use_until_it_ends() {
+        let folder = std::env::temp_dir().join(media::id("studio-scratch-test"));
+        let (temp, partial) = (
+            folder.join("renders/export-1"),
+            folder.join(".out.export-1.partial.mp4"),
+        );
+        assert!(!scratch_in_use(&temp));
+        let running = Scratch::of(vec![temp.clone()]);
+        partial_outputs().lock().unwrap().insert(partial.clone());
+        assert!(scratch_in_use(&temp) && scratch_in_use(&partial));
+        assert!(!scratch_in_use(&folder.join("renders/export-2")));
+        // Dropped when the render returns, fails or is cancelled.
+        drop(running);
+        partial_outputs().lock().unwrap().remove(&partial);
+        assert!(!scratch_in_use(&temp) && !scratch_in_use(&partial));
+    }
+    #[test]
     fn stale_scratch_files_are_removed_once_and_user_files_are_left_alone() {
         let root = std::env::temp_dir().join(media::id("studio-clean-test"));
-        for dir in ["previews/preview-old", "renders/export-old", "thumbnails", "imports"] {
+        for dir in [
+            "previews/preview-old",
+            "renders/export-old",
+            "thumbnails",
+            "imports",
+        ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         let stale = [
@@ -2598,9 +2743,23 @@ mod tests {
     }
     async fn frame_at(path: &Path, time: f64) -> Vec<u8> {
         let decoded = Command::new(media::executable("ffmpeg"))
-            .args(["-v", "error", "-ss", &(time - 0.01).max(0.0).to_string(), "-i"])
+            .args([
+                "-v",
+                "error",
+                "-ss",
+                &(time - 0.01).max(0.0).to_string(),
+                "-i",
+            ])
             .arg(path)
-            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
             .output()
             .await
             .unwrap();
@@ -2703,7 +2862,10 @@ mod tests {
                 .unwrap()
                 .to_rgb8();
             let error = mean_difference(preview.as_raw(), &frame_at(&full, time).await);
-            assert!(error < 2.5, "frame at {time}s differs from the export: {error}");
+            assert!(
+                error < 2.5,
+                "frame at {time}s differs from the export: {error}"
+            );
         }
         let range = dir.join("range.mp4");
         let job = jobs
@@ -2746,8 +2908,14 @@ mod tests {
             .collect();
         let at = |seconds: f64| peaks[(seconds / 1.5 * peaks.len() as f64) as usize];
         assert!(at(0.1) > 0.3 && at(0.4) > 0.3, "tone expected: {peaks:?}");
-        assert!(at(0.6) < 0.02 && at(1.15) < 0.02, "silence expected: {peaks:?}");
-        assert!(at(1.35) > 0.3 && at(1.45) > 0.3, "reversed tone expected: {peaks:?}");
+        assert!(
+            at(0.6) < 0.02 && at(1.15) < 0.02,
+            "silence expected: {peaks:?}"
+        );
+        assert!(
+            at(1.35) > 0.3 && at(1.45) > 0.3,
+            "reversed tone expected: {peaks:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// Slow motion and a source frame rate other than the project's put window starts
@@ -2810,17 +2978,32 @@ mod tests {
             clip["speed"] = json!(speed);
             clip["sourceIn"] = json!(source_in);
         }
-        assert_eq!(p["clips"].as_array().unwrap().iter().filter(|c| c["speed"] != 1.0).count(), 2);
+        assert_eq!(
+            p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["speed"] != 1.0)
+                .count(),
+            2
+        );
         validate_project(&p).unwrap();
         let root = dir.join("state");
         let jobs = RenderJobs::default();
         let full = dir.join("full.mp4");
         let job = jobs
-            .start(p.clone(), json!({"path":full,"format":"mp4","crf":8}), root.clone())
+            .start(
+                p.clone(),
+                json!({"path":full,"format":"mp4","crf":8}),
+                root.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(finish(&jobs, &job).await["state"], "completed");
-        for frame in (2..150).step_by(3).chain([4, 10, 34, 35, 36, 37, 61, 63, 65, 94, 100, 137]) {
+        for frame in (2..150)
+            .step_by(3)
+            .chain([4, 10, 34, 35, 36, 37, 61, 63, 65, 94, 100, 137])
+        {
             let time = frame as f64 / 30.0;
             let still = preview_frame(&p, &json!({"time":time,"width":320}), &root)
                 .await
@@ -2829,7 +3012,10 @@ mod tests {
                 .unwrap()
                 .to_rgb8();
             let error = mean_difference(preview.as_raw(), &frame_at(&full, time).await);
-            assert!(error < 2.5, "frame {frame} differs from the export: {error}");
+            assert!(
+                error < 2.5,
+                "frame {frame} differs from the export: {error}"
+            );
         }
         for start in [35, 63, 100, 130] {
             let range = dir.join(format!("range{start}.mp4"));
@@ -2849,7 +3035,10 @@ mod tests {
                     &frame_at(&range, offset).await,
                     &frame_at(&full, from + offset).await,
                 );
-                assert!(error < 2.5, "range {start} frame at +{offset}s differs: {error}");
+                assert!(
+                    error < 2.5,
+                    "range {start} frame at +{offset}s differs: {error}"
+                );
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -2859,9 +3048,14 @@ mod tests {
         let dir = std::env::temp_dir().join(media::id("studio-late-frame-test"));
         std::fs::create_dir_all(&dir).unwrap();
         let mut paths = vec![];
-        for (name, color) in [("early.png", [255, 0, 0, 255]), ("late.png", [0, 0, 255, 255])] {
+        for (name, color) in [
+            ("early.png", [255, 0, 0, 255]),
+            ("late.png", [0, 0, 255, 255]),
+        ] {
             let path = dir.join(name);
-            RgbaImage::from_pixel(320, 180, Rgba(color)).save(&path).unwrap();
+            RgbaImage::from_pixel(320, 180, Rgba(color))
+                .save(&path)
+                .unwrap();
             paths.push(path);
         }
         let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
@@ -2931,7 +3125,10 @@ mod tests {
         .await
         .unwrap();
         let project = e
-            .dispatch("media.importAndAdd", json!({"paths":[input],"duration":0.5}))
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[input],"duration":0.5}),
+            )
             .await
             .unwrap();
         let root = dir.join("state");
@@ -2947,15 +3144,24 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"someone else's video");
         let mut allowed = params.clone();
         allowed["overwrite"] = json!(true);
-        let job = jobs.start(project.clone(), allowed, root.clone()).await.unwrap();
+        let job = jobs
+            .start(project.clone(), allowed, root.clone())
+            .await
+            .unwrap();
         assert_eq!(finish(&jobs, &job).await["state"], "completed");
         let exported = media::probe(&output, &dir).await.unwrap();
-        assert_eq!((exported["width"].as_u64(), exported["height"].as_u64()), (Some(180), Some(180)));
+        assert_eq!(
+            (exported["width"].as_u64(), exported["height"].as_u64()),
+            (Some(180), Some(180))
+        );
         let pixels = frame_at(&output, 0.25).await;
         let pixel = |x: usize, y: usize| &pixels[(y * 180 + x) * 3..(y * 180 + x) * 3 + 3];
         // 320x180 fits as 180x102 in the middle, with black bars above and below.
         assert!(pixel(90, 90)[0] > 200 && pixel(90, 90)[1] < 60);
-        assert!(pixel(4, 90)[0] > 200, "the picture must span the full width");
+        assert!(
+            pixel(4, 90)[0] > 200,
+            "the picture must span the full width"
+        );
         for y in [4, 30, 150, 175] {
             assert!(pixel(90, y).iter().all(|v| *v < 30), "bar at y={y}");
         }
@@ -2971,14 +3177,19 @@ mod tests {
             .unwrap();
         let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
         let project = e
-            .dispatch("media.importAndAdd", json!({"paths":[input],"duration":0.2}))
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[input],"duration":0.2}),
+            )
             .await
             .unwrap();
         let root = dir.join("state");
         let jobs = RenderJobs::default();
         let mut videos = vec![];
         for index in 0..=MAX_PREVIEW_VIDEOS {
-            let path = root.join("previews").join(format!("preview-video-{index}.mp4"));
+            let path = root
+                .join("previews")
+                .join(format!("preview-video-{index}.mp4"));
             let job = jobs
                 .start(
                     project.clone(),
@@ -3040,7 +3251,9 @@ mod tests {
         )
         .await
         .unwrap();
-        image::open(frame["path"].as_str().unwrap()).unwrap().to_rgb8()
+        image::open(frame["path"].as_str().unwrap())
+            .unwrap()
+            .to_rgb8()
     }
     fn near(pixel: &image::Rgb<u8>, want: [u8; 3], tolerance: i32) -> bool {
         (0..3).all(|i| (pixel[i] as i32 - want[i] as i32).abs() <= tolerance)
@@ -3061,8 +3274,14 @@ mod tests {
             plain,
             "if(lt(t,1.000000),-100.000000+(200.000000)*((t)-0.000000)/1.000000,100.000000)"
         );
-        assert_eq!(expression(&json!({"keyframes":frames(Some("linear"))}), "x", 0.0, "t"), plain);
-        assert_ne!(expression(&json!({"keyframes":frames(Some("easeIn"))}), "x", 0.0, "t"), plain);
+        assert_eq!(
+            expression(&json!({"keyframes":frames(Some("linear"))}), "x", 0.0, "t"),
+            plain
+        );
+        assert_ne!(
+            expression(&json!({"keyframes":frames(Some("easeIn"))}), "x", 0.0, "t"),
+            plain
+        );
 
         let dir = std::env::temp_dir().join(media::id("studio-easing-test"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3122,14 +3341,22 @@ mod tests {
         for n in [1u32, 7, 23, 50, 113, 123, 200, 301] {
             let project = at_30_fps(vec![layer("white", "v1", n as f64 / 30.0, 10.0 / 30.0)]);
             for (frame, lit) in [(n - 1, 0), (n, 255), (n + 9, 255)] {
-                let pixel = *still(&project, &dir, frame as f64 / 30.0).await.get_pixel(160, 90);
-                assert!(near(&pixel, [lit; 3], 8), "clip from frame {n}, frame {frame}: {pixel:?}");
+                let pixel = *still(&project, &dir, frame as f64 / 30.0)
+                    .await
+                    .get_pixel(160, 90);
+                assert!(
+                    near(&pixel, [lit; 3], 8),
+                    "clip from frame {n}, frame {frame}: {pixel:?}"
+                );
             }
         }
         // The exported file shows each clip on exactly its ten frames.
         let starts = [7u32, 23, 50, 113];
         let mut project = at_30_fps(
-            starts.iter().map(|n| layer("white", "v1", *n as f64 / 30.0, 10.0 / 30.0)).collect(),
+            starts
+                .iter()
+                .map(|n| layer("white", "v1", *n as f64 / 30.0, 10.0 / 30.0))
+                .collect(),
         );
         // An export validates the project like the editor does.
         project["markers"] = json!([]);
@@ -3137,7 +3364,8 @@ mod tests {
         project["concept"] = json!({"audience":"","message":"","appeal":"","direction":""});
         for clip in project["clips"].as_array_mut().unwrap() {
             clip["reverse"] = json!(false);
-            clip["color"] = json!({"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0});
+            clip["color"] =
+                json!({"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0});
         }
         let output = dir.join("cuts.mp4");
         let jobs = RenderJobs::default();
@@ -3186,13 +3414,20 @@ mod tests {
             let level = (255.0 * alpha) as u8;
             for (x, y) in [(4, 4), (160, 90), (315, 175)] {
                 let pixel = frame.get_pixel(x, y);
-                assert!(near(pixel, [level; 3], 8), "{time}s: {pixel:?}, expected {level}");
+                assert!(
+                    near(pixel, [level; 3], 8),
+                    "{time}s: {pixel:?}, expected {level}"
+                );
             }
         }
         let held = still(&project("hold", 0.0), &dir, 0.75).await;
         assert!(near(held.get_pixel(160, 90), [255; 3], 8));
         let eased = still(&project("easeIn", 0.0), &dir, 0.5).await;
-        assert!(near(eased.get_pixel(160, 90), [204; 3], 8), "{:?}", eased.get_pixel(160, 90));
+        assert!(
+            near(eased.get_pixel(160, 90), [204; 3], 8),
+            "{:?}",
+            eased.get_pixel(160, 90)
+        );
         // Together with a rotation, and the same in the exported file.
         let rotated = project("linear", 90.0);
         let expected = still(&rotated, &dir, 0.5).await;
@@ -3243,7 +3478,10 @@ mod tests {
         }
         for (x, y) in [(80, 90), (240, 90), (160, 20), (160, 160), (10, 10)] {
             let pixel = frame.get_pixel(x, y);
-            assert!(near(pixel, [0, 0, 0], 12), "outside at ({x},{y}): {pixel:?}");
+            assert!(
+                near(pixel, [0, 0, 0], 12),
+                "outside at ({x},{y}): {pixel:?}"
+            );
         }
         let output = dir.join("scale.mp4");
         run(
@@ -3325,8 +3563,14 @@ mod tests {
                 }
                 if kind == "zoom" {
                     // Scaled to 0.9: a 16 px border of background shows.
-                    assert!(near(frame.get_pixel(5, 90), NONE, 16), "zoom border at {time}s");
-                    assert!(near(frame.get_pixel(160, 4), NONE, 16), "zoom border at {time}s");
+                    assert!(
+                        near(frame.get_pixel(5, 90), NONE, 16),
+                        "zoom border at {time}s"
+                    );
+                    assert!(
+                        near(frame.get_pixel(160, 4), NONE, 16),
+                        "zoom border at {time}s"
+                    );
                 }
             }
             // The exported file moves through the transition as the frame preview does.
@@ -3351,7 +3595,10 @@ mod tests {
             // Between the transitions the clip is untouched.
             let frame = still(&project, &dir, 1.0).await;
             for (x, y) in [(2, 2), (317, 177), (160, 90)] {
-                assert!(near(frame.get_pixel(x, y), RED, 16), "{kind} at rest ({x},{y})");
+                assert!(
+                    near(frame.get_pixel(x, y), RED, 16),
+                    "{kind} at rest ({x},{y})"
+                );
             }
         }
         // Older projects: fadeIn/fadeOut without a transition object still fade.
@@ -3359,8 +3606,16 @@ mod tests {
         clip["fadeIn"] = json!(1.0);
         clip["transitionIn"] = Value::Null;
         let project = composition(vec![red.clone()], vec![clip]);
-        assert!(near(still(&project, &dir, 0.5).await.get_pixel(160, 90), HALF, 16));
-        assert!(near(still(&project, &dir, 1.5).await.get_pixel(160, 90), RED, 16));
+        assert!(near(
+            still(&project, &dir, 0.5).await.get_pixel(160, 90),
+            HALF,
+            16
+        ));
+        assert!(near(
+            still(&project, &dir, 1.5).await.get_pixel(160, 90),
+            RED,
+            16
+        ));
         // A wipe follows the clip's own box when it is scaled and moved.
         let mut clip = layer("red", "v1", 0.0, 2.0);
         clip["transform"]["scale"] = json!(0.5);
@@ -3393,7 +3648,11 @@ mod tests {
         let under = layer("red", "v1", 4.0, 1.0);
         let over = layer("green", "v1", 4.0, 1.0);
         let project = composition(media, vec![blue, red, under, over]);
-        assert!(near(still(&project, &dir, 1.0).await.get_pixel(160, 90), [255, 0, 0], 16));
+        assert!(near(
+            still(&project, &dir, 1.0).await.get_pixel(160, 90),
+            [255, 0, 0],
+            16
+        ));
         let middle = still(&project, &dir, 1.75).await;
         for (x, y) in [(20, 20), (160, 90), (300, 160)] {
             let pixel = middle.get_pixel(x, y);
@@ -3407,8 +3666,16 @@ mod tests {
         assert!(early.get_pixel(160, 90)[0] > early.get_pixel(160, 90)[2] + 60);
         let late = still(&project, &dir, 1.875).await;
         assert!(late.get_pixel(160, 90)[2] > late.get_pixel(160, 90)[0] + 60);
-        assert!(near(still(&project, &dir, 2.5).await.get_pixel(160, 90), [0, 0, 255], 16));
-        assert!(near(still(&project, &dir, 4.5).await.get_pixel(160, 90), [0, 255, 0], 16));
+        assert!(near(
+            still(&project, &dir, 2.5).await.get_pixel(160, 90),
+            [0, 0, 255],
+            16
+        ));
+        assert!(near(
+            still(&project, &dir, 4.5).await.get_pixel(160, 90),
+            [0, 255, 0],
+            16
+        ));
         // The exported file shows the same mix.
         let output = dir.join("dissolve.mp4");
         run(
@@ -3424,7 +3691,10 @@ mod tests {
         .await
         .unwrap();
         let error = mean_difference(middle.as_raw(), &frame_at(&output, 1.75).await);
-        assert!(error < 4.0, "export differs from the frame preview: {error}");
+        assert!(
+            error < 4.0,
+            "export differs from the frame preview: {error}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3459,7 +3729,10 @@ mod tests {
             let frame = still(&frame_with(json!(mode), json!({})), &dir, 0.5).await;
             for (x, y) in [(10, 10), (160, 90), (310, 170)] {
                 let pixel = frame.get_pixel(x, y);
-                assert!(near(pixel, expected, 8), "{mode}: {pixel:?}, expected {expected:?}");
+                assert!(
+                    near(pixel, expected, 8),
+                    "{mode}: {pixel:?}, expected {expected:?}"
+                );
             }
         }
         // Overlay keys on the picture below: dark below multiplies, bright below screens.
@@ -3467,7 +3740,10 @@ mod tests {
         dark["media"][0] = solid(&dir, "dark", [40, 40, 40], (320, 180));
         dark["media"][0]["id"] = json!("below");
         let pixel = *still(&dark, &dir, 0.5).await.get_pixel(160, 90);
-        assert!(near(&pixel, [31, 63, 16], 8), "overlay over dark: {pixel:?}");
+        assert!(
+            near(&pixel, [31, 63, 16], 8),
+            "overlay over dark: {pixel:?}"
+        );
         // No mode, or one this version does not know, is a normal layer.
         for mode in [Value::Null, json!("future-mode")] {
             let frame = still(&frame_with(mode, json!({})), &dir, 0.5).await;
@@ -3486,7 +3762,10 @@ mod tests {
         }
         for (x, y) in [(60, 90), (200, 20), (300, 90), (200, 160)] {
             let pixel = frame.get_pixel(x, y);
-            assert!(near(pixel, [128, 128, 128], 5), "outside the layer: {pixel:?}");
+            assert!(
+                near(pixel, [128, 128, 128], 5),
+                "outside the layer: {pixel:?}"
+            );
         }
         // Rotated: the corners of the layer's bounding box stay untouched.
         let project = frame_with(json!("multiply"), json!({"scale":0.5,"rotation":45.0}));
@@ -3510,7 +3789,10 @@ mod tests {
         .await
         .unwrap();
         let error = mean_difference(expected.as_raw(), &frame_at(&output, 0.5).await);
-        assert!(error < 4.0, "export differs from the frame preview: {error}");
+        assert!(
+            error < 4.0,
+            "export differs from the frame preview: {error}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3539,7 +3821,10 @@ mod tests {
             .output()
             .await
             .unwrap();
-        String::from_utf8_lossy(&probed.stdout).trim().parse().unwrap()
+        String::from_utf8_lossy(&probed.stdout)
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3560,12 +3845,31 @@ mod tests {
         let mut badge = layer("badge", "v2", 2.5, 0.5);
         badge["transform"]["x"] = json!(-120.0);
         let project = composition(media, vec![layer("below", "v1", 0.0, 3.0), top, badge]);
-        let expected = |time: f64| if (1.0..2.0).contains(&time) { MULTIPLIED } else { GREY };
-        let times = [0.0, 0.5, 23.0 / 24.0, 1.0, 1.5, 47.0 / 24.0, 2.0, 2.5, 71.0 / 24.0];
+        let expected = |time: f64| {
+            if (1.0..2.0).contains(&time) {
+                MULTIPLIED
+            } else {
+                GREY
+            }
+        };
+        let times = [
+            0.0,
+            0.5,
+            23.0 / 24.0,
+            1.0,
+            1.5,
+            47.0 / 24.0,
+            2.0,
+            2.5,
+            71.0 / 24.0,
+        ];
         for time in times {
             let frame = still(&project, &dir, time).await;
             let pixel = frame.get_pixel(160, 90);
-            assert!(near(pixel, expected(time), 8), "frame at {time}s: {pixel:?}");
+            assert!(
+                near(pixel, expected(time), 8),
+                "frame at {time}s: {pixel:?}"
+            );
         }
         let centre = |raw: &[u8]| image::Rgb([0, 1, 2].map(|c| raw[(90 * 320 + 160) * 3 + c]));
         let badge_at = |raw: &[u8]| image::Rgb([0, 1, 2].map(|c| raw[(90 * 320 + 40) * 3 + c]));
@@ -3574,12 +3878,29 @@ mod tests {
         for time in times {
             let raw = frame_at(&output, time).await;
             let pixel = centre(&raw);
-            assert!(near(&pixel, expected(time), 10), "export at {time}s: {pixel:?}");
-            let white = if time >= 2.5 { [255; 3] } else { expected(time) };
-            assert!(near(&badge_at(&raw), white, 10), "badge at {time}s: {:?}", badge_at(&raw));
+            assert!(
+                near(&pixel, expected(time), 10),
+                "export at {time}s: {pixel:?}"
+            );
+            let white = if time >= 2.5 {
+                [255; 3]
+            } else {
+                expected(time)
+            };
+            assert!(
+                near(&badge_at(&raw), white, 10),
+                "badge at {time}s: {:?}",
+                badge_at(&raw)
+            );
         }
         // Windows that start inside the clip, end inside it, or miss it altogether.
-        for (start, end) in [(1.5, 3.0), (0.5, 1.5), (0.0, 0.75), (2.25, 3.0), (1.25, 1.75)] {
+        for (start, end) in [
+            (1.5, 3.0),
+            (0.5, 1.5),
+            (0.0, 0.75),
+            (2.25, 3.0),
+            (1.25, 1.75),
+        ] {
             let name = format!("range-{start}-{end}");
             let params = json!({"crf":12,"hardware":false,"start":start,"end":end});
             let output = export(&project, params, &dir, &name).await;
@@ -3612,7 +3933,10 @@ mod tests {
         let project = composition(vec![red.clone()], vec![clip.clone()]);
         let frame = still(&project, &dir, 0.0).await;
         for x in [5, 40, 75, 110, 160, 260] {
-            assert!(near(frame.get_pixel(x, 90), NONE, 16), "entering, start, x {x}");
+            assert!(
+                near(frame.get_pixel(x, 90), NONE, 16),
+                "entering, start, x {x}"
+            );
         }
         // Halfway it has covered half of the 300 px from x -80..0: it is at 70..150.
         let frame = still(&project, &dir, 0.5).await;
@@ -3642,7 +3966,10 @@ mod tests {
         let project = composition(vec![red], vec![clip]);
         let frame = still(&project, &dir, 0.0).await;
         for x in [20, 60, 160, 300, 315] {
-            assert!(near(frame.get_pixel(x, 90), NONE, 16), "keyframed, start, x {x}");
+            assert!(
+                near(frame.get_pixel(x, 90), NONE, 16),
+                "keyframed, start, x {x}"
+            );
         }
         // Halfway: resting place -50 (70..150), plus half of the way from the right edge.
         let frame = still(&project, &dir, 0.5).await;
@@ -3666,7 +3993,11 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
         assert!(media::constant_frame_rate(&input).await.is_some());
         let source = json!({"id":"dropped","name":"dropped","path":input,"kind":"video",
             "duration":20.0,"width":320,"height":180,"hasAudio":false});
@@ -3682,7 +4013,10 @@ mod tests {
             let pixel = frame.get_pixel(160, 90);
             assert!(pixel[0] > 100, "the clip is missing at {time}s: {pixel:?}");
             let error = mean_difference(frame.as_raw(), &frame_at(&output, time).await);
-            assert!(error < 4.0, "frame at {time}s differs from the export: {error}");
+            assert!(
+                error < 4.0,
+                "frame at {time}s differs from the export: {error}"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3695,28 +4029,49 @@ mod tests {
         assert_eq!(wrap("hello world", 60.0), ["hello", "world"]);
         assert_eq!(wrap("one  two", 100.0), ["one  two"]);
         // A word longer than a line breaks between characters.
-        assert_eq!(wrap(&"a".repeat(25), 100.0), ["a".repeat(10), "a".repeat(10), "a".repeat(5)]);
-        assert_eq!(wrap("hi abcdefghijkl", 50.0), ["hi", "abcde", "fghij", "kl"]);
+        assert_eq!(
+            wrap(&"a".repeat(25), 100.0),
+            ["a".repeat(10), "a".repeat(10), "a".repeat(5)]
+        );
+        assert_eq!(
+            wrap("hi abcdefghijkl", 50.0),
+            ["hi", "abcde", "fghij", "kl"]
+        );
         // Korean has no spaces to break at: it breaks between characters.
-        assert_eq!(wrap("한글은글자단위로줄바꿈", 50.0), ["한글은글자", "단위로줄바", "꿈"]);
+        assert_eq!(
+            wrap("한글은글자단위로줄바꿈", 50.0),
+            ["한글은글자", "단위로줄바", "꿈"]
+        );
         assert_eq!(wrap("가나 abc다라", 40.0), ["가나", "abc다", "라"]);
         assert_eq!(wrap("日本語のテキスト", 30.0), ["日本語", "のテキ", "スト"]);
         // Explicit breaks and empty lines stay; each paragraph wraps on its own.
         assert_eq!(wrap("a\n\nb", 100.0), ["a", "", "b"]);
-        assert_eq!(wrap("aaa bbb\nccc ddd eee", 70.0), ["aaa bbb", "ccc ddd", "eee"]);
+        assert_eq!(
+            wrap("aaa bbb\nccc ddd eee", 70.0),
+            ["aaa bbb", "ccc ddd", "eee"]
+        );
         assert_eq!(wrap("", 100.0), [""]);
         assert_eq!(wrap("  indented", 100.0), ["  indented"]);
         // Letter spacing counts towards the width, as it does in the browser.
-        assert_eq!(wrap_text("abcd efgh", 100.0, &|_| 10.0 + 5.0), ["abcd", "efgh"]);
+        assert_eq!(
+            wrap_text("abcd efgh", 100.0, &|_| 10.0 + 5.0),
+            ["abcd", "efgh"]
+        );
         // Closing punctuation never starts a line: it takes the character before it along.
-        assert_eq!(wrap("안녕하세요, 여러분!", 50.0), ["안녕하세", "요, 여러", "분!"]);
+        assert_eq!(
+            wrap("안녕하세요, 여러분!", 50.0),
+            ["안녕하세", "요, 여러", "분!"]
+        );
         assert_eq!(wrap("日本語です。次", 50.0), ["日本語で", "す。次"]);
         assert_eq!(wrap("가나다라」마", 40.0), ["가나다", "라」마"]);
         // An opening bracket never ends a line.
         assert_eq!(wrap("가나다「라마", 40.0), ["가나다", "「라마"]);
         assert_eq!(wrap("가나다(라마)", 40.0), ["가나다", "(라마)"]);
         // A hyphen inside a word allows a break after it, but not before a digit.
-        assert_eq!(wrap("a well-known fact", 70.0), ["a well-", "known", "fact"]);
+        assert_eq!(
+            wrap("a well-known fact", 70.0),
+            ["a well-", "known", "fact"]
+        );
         assert_eq!(wrap("well-known", 100.0), ["well-known"]);
         assert_eq!(wrap("abcd x-1 y", 60.0), ["abcd", "x-1 y"]);
         assert_eq!(wrap("abc -de", 60.0), ["abc", "-de"]);
@@ -3779,7 +4134,10 @@ mod tests {
         assert_eq!(normal.as_raw(), explicit.as_raw());
         let loose = rendered_text(&dir, "lines-loose", two(json!({"lineHeight":2.0})));
         let grown = loose.height() as i32 - normal.height() as i32;
-        assert!((grown - 102).abs() <= 2, "two lines must grow by 2 * 51 px: {grown}");
+        assert!(
+            (grown - 102).abs() <= 2,
+            "two lines must grow by 2 * 51 px: {grown}"
+        );
         let squeezed = rendered_text(&dir, "lines-tight", two(json!({"lineHeight":0.8})));
         assert!(squeezed.height() < normal.height());
         assert!(
@@ -3797,7 +4155,9 @@ mod tests {
         fn pixels_where_rows(image: &RgbaImage, from: f64, to: f64) -> f64 {
             let found: Vec<f64> = image
                 .enumerate_pixels()
-                .filter(|(_, y, p)| p[3] > 200 && p[0] > 200 && (*y as f64) >= from && (*y as f64) < to)
+                .filter(|(_, y, p)| {
+                    p[3] > 200 && p[0] > 200 && (*y as f64) >= from && (*y as f64) < to
+                })
                 .map(|(x, _, _)| x as f64)
                 .collect();
             found.iter().sum::<f64>() / found.len().max(1) as f64
@@ -3807,8 +4167,16 @@ mod tests {
         slanted["italic"] = json!(true);
         let upright = rendered_text(&dir, "upright", bars);
         let italic = rendered_text(&dir, "italic", slanted);
-        assert!(lean(&upright).abs() < 1.0, "upright bars lean by {}", lean(&upright));
-        assert!(lean(&italic) > 4.0, "italic bars must lean right: {}", lean(&italic));
+        assert!(
+            lean(&upright).abs() < 1.0,
+            "upright bars lean by {}",
+            lean(&upright)
+        );
+        assert!(
+            lean(&italic) > 4.0,
+            "italic bars must lean right: {}",
+            lean(&italic)
+        );
         assert_eq!(
             rendered_text(&dir, "italic-off", with(json!({"italic":false}))).as_raw(),
             plain.as_raw()
@@ -3829,11 +4197,20 @@ mod tests {
         assert!((x - ink_x - 4.0).abs() < 0.5 && (y - ink_y - 4.0).abs() < 0.5);
         // The ring reaches 4 px left of the leftmost glyph pixel and no further.
         let left_edge = |image: &RgbaImage, pick: &dyn Fn(&Rgba<u8>) -> bool| {
-            image.enumerate_pixels().filter(|(_, _, p)| pick(p)).map(|(x, _, _)| x).min().unwrap()
+            image
+                .enumerate_pixels()
+                .filter(|(_, _, p)| pick(p))
+                .map(|(x, _, _)| x)
+                .min()
+                .unwrap()
         };
         let reach = left_edge(&outlined, &white) as i32 - left_edge(&outlined, &red) as i32;
         assert!((3..=5).contains(&reach), "outline reaches {reach} px");
-        let thin = rendered_text(&dir, "thin", with(json!({"outline":{"color":"#ff0000","width":0}})));
+        let thin = rendered_text(
+            &dir,
+            "thin",
+            with(json!({"outline":{"color":"#ff0000","width":0}})),
+        );
         assert_eq!(thin.as_raw(), plain.as_raw());
 
         // Shadow: the text shape again in the shadow colour, offset; blur softens it.
@@ -3847,17 +4224,25 @@ mod tests {
         let blue = |p: &Rgba<u8>| p[3] > 0 && p[2] > 200 && p[0] < 60 && p[1] < 60;
         let hard = shadow(0);
         let (hard_ink, x, y) = pixels_where(&hard, white);
-        assert!((hard_ink as f64 / ink as f64 - 1.0).abs() < 0.02, "the shadow lies under the text");
+        assert!(
+            (hard_ink as f64 / ink as f64 - 1.0).abs() < 0.02,
+            "the shadow lies under the text"
+        );
         // The glyph shape drawn in blue at (+12, +8), minus what the text covers.
         let (shadow_pixels, sx, sy) = pixels_where(&hard, blue);
         assert!(shadow_pixels > ink / 3);
-        assert!(sx > x + 4.0 && sy > y + 2.0, "shadow at ({sx},{sy}), text at ({x},{y})");
+        assert!(
+            sx > x + 4.0 && sy > y + 2.0,
+            "shadow at ({sx},{sy}), text at ({x},{y})"
+        );
         let offset_copy = hard
             .enumerate_pixels()
             .filter(|(x, y, p)| white(p) && blue_or_white(&hard, x + 12, y + 8))
             .count();
         fn blue_or_white(image: &RgbaImage, x: u32, y: u32) -> bool {
-            image.get_pixel_checked(x, y).is_some_and(|p| p[3] > 100 && p[2] > 200)
+            image
+                .get_pixel_checked(x, y)
+                .is_some_and(|p| p[3] > 100 && p[2] > 200)
         }
         assert!(offset_copy as f64 > hard_ink as f64 * 0.98);
         let soft = shadow(12);
@@ -3871,7 +4256,10 @@ mod tests {
             x - soft.width() as f64 / 2.0 - (ink_x - plain.width() as f64 / 2.0),
             y - soft.height() as f64 / 2.0 - (ink_y - plain.height() as f64 / 2.0),
         );
-        assert!(dx.abs() < 2.5 && dy.abs() < 2.5, "text moved by ({dx},{dy})");
+        assert!(
+            dx.abs() < 2.5 && dy.abs() < 2.5,
+            "text moved by ({dx},{dy})"
+        );
         assert_eq!((soft.width() - plain.width()) % 2, 0);
 
         // A background covers the text box, not the margin that holds the effects.
@@ -3884,9 +4272,16 @@ mod tests {
         assert_eq!(boxed.get_pixel(8, 8).0, [0, 255, 0, 255]);
 
         // A long Korean sentence and long English text wrap inside 90% of the frame.
-        for content in ["가나다라마바사아자차카타파하 ".repeat(8), "wrapping words ".repeat(12)] {
+        for content in [
+            "가나다라마바사아자차카타파하 ".repeat(8),
+            "wrapping words ".repeat(12),
+        ] {
             let long = rendered_text(&dir, "long", with(json!({"content":content})));
-            assert!(long.width() <= (1280.0_f32 * 0.9) as u32 + 24, "{}", long.width());
+            assert!(
+                long.width() <= (1280.0_f32 * 0.9) as u32 + 24,
+                "{}",
+                long.width()
+            );
             assert!(long.height() > plain.height() * 2);
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -3904,10 +4299,162 @@ mod tests {
             "outline":{"color":"#ff0000","width":3},"shadow":{"color":"#0000ff","x":6,"y":6,"blur":2}});
         let project = composition(vec![], vec![clip]);
         let frame = still(&project, &dir, 0.5).await;
-        let count = |pick: &dyn Fn(&image::Rgb<u8>) -> bool| frame.pixels().filter(|p| pick(p)).count();
-        assert!(count(&|p| p[0] > 200 && p[1] > 200 && p[2] > 200) > 300, "white text");
-        assert!(count(&|p| p[0] > 180 && p[1] < 70 && p[2] < 70) > 300, "red outline");
-        assert!(count(&|p| p[2] > 150 && p[0] < 70 && p[1] < 70) > 50, "blue shadow");
+        let count =
+            |pick: &dyn Fn(&image::Rgb<u8>) -> bool| frame.pixels().filter(|p| pick(p)).count();
+        assert!(
+            count(&|p| p[0] > 200 && p[1] > 200 && p[2] > 200) > 300,
+            "white text"
+        );
+        assert!(
+            count(&|p| p[0] > 180 && p[1] < 70 && p[2] < 70) > 300,
+            "red outline"
+        );
+        assert!(
+            count(&|p| p[2] > 150 && p[0] < 70 && p[1] < 70) > 50,
+            "blue shadow"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A 1280x720 composition that uses everything measured in project pixels or
+    /// placed relative to the frame: offsets, fixed and animated scale, rotation, a
+    /// mask, a blend mode, a slide and a wipe in progress, and styled text.
+    fn busy_composition(dir: &Path) -> Value {
+        let pattern = dir.join("pattern.png");
+        RgbaImage::from_fn(1280, 720, |x, y| {
+            let block = ((x / 80 + y / 80) % 2) as u8;
+            Rgba([(x / 6) as u8, 60 + block * 120, (y / 3) as u8, 255])
+        })
+        .save(&pattern)
+        .unwrap();
+        let media = vec![
+            json!({"id":"pattern","name":"pattern","path":pattern,"kind":"image","duration":5.0,
+                "width":1280,"height":720,"hasAudio":false}),
+            solid(dir, "red", [220, 40, 40], (640, 360)),
+            solid(dir, "green", [40, 200, 80], (400, 400)),
+            solid(dir, "blue", [40, 80, 230], (1280, 720)),
+        ];
+        let mut inset = layer("red", "v2", 0.0, 2.0);
+        inset["transform"] =
+            json!({"x":-300.0,"y":-150.0,"scale":0.4,"rotation":20.0,"opacity":0.9});
+        inset["mask"] =
+            json!({"type":"circle","x":0.5,"y":0.5,"width":0.9,"height":0.9,"feather":0.1});
+        let mut moving = layer("green", "v3", 0.0, 2.0);
+        moving["transform"]["scale"] = json!(0.5);
+        moving["keyframes"] = json!([
+            {"property":"x","time":0,"value":200},{"property":"x","time":2,"value":420},
+            {"property":"y","time":0,"value":-200},{"property":"y","time":2,"value":160},
+            {"property":"scale","time":0,"value":0.3},{"property":"scale","time":2,"value":0.7}
+        ]);
+        moving["transitionIn"] = json!({"type":"wipeRight","duration":1.6});
+        let mut blended = layer("blue", "v4", 0.0, 2.0);
+        blended["blendMode"] = json!("screen");
+        blended["transform"] =
+            json!({"x":250.0,"y":180.0,"scale":0.5,"rotation":0.0,"opacity":0.8});
+        blended["transitionIn"] = json!({"type":"slideLeft","duration":1.5});
+        let mut title = layer("", "v5", 0.0, 2.0);
+        title["kind"] = json!("text");
+        title.as_object_mut().unwrap().remove("mediaId");
+        title["transform"]["y"] = json!(-250.0);
+        title["text"] = json!({"content":"축소 합성 미리보기 Preview","fontSize":72,"color":"#ffffff",
+            "background":"#00000080","outline":{"color":"#ff0000","width":6},
+            "shadow":{"color":"#0000ff","x":10,"y":10,"blur":8}});
+        let mut project = composition(
+            media,
+            vec![
+                layer("pattern", "v1", 0.0, 2.0),
+                inset,
+                moving,
+                blended,
+                title,
+            ],
+        );
+        project["width"] = json!(1280);
+        project["height"] = json!(720);
+        project["tracks"] = json!((1..=5)
+            .map(
+                |n| json!({"id":format!("v{n}"),"kind":"video","name":format!("V{n}"),
+                "muted":false,"hidden":false,"locked":false})
+            )
+            .collect::<Vec<_>>());
+        project
+    }
+
+    /// The share of pixels whose colour differs clearly: a layer that is misplaced or
+    /// has the wrong size shows as an area, resampling only as thin edges.
+    fn clearly_different(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let different = a
+            .chunks(3)
+            .zip(b.chunks(3))
+            .filter(|(a, b)| (0..3).any(|i| (a[i] as i32 - b[i] as i32).abs() > 48))
+            .count();
+        different as f64 / (a.len() / 3) as f64
+    }
+
+    #[tokio::test]
+    async fn a_small_preview_frame_shows_what_the_export_shows() {
+        let dir = std::env::temp_dir().join(media::id("studio-small-frame-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = busy_composition(&dir);
+        let output = export(&project, json!({"crf":10,"hardware":false}), &dir, "busy").await;
+        for width in [320u32, 640, 426] {
+            for time in [0.5, 1.0] {
+                let frame = render_frame(
+                    &project,
+                    &json!({"time":time,"width":width}),
+                    &dir,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .unwrap();
+                let picture = image::open(frame["path"].as_str().unwrap())
+                    .unwrap()
+                    .to_rgb8();
+                assert_eq!(picture.width(), frame["width"].as_u64().unwrap() as u32);
+                assert_eq!(picture.width(), width / 2 * 2);
+                // The same frame of the exported file, resized as the preview is. A
+                // layer that is misplaced or 15% off in size more than doubles both.
+                let decoded = Command::new(media::executable("ffmpeg"))
+                    .args(["-v", "error", "-ss", &(time - 0.01).to_string(), "-i"])
+                    .arg(&output)
+                    .args(["-frames:v", "1", "-vf"])
+                    .arg(format!("scale={}:{}", picture.width(), picture.height()))
+                    .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(decoded.status.success());
+                let mean = mean_difference(picture.as_raw(), &decoded.stdout);
+                let area = clearly_different(picture.as_raw(), &decoded.stdout);
+                assert!(
+                    mean < 6.0,
+                    "width {width} at {time}: export mean difference {mean}"
+                );
+                assert!(
+                    area < 0.04,
+                    "width {width} at {time}: {area} of the export differs"
+                );
+            }
+        }
+        // `reduce` is not a parameter any more: a frame asked for with it is the same
+        // picture, composed at the project size as every other frame is.
+        let pixels = |params: Value| {
+            let (project, dir) = (project.clone(), dir.clone());
+            async move {
+                let frame = render_frame(&project, &params, &dir, Arc::new(AtomicBool::new(false)))
+                    .await
+                    .unwrap();
+                image::open(frame["path"].as_str().unwrap())
+                    .unwrap()
+                    .to_rgb8()
+                    .into_raw()
+            }
+        };
+        assert!(
+            pixels(json!({"time":0.5,"width":426})).await
+                == pixels(json!({"time":0.5,"width":426,"reduce":true})).await
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3930,7 +4477,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("moving.mp4");
         let generated = Command::new(media::executable("ffmpeg"))
-            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=3"])
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x360:r=30:d=3",
+            ])
             .args(["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p"])
             .arg(&input)
             .output()
@@ -3939,9 +4494,12 @@ mod tests {
         assert!(generated.status.success());
         let root = dir.join("state");
         let mut e = crate::editor::Editor::new(root.clone()).unwrap();
-        e.dispatch("project.update", json!({"patch":{"width":640,"height":360,"fps":30}}))
-            .await
-            .unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":640,"height":360,"fps":30}}),
+        )
+        .await
+        .unwrap();
         let project = e
             .dispatch("media.importAndAdd", json!({"paths":[input]}))
             .await
@@ -3949,11 +4507,15 @@ mod tests {
         let jobs = RenderJobs::default();
         let export = async |name: &str, options: Value| -> (Value, Value, u64) {
             let path = dir.join(name);
-            let mut params = json!({"path":path,"format":path.extension().unwrap().to_str().unwrap()});
+            let mut params =
+                json!({"path":path,"format":path.extension().unwrap().to_str().unwrap()});
             for (key, value) in options.as_object().unwrap() {
                 params[key] = value.clone();
             }
-            let job = jobs.start(project.clone(), params, root.clone()).await.unwrap();
+            let job = jobs
+                .start(project.clone(), params, root.clone())
+                .await
+                .unwrap();
             let status = finish(&jobs, &job).await;
             assert_eq!(status["state"], "completed", "{name}: {status}");
             let size = std::fs::metadata(&path).unwrap().len();
@@ -3964,10 +4526,17 @@ mod tests {
         let (status, stream, _) = export("default.mp4", json!({})).await;
         assert_eq!(
             status["encoder"],
-            if hardware { "h264_videotoolbox" } else { "libx264" }
+            if hardware {
+                "h264_videotoolbox"
+            } else {
+                "libx264"
+            }
         );
         assert_eq!(stream["codec_name"], "h264");
-        assert_eq!((stream["width"].as_u64(), stream["height"].as_u64()), (Some(640), Some(360)));
+        assert_eq!(
+            (stream["width"].as_u64(), stream["height"].as_u64()),
+            (Some(640), Some(360))
+        );
         assert_eq!(stream["pix_fmt"], "yuv420p");
         // The picture of the hardware file is the same picture.
         let (status, _, _) = export("software.mp4", json!({"hardware":false,"crf":14})).await;
@@ -3978,32 +4547,55 @@ mod tests {
                 &frame_at(&dir.join("software.mp4"), time).await,
                 &frame_at(&dir.join("hardware.mp4"), time).await,
             );
-            assert!(error < 6.0, "hardware and software exports differ at {time}s: {error}");
+            assert!(
+                error < 6.0,
+                "hardware and software exports differ at {time}s: {error}"
+            );
         }
         // HEVC, software and (where available) hardware, tagged for QuickTime.
-        let (status, stream, _) = export("hevc.mp4", json!({"codec":"hevc","hardware":false})).await;
+        let (status, stream, _) =
+            export("hevc.mp4", json!({"codec":"hevc","hardware":false})).await;
         assert_eq!(status["encoder"], "libx265");
         assert_eq!(stream["codec_name"], "hevc");
         assert_eq!(stream["codec_tag_string"], "hvc1");
         let (status, stream, _) = export("hevc.mov", json!({"codec":"hevc"})).await;
         assert_eq!(
             status["encoder"],
-            if encoder_works("hevc_videotoolbox").await { "hevc_videotoolbox" } else { "libx265" }
+            if encoder_works("hevc_videotoolbox").await {
+                "hevc_videotoolbox"
+            } else {
+                "libx265"
+            }
         );
         assert_eq!(stream["codec_name"], "hevc");
         assert_eq!(stream["codec_tag_string"], "hvc1");
         let (_, stream, _) = export("h264.mov", json!({"codec":"h264","hardware":false})).await;
         assert_eq!(stream["codec_name"], "h264");
         // A bitrate replaces the quality setting.
-        let rate = |stream: &Value| stream["bit_rate"].as_str().unwrap().parse::<f64>().unwrap() / 1000.0;
+        let rate =
+            |stream: &Value| stream["bit_rate"].as_str().unwrap().parse::<f64>().unwrap() / 1000.0;
         let (_, low, low_size) = export("low.mp4", json!({"bitrate":400,"hardware":false})).await;
-        let (_, high, high_size) = export("high.mp4", json!({"bitrate":3000,"hardware":false})).await;
-        assert!((250.0..600.0).contains(&rate(&low)), "400 kbps asked, {} made", rate(&low));
-        assert!((2000.0..4000.0).contains(&rate(&high)), "3000 kbps asked, {} made", rate(&high));
+        let (_, high, high_size) =
+            export("high.mp4", json!({"bitrate":3000,"hardware":false})).await;
+        assert!(
+            (250.0..600.0).contains(&rate(&low)),
+            "400 kbps asked, {} made",
+            rate(&low)
+        );
+        assert!(
+            (2000.0..4000.0).contains(&rate(&high)),
+            "3000 kbps asked, {} made",
+            rate(&high)
+        );
         assert!(high_size > low_size * 3);
         let (_, low, _) = export("low-hw.mp4", json!({"bitrate":400})).await;
         let (_, high, _) = export("high-hw.mp4", json!({"bitrate":3000})).await;
-        assert!(rate(&high) > rate(&low) * 2.0, "{} vs {}", rate(&high), rate(&low));
+        assert!(
+            rate(&high) > rate(&low) * 2.0,
+            "{} vs {}",
+            rate(&high),
+            rate(&low)
+        );
         let (_, _, low_size) = export("low.webm", json!({"bitrate":300})).await;
         let (_, _, high_size) = export("high.webm", json!({"bitrate":3000})).await;
         assert!(high_size > low_size * 2);
@@ -4020,7 +4612,9 @@ mod tests {
                 params[key] = value.clone();
             }
             assert!(
-                jobs.start(project.clone(), params, root.clone()).await.is_err(),
+                jobs.start(project.clone(), params, root.clone())
+                    .await
+                    .is_err(),
                 "{options} must be refused"
             );
         }
@@ -4089,7 +4683,10 @@ mod tests {
         )
         .await;
         assert!(cancelled.unwrap_err().contains("취소"));
-        assert_eq!(states.lock().unwrap()["job"]["encoder"], "h264_missing_hardware");
+        assert_eq!(
+            states.lock().unwrap()["job"]["encoder"],
+            "h264_missing_hardware"
+        );
         assert!(!encoder_works("h264_missing_hardware").await);
         assert!(encoder_works("libx264").await);
         std::fs::remove_dir_all(dir).unwrap();
@@ -4110,7 +4707,11 @@ mod tests {
                 .output()
                 .await
                 .unwrap();
-            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
         };
         let source = |size: &str, seconds: u32| -> Vec<String> {
             format!("-f lavfi -i testsrc2=s={size}:r=30:d={seconds} -f lavfi -i sine=frequency=440:sample_rate=48000:duration={seconds} -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest")
@@ -4129,12 +4730,17 @@ mod tests {
         };
         // Thirty 2 s cuts of a 1080p source plus a caption over the last ten seconds.
         let mut e = crate::editor::Editor::new(dir.join("hd-state")).unwrap();
-        let p = e.dispatch("media.import", json!({"paths":[hd]})).await.unwrap();
+        let p = e
+            .dispatch("media.import", json!({"paths":[hd]}))
+            .await
+            .unwrap();
         for index in 0..30 {
-            e
-                .dispatch("edit.add", json!({"mediaId":p["media"][0]["id"],"start":index as f64 * 2.0,"duration":2.0}))
-                .await
-                .unwrap();
+            e.dispatch(
+                "edit.add",
+                json!({"mediaId":p["media"][0]["id"],"start":index as f64 * 2.0,"duration":2.0}),
+            )
+            .await
+            .unwrap();
         }
         let project = e
             .dispatch("edit.add", json!({"text":{"content":"성능 측정 자막","fontSize":64},"start":50.0,"duration":10.0}))
@@ -4144,7 +4750,14 @@ mod tests {
         for width in [640, 1920] {
             let mut times = vec![];
             for time in [58.5, 57.25, 55.1] {
-                times.push(timed(project.clone(), json!({"time":time,"width":width}), root.clone()).await);
+                times.push(
+                    timed(
+                        project.clone(),
+                        json!({"time":time,"width":width}),
+                        root.clone(),
+                    )
+                    .await,
+                );
             }
             println!("PERF 1080p 30-clip timeline, late frame, width {width}: {times:.3?} s");
         }
@@ -4161,7 +4774,10 @@ mod tests {
                 params[key] = value.clone();
             }
             let started = std::time::Instant::now();
-            let job = jobs.start(project.clone(), params, root.clone()).await.unwrap();
+            let job = jobs
+                .start(project.clone(), params, root.clone())
+                .await
+                .unwrap();
             let status = finish(&jobs, &job).await;
             println!(
                 "PERF 30 s 1080p export, {label}: {:.2} s ({}, encoder {}, {} bytes)",
@@ -4196,8 +4812,79 @@ mod tests {
             "PERF 30 s 1080p export with 15 one-second wipes: {:.2} s",
             started.elapsed().as_secs_f64()
         );
+        // A copy of a clip on a track of its own above the others.
+        let stacked = |project: &mut Value, source: usize, track: &str, patch: Value| {
+            let mut above = project["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == project["clips"][source]["trackId"])
+                .unwrap()
+                .clone();
+            above["id"] = json!(track);
+            project["tracks"].as_array_mut().unwrap().push(above);
+            let mut clip = project["clips"][source].clone();
+            clip["id"] = json!(format!("clip-{track}"));
+            clip["trackId"] = json!(track);
+            for (key, value) in patch.as_object().unwrap() {
+                clip[key] = value.clone();
+            }
+            project["clips"].as_array_mut().unwrap().push(clip);
+        };
+        let half = json!({"x":300.0,"y":150.0,"scale":0.5,"rotation":0.0,"opacity":1.0});
+        // Blend modes: a half-size screen layer over seconds 10 to 20 of the same timeline.
+        let mut blended = project.clone();
+        let fifth = blended["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c["kind"] == "video" && number(c, "start", 0.0) == 10.0)
+            .unwrap();
+        stacked(
+            &mut blended,
+            fifth,
+            "perf-blend",
+            json!({"duration":10.0,"blendMode":"screen","transform":half}),
+        );
+        for width in [640, 1920] {
+            let mut times = vec![];
+            for time in [15.5, 12.25, 18.1] {
+                times.push(
+                    timed(
+                        blended.clone(),
+                        json!({"time":time,"width":width}),
+                        root.clone(),
+                    )
+                    .await,
+                );
+            }
+            println!("PERF 1080p timeline, frame under a screen-blended layer, width {width}: {times:.3?} s");
+        }
+        let output = dir.join("blend.mp4");
+        let started = std::time::Instant::now();
+        run(
+            blended,
+            json!({"start":0.0,"end":30.0}),
+            &output,
+            "mp4",
+            &root,
+            "export-blend",
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PERF 30 s 1080p export with a 10 s screen-blended layer: {:.2} s",
+            started.elapsed().as_secs_f64()
+        );
         let mut e = crate::editor::Editor::new(dir.join("uhd-state")).unwrap();
-        e.dispatch("project.update", json!({"patch":{"width":3840,"height":2160}})).await.unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":3840,"height":2160}}),
+        )
+        .await
+        .unwrap();
         let project = e
             .dispatch("media.importAndAdd", json!({"paths":[uhd]}))
             .await
@@ -4205,13 +4892,82 @@ mod tests {
         let root = dir.join("uhd-state");
         let mut times = vec![];
         for time in [5.5, 8.2, 1.3] {
-            times.push(timed(project.clone(), json!({"time":time,"width":1280}), root.clone()).await);
+            times.push(
+                timed(
+                    project.clone(),
+                    json!({"time":time,"width":1280}),
+                    root.clone(),
+                )
+                .await,
+            );
         }
         println!("PERF 4K source, one frame, width 1280: {times:.3?} s");
-        let started = std::time::Instant::now();
-        let proxy = media::build_proxy(&root, &project["media"][0], Arc::new(AtomicBool::new(false)))
+        // A 4K project with layers: the clip, a half-size copy, a screen-blended copy
+        // and a caption. Each frame is composed at the project size and resized.
+        let project = e
+            .dispatch("edit.add", json!({"text":{"content":"4K 프로젝트 자막","fontSize":160},"start":0.0,"duration":10.0}))
             .await
             .unwrap();
+        let mut layered = project.clone();
+        stacked(&mut layered, 0, "perf-inset", json!({"transform":half}));
+        let mut corner = half.clone();
+        corner["x"] = json!(-900.0);
+        stacked(
+            &mut layered,
+            0,
+            "perf-screen",
+            json!({"blendMode":"screen","transform":corner}),
+        );
+        // The same layers as stills, which leaves out the cost of decoding 4K video
+        // from its last keyframe (the larger part of the timings above).
+        let picture = dir.join("uhd.png");
+        make(
+            "-f lavfi -i testsrc2=s=3840x2160:r=1:d=1 -frames:v 1"
+                .split(' ')
+                .map(String::from)
+                .collect(),
+            picture.clone(),
+        )
+        .await;
+        let mut stills = layered.clone();
+        stills["media"][0]["path"] = json!(picture);
+        stills["media"][0]["kind"] = json!("image");
+        stills["media"][0]["hasAudio"] = json!(false);
+        for clip in stills["clips"].as_array_mut().unwrap() {
+            if clip["kind"] == "video" {
+                clip["kind"] = json!("image");
+            }
+        }
+        for (label, project) in [
+            ("one clip and a caption", &project),
+            ("three layers, one blended, and a caption", &layered),
+            ("three still layers, one blended, and a caption", &stills),
+        ] {
+            for width in [640, 1280] {
+                let mut times = vec![];
+                for time in [5.5, 8.2, 1.3] {
+                    let started = std::time::Instant::now();
+                    render_frame(
+                        project,
+                        &json!({"time":time,"width":width}),
+                        &root,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                    .unwrap();
+                    times.push(started.elapsed().as_secs_f64());
+                }
+                println!("PERF 4K project, {label}, width {width}: {times:.3?} s");
+            }
+        }
+        let started = std::time::Instant::now();
+        let proxy = media::build_proxy(
+            &root,
+            &project["media"][0],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
         println!(
             "PERF proxy of a 10 s 4K source: {:.2} s ({} bytes)",
             started.elapsed().as_secs_f64(),

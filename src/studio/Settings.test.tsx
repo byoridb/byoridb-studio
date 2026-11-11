@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import Settings from "./Settings";
+import Settings, { resetInstallation } from "./Settings";
 import { rpc } from "./api";
 import type { RuntimeStatus } from "./types";
 
@@ -29,6 +29,7 @@ const calls = (method: string) =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetInstallation();
   installed = false;
   jobState = "running";
   vi.mocked(rpc).mockImplementation(async (method) => {
@@ -106,5 +107,103 @@ describe("Settings", () => {
   it("shows which agent needs sign-in", async () => {
     render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
     expect(await screen.findByText("로그인 필요")).toBeInTheDocument();
+  });
+
+  it("shows values as being checked while loading, then a short engine name with the path as a tooltip", async () => {
+    let release = (_value: unknown) => {};
+    vi.mocked(rpc).mockImplementation(async (method) => {
+      if (method === "runtime.status") return new Promise((resolve) => { release = resolve; });
+      return mcp;
+    });
+    const { container } = render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    expect(screen.getAllByText("확인 중…").length).toBeGreaterThanOrEqual(3);
+    expect(screen.queryByText("확인되지 않음")).toBeNull();
+    expect(screen.queryByText("확인 필요")).toBeNull();
+    expect(screen.queryByText(/로컬 작업 공간/)).toBeNull();
+    expect(screen.queryByText(/연결을 관리합니다/)).toBeNull();
+    release({
+      ...status(true),
+      ffmpeg: {
+        available: true,
+        path: "/opt/homebrew/bin/ffmpeg",
+        version: "ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers",
+      },
+    });
+    const engine = await screen.findByText("FFmpeg 7.1.1");
+    expect(engine).toHaveAttribute("title", "/opt/homebrew/bin/ffmpeg");
+    expect(container).not.toHaveTextContent("Copyright");
+    expect(screen.queryByText("확인 중…")).toBeNull();
+  });
+
+  it("shows storage per folder and cleans unused temporary files only after confirming", async () => {
+    const usage = (reclaimable: number) => ({
+      folders: {
+        proxies: { files: 2, bytes: 300 * 1024 * 1024, cleanable: true, reclaimableBytes: reclaimable, reclaimableFiles: 1 },
+        imports: { files: 4, bytes: 2 * 1024 * 1024 * 1024, cleanable: false },
+        speech: { files: 0, bytes: 0, cleanable: false },
+        renders: { files: 0, bytes: 0, cleanable: true, reclaimableBytes: 0, reclaimableFiles: 0 },
+        previews: { files: 9, bytes: 5 * 1024 * 1024, cleanable: true, reclaimableBytes: 0, reclaimableFiles: 0 },
+      },
+      bytes: 2353 * 1024 * 1024,
+      reclaimableBytes: reclaimable,
+    });
+    let reclaimable = 120 * 1024 * 1024;
+    vi.mocked(rpc).mockImplementation(async (method) => {
+      if (method === "runtime.status") return status(true);
+      if (method === "storage.usage") return usage(reclaimable);
+      if (method === "storage.clean") {
+        reclaimable = 0;
+        return { ...usage(0), removedBytes: 120 * 1024 * 1024 };
+      }
+      return mcp;
+    });
+    render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    expect(await screen.findByText("가져온 소재")).toBeInTheDocument();
+    expect(screen.getByText("2.0 GB")).toBeInTheDocument();
+    expect(screen.getByText("300 MB")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /쓰지 않는 임시 파일 정리 \(120 MB\)/ }));
+    expect(calls("storage.clean")).toHaveLength(0);
+    expect(screen.getByText(/원본\s+소재와 프로젝트는 지우지 않습니다/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "취소" }));
+    expect(calls("storage.clean")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /쓰지 않는 임시 파일 정리/ }));
+    fireEvent.click(screen.getByRole("button", { name: "삭제" }));
+    expect(await screen.findByText(/120 MB를\s+정리했습니다/)).toBeInTheDocument();
+    expect(calls("storage.clean")).toHaveLength(1);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /쓰지 않는 임시 파일 정리/ })).toBeDisabled(),
+    );
+  });
+
+  it("leaves the storage section out when the service does not report it", async () => {
+    render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    await screen.findByText("로그인 필요");
+    expect(screen.queryByText("저장 공간")).toBeNull();
+  });
+
+  it("keeps a running installation and the checked release when the dialog is closed, even if one status check fails", async () => {
+    const first = render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /ByoriDB 설치/ }));
+    expect(await screen.findByText("내려받는 중", {}, { timeout: 3000 })).toBeInTheDocument();
+    first.unmount();
+    const before = calls("runtime.checkUpdate").length;
+    let fail = true;
+    const base = vi.mocked(rpc).getMockImplementation()!;
+    vi.mocked(rpc).mockImplementation(async (method, ...rest) => {
+      if (method === "runtime.installStatus" && fail) {
+        fail = false;
+        throw new Error("일시적인 연결 오류");
+      }
+      return base(method, ...rest);
+    });
+    render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    // Shown at once from what was last known, before any request returns.
+    expect(screen.getByText("설치 진행 중")).toBeInTheDocument();
+    expect(screen.getByText("내려받는 중")).toBeInTheDocument();
+    expect(screen.getByText("v1.2.0")).toBeInTheDocument();
+    expect(calls("runtime.checkUpdate")).toHaveLength(before);
+    jobState = "completed";
+    installed = true;
+    expect(await screen.findByText("설치 완료", {}, { timeout: 4000 })).toBeInTheDocument();
   });
 });

@@ -154,3 +154,19 @@ it("snaps a moved clip to the frame centre and edges and reports the guide", () 
   fireEvent.pointerUp(handle);
   expect(command).toHaveBeenCalledWith("edit.update", { id: "clip", expectedRevision: 3, patch: { transform: { ...clip.transform, x: 0, y: 300 } } });
 });
+it("keeps handles at screen size and moves the rotation handle inside a frame-filling box", () => {
+  const props = { clip, revision: 3, ratio: 0.5, rotation: 0, stage: { width: 1920, height: 1080 }, onPreview: vi.fn(), onCommand: vi.fn() };
+  // A full-frame picture: 20px above its top edge is outside the 960×540 stage.
+  const { container, rerender } = render(
+    <SelectionOverlay {...props} box={{ width: 960, height: 540 }} transform={{ x: 0, y: 0, scale: 1 }} />,
+  );
+  const overlay = () => container.querySelector<HTMLElement>(".selection-overlay")!;
+  expect(overlay()).toHaveClass("rotate-inside");
+  // A small sticker in the middle has room above it; its handles are scaled back up.
+  rerender(<SelectionOverlay {...props} box={{ width: 960, height: 540 }} transform={{ x: 0, y: 0, scale: 0.25 }} />);
+  expect(overlay()).not.toHaveClass("rotate-inside");
+  expect(overlay().style.getPropertyValue("--inverse-scale")).toBe("4");
+  // Turned upside down near the bottom edge, the handle would leave the frame again.
+  rerender(<SelectionOverlay {...props} rotation={180} box={{ width: 960, height: 540 }} transform={{ x: 0, y: 400, scale: 0.25 }} />);
+  expect(overlay()).toHaveClass("rotate-inside");
+});

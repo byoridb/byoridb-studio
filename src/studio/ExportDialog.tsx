@@ -152,10 +152,7 @@ export default function ExportDialog({
         ref={dialog}
       >
         <header>
-          <div>
-            <h2 id="export-title">내보내기</h2>
-            <p>마지막 프레임까지, 의도한 그대로.</p>
-          </div>
+          <h2 id="export-title">내보내기</h2>
           <button
             title={
               active
@@ -190,10 +187,14 @@ export default function ExportDialog({
                   : "합성 프레임 준비 중…"}
               </div>
             )}
-            <span>{project.name}</span>
-            <small>
-              {durationOf(project).toFixed(2)}초 · {project.clips.length}개 클립
-            </small>
+            <div>
+              <span>{project.name}</span>
+              <small>
+                {range && endTime > startTime
+                  ? `${startTime.toFixed(2)}–${endTime.toFixed(2)}초 구간 · ${(endTime - startTime).toFixed(2)}초`
+                  : `전체 ${durationOf(project).toFixed(2)}초`}
+              </small>
+            </div>
           </div>
           <div className="export-options">
             <label>
@@ -224,6 +225,7 @@ export default function ExportDialog({
                 )}
               </div>
             </label>
+            <div className="export-pair">
             <label>
               형식
               <select
@@ -258,6 +260,8 @@ export default function ExportDialog({
                   ))}
               </select>
             </label>
+            </div>
+            <div className="export-pair">
             <label>
               프레임레이트
               <select
@@ -282,10 +286,11 @@ export default function ExportDialog({
                 onChange={(e) => setQuality(+e.target.value)}
               >
                 <option value={18}>높음</option>
-                <option value={23}>권장</option>
+                <option value={23}>보통</option>
                 <option value={28}>작은 파일</option>
               </select>
             </label>
+            </div>
             <label>
               내보낼 구간
               <select
@@ -297,10 +302,33 @@ export default function ExportDialog({
                 <option value="range">구간 지정</option>
               </select>
             </label>
-            {!audioOnly && (
-              <p className="export-hint export-size">
-                {size.width}×{size.height} · {fps} fps
-              </p>
+            {range && (
+              <div className="export-range">
+                <label>
+                  시작 (초)
+                  <input
+                    type="number"
+                    min={0}
+                    max={durationOf(project)}
+                    step={0.1}
+                    value={startTime}
+                    disabled={active}
+                    onChange={(e) => setStartTime(+e.target.value)}
+                  />
+                </label>
+                <label>
+                  끝 (초)
+                  <input
+                    type="number"
+                    min={0}
+                    max={durationOf(project)}
+                    step={0.1}
+                    value={endTime}
+                    disabled={active}
+                    onChange={(e) => setEndTime(+e.target.value)}
+                  />
+                </label>
+              </div>
             )}
             <button
               className="export-advanced-toggle"
@@ -366,34 +394,6 @@ export default function ExportDialog({
                 오디오 형식은 소리만 내보내므로 해상도·프레임레이트·품질을
                 사용하지 않습니다.
               </p>
-            )}
-            {range && (
-              <div className="export-range">
-                <label>
-                  시작 (초)
-                  <input
-                    type="number"
-                    min={0}
-                    max={durationOf(project)}
-                    step={0.1}
-                    value={startTime}
-                    disabled={active}
-                    onChange={(e) => setStartTime(+e.target.value)}
-                  />
-                </label>
-                <label>
-                  끝 (초)
-                  <input
-                    type="number"
-                    min={0}
-                    max={durationOf(project)}
-                    step={0.1}
-                    value={endTime}
-                    disabled={active}
-                    onChange={(e) => setEndTime(+e.target.value)}
-                  />
-                </label>
-              </div>
             )}
           </div>
         </div>

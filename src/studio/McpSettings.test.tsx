@@ -33,3 +33,15 @@ it("shows connection failures and allows removing saved credentials", async () =
   await screen.findByRole("button", { name: "Higgsfield 추가" });
   expect(rpc).toHaveBeenCalledWith("runtime.mcpRemove", {});
 });
+
+it("states the read-only boundary in one sentence and shows no badge before the status is known", async () => {
+  let release = (_value: unknown) => {};
+  vi.mocked(rpc).mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+  const { container } = render(<McpSettings />);
+  expect(container.querySelector(".state-badge")).toBeNull();
+  expect(screen.getByText(/모델·크레딧 조회만 지원합니다\./)).toBeInTheDocument();
+  expect(screen.queryByText(/유료 생성 실행/)).toBeNull();
+  expect(screen.getByRole("link", { name: /연결 안내/ })).toBeInTheDocument();
+  release({ added: false, enabled: false, phase: "unchecked", url: "", toolCount: 0, bridgeAvailable: true });
+  expect(await screen.findByText("미연결")).toBeInTheDocument();
+});

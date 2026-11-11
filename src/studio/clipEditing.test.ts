@@ -114,26 +114,21 @@ describe("clip junction transitions", () => {
     const project = sample();
     const [first] = clipJunctions(project.clips.filter((item) => item.trackId === "v"), 30);
     expect(junctionTransitionCommands(project, first, { type: "dissolve", duration: 0.5 })).toEqual([
-      { method: "edit.update", params: { id: "b", patch: { start: 1.5, transitionIn: { type: "dissolve", duration: 0.5 } } } },
-      { method: "edit.update", params: { id: "c", patch: { start: 3.5 } } },
-      { method: "edit.update", params: { id: "gap", patch: { start: 8.5 } } },
+      { method: "edit.update", params: { id: "b", patch: { transitionIn: { type: "dissolve", duration: 0.5 } } } },
+      { method: "edit.shift", params: { trackId: "v", from: 2, delta: -0.5 } },
     ]);
   });
-  it("refuses a junction whose ripple would exceed one edit.batch", async () => {
-    const { BATCH_LIMIT, junctionTransitionBlocked, junctionTransitionCommands } = await import("./clipEditing");
+  it("ripples any number of following clips with one edit.shift", async () => {
+    const { junctionTransitionCommands } = await import("./clipEditing");
     const base = sample();
     const template = base.clips.find((item) => item.id === "a")!;
-    const many = (count: number) => ({
+    const project = {
       ...base,
-      clips: Array.from({ length: count }, (_, index) => ({ ...template, id: `c${index}`, start: index * 2, duration: 2 })),
-    });
-    const fits = many(BATCH_LIMIT + 1), over = many(BATCH_LIMIT + 2);
-    const junction = (project: typeof base) => ({ before: project.clips[0], after: project.clips[1] });
-    expect(junctionTransitionBlocked(fits, junction(fits))).toBeNull();
-    expect(junctionTransitionCommands(fits, junction(fits), { type: "fade", duration: 0.5 })).toHaveLength(BATCH_LIMIT);
-    expect(junctionTransitionBlocked(over, junction(over))).toContain("500");
-    // A later junction of the same track still fits.
-    expect(junctionTransitionBlocked(over, { before: over.clips[1], after: over.clips[2] })).toBeNull();
+      clips: Array.from({ length: 2000 }, (_, index) => ({ ...template, id: `c${index}`, start: index * 2, duration: 2 })),
+    };
+    const commands = junctionTransitionCommands(project, { before: project.clips[0], after: project.clips[1] }, { type: "fade", duration: 0.5 });
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toEqual({ method: "edit.shift", params: { trackId: "v", from: 2, delta: -0.5 } });
   });
   it("changes only the type in place, resizes the overlap, and removal restores the cut", async () => {
     const { clipJunctions, junctionTransitionCommands } = await import("./clipEditing");
@@ -146,11 +141,11 @@ describe("clip junction transitions", () => {
     ]);
     expect(junctionTransitionCommands(project, first, { type: "fade", duration: 0.5 })).toEqual([]);
     const longer = junctionTransitionCommands(project, first, { type: "fade", duration: 1 });
-    expect(longer[0]).toEqual({ method: "edit.update", params: { id: "b", patch: { start: 1, transitionIn: { type: "fade", duration: 1 } } } });
-    expect(longer[1]).toEqual({ method: "edit.update", params: { id: "c", patch: { start: 3 } } });
+    expect(longer[0]).toEqual({ method: "edit.update", params: { id: "b", patch: { transitionIn: { type: "fade", duration: 1 } } } });
+    expect(longer[1]).toEqual({ method: "edit.shift", params: { trackId: "v", from: 1.5, delta: -0.5 } });
     const removed = junctionTransitionCommands(project, first, null);
-    expect(removed[0]).toEqual({ method: "edit.update", params: { id: "b", patch: { start: 2, transitionIn: null } } });
-    expect(removed[1]).toEqual({ method: "edit.update", params: { id: "c", patch: { start: 4 } } });
+    expect(removed[0]).toEqual({ method: "edit.update", params: { id: "b", patch: { transitionIn: null } } });
+    expect(removed[1]).toEqual({ method: "edit.shift", params: { trackId: "v", from: 1.5, delta: 0.5 } });
   });
   it("limits the duration to half of the shorter clip, like the Library and Inspector", async () => {
     const { clipJunctions, junctionTransitionCommands, maxTransitionDuration } = await import("./clipEditing");
@@ -159,6 +154,29 @@ describe("clip junction transitions", () => {
     expect(maxTransitionDuration(first, 30)).toBeCloseTo(1);
     const [command] = junctionTransitionCommands(project, first, { type: "fade", duration: 10 });
     expect((command.params.patch as { transitionIn: { duration: number } }).transitionIn.duration).toBeCloseTo(1);
+  });
+  it("places an overlay on a track that is free at that time, or asks for a new one", async () => {
+    const { overlayPlacement } = await import("./clipEditing");
+    const project = sample();
+    // Track v is busy from 0 to 6 and from 9 to 10; track w from 4 to 6.
+    expect(overlayPlacement(project, "video", 7, 1)).toBeNull();
+    expect(overlayPlacement(project, "video", 1, 2)).toEqual({ trackId: "w" });
+    expect(overlayPlacement(project, "video", 1, 2, "w")).toEqual({ trackId: "w" });
+    expect(overlayPlacement(project, "video", 4, 1, "w")).toEqual({ create: "video" });
+    expect(overlayPlacement(project, "video", 6, 1, "v")).toEqual({ trackId: "v" });
+    expect(overlayPlacement({ ...project, tracks: project.tracks.map((track) => ({ ...track, locked: track.id === "w" })) }, "video", 1, 2)).toEqual({ create: "video" });
+    expect(overlayPlacement(project, "text", 0, 3)).toEqual({ create: "text" });
+  });
+  it("never places an overlay on a hidden track", async () => {
+    const { overlayPlacement } = await import("./clipEditing");
+    const project = sample();
+    const hide = (...ids: string[]) => ({ ...project, tracks: project.tracks.map((track) => ({ ...track, hidden: ids.includes(track.id) })) });
+    // Track v is busy at 1..3 and the only free track there is hidden: a new track, not the hidden one.
+    expect(overlayPlacement(hide("w"), "video", 1, 2)).toEqual({ create: "video" });
+    expect(overlayPlacement(hide("w"), "video", 1, 2, "w")).toEqual({ create: "video" });
+    // The core would default to the hidden first track, so the visible free one is named.
+    expect(overlayPlacement(hide("v"), "video", 7, 1)).toEqual({ trackId: "w" });
+    expect(overlayPlacement(hide("v", "w"), "video", 7, 1)).toEqual({ create: "video" });
   });
   it("writes a canvas rotation as a static value or a keyframe", async () => {
     const { canvasTransformPatch } = await import("./clipEditing");

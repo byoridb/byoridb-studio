@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import SpeechPanel from "./SpeechPanel";
+import SpeechPanel, { voiceLabel } from "./SpeechPanel";
 import { rpc } from "./api";
 import type { Project } from "./types";
 
@@ -209,5 +209,26 @@ describe("SpeechPanel", () => {
       "음성 엔진 확인 실패",
     );
     expect(rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it("says the voices are loading and names them without nested brackets or locale codes", async () => {
+    let release = (_value: unknown) => {};
+    vi.mocked(rpc).mockImplementation(
+      () => new Promise((resolve) => { release = resolve; }),
+    );
+    render(
+      <SpeechPanel mode="synthesize" visible project={project} playhead={0} onCommand={vi.fn()} />,
+    );
+    const voices = screen.getByRole("combobox", { name: "내레이션 목소리" });
+    expect(voices).toHaveTextContent("목소리 불러오는 중…");
+    expect(voices).not.toHaveTextContent("사용 가능한 목소리 없음");
+    release({
+      whisperAvailable: true,
+      ttsAvailable: true,
+      voices: [{ id: "Eddy", name: "Eddy (한국어(한국))", language: "ko-KR" }],
+    });
+    await waitFor(() => expect(voices).toHaveTextContent("Eddy · 한국어"));
+    expect(voices).not.toHaveTextContent("ko-KR");
+    expect(voiceLabel({ name: "Samantha", language: "en_US" })).toBe("Samantha · 영어");
   });
 });

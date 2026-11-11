@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   Check,
-  ChevronDown,
   CloudOff,
   Download,
+  Ellipsis,
   Film,
   FolderOpen,
-  Home as HomeIcon,
-  LayoutPanelLeft,
   LoaderCircle,
   Plus,
-  Save,
   Settings2,
   Sparkles,
   TriangleAlert,
@@ -34,10 +31,10 @@ import {
   shiftSelectionTracks,
 } from "./studio/selection";
 import Player, { type LoopRange } from "./studio/Player";
-import Home, { DEFAULT_PROJECT_NAME } from "./studio/Home";
+import Home, { DEFAULT_PROJECT_NAME, EXAMPLE_PROJECT_NAME, UNNAMED, type ProjectSummary } from "./studio/Home";
 import { playbackClock, useIdleClockTime } from "./studio/playbackClock";
 import { isPreviewPlaybackWaiting, primePreviewPlayback } from "./studio/mediaPlayback";
-import { clipEditCommands } from "./studio/clipEditing";
+import { clipEditCommands, overlayPlacement } from "./studio/clipEditing";
 import {
   PreviewDraftContext,
   withPreviewDraft,
@@ -51,6 +48,7 @@ import AssistantPanel from "./studio/AssistantPanel";
 import Settings from "./studio/Settings";
 import ExportDialog from "./studio/ExportDialog";
 import { useModal } from "./studio/useModal";
+import { errorText } from "./studio/errorText";
 import "./styles/studio.css";
 
 /** Letter shortcuts follow the physical key when an IME (e.g. Hangul) changes event.key. */
@@ -79,7 +77,7 @@ const noIds: string[] = [];
 const isBlank = (project: Project) =>
   !project.clips.length &&
   !project.media.length &&
-  [DEFAULT_PROJECT_NAME, "새 프로젝트"].includes(project.name);
+  UNNAMED.includes(project.name);
 
 interface Layout {
   /** Panel widths in pixels; a null library keeps its responsive default. */
@@ -104,6 +102,8 @@ const storedLayout = (): Layout => {
   }
 };
 const PANEL_LIMITS = { library: [220, 560], inspector: [240, 520] } as const;
+/** Below this editing width an open assistant drawer takes the inspector's place. */
+const INSPECTOR_ROOM = 820;
 /** Two separators and the narrowest player. */
 const PLAYER_RESERVE = 6 + 250 + 6;
 
@@ -115,10 +115,20 @@ const PLAYER_RESERVE = 6 + 250 + 6;
 export function fitPanelWidths(
   layout: { library: number | null; inspector: number },
   width: number,
+  /** False while the assistant drawer stands in for the inspector column. */
+  inspectorShown = true,
 ): { library: number | null; inspector: number | null } {
   const inspector = layout.inspector === defaultLayout.inspector ? null : layout.inspector;
   if (!(width > 0)) return { library: layout.library, inspector };
   const [minLibrary] = PANEL_LIMITS.library, [minInspector] = PANEL_LIMITS.inspector;
+  if (!inspectorShown) {
+    // Library, one separator and the narrowest player.
+    const room = width - 6 - 250;
+    return {
+      library: layout.library === null || layout.library <= room ? layout.library : Math.max(minLibrary, Math.floor(room)),
+      inspector: null,
+    };
+  }
   const budget = width - PLAYER_RESERVE;
   // The responsive defaults, as the stylesheet resolves them.
   const narrow = width <= 1200;
@@ -235,7 +245,14 @@ export default function App() {
       playbackClock.seek((now) => snapToFrame(typeof value === "function" ? value(now) : value)),
     [snapToFrame],
   );
-  const [playing, setPlaying] = useState(false);
+  // Playback belongs to one project: another project is simply not playing, with
+  // no effect that could run after (and undo) a click on play.
+  const [playingFor, setPlayingFor] = useState<string | null>(null);
+  const playing = !!project && playingFor === project.id;
+  const setPlaying = useCallback(
+    (value: boolean) => setPlayingFor(value ? (current.current?.id ?? null) : null),
+    [],
+  );
   const idleTime = useIdleClockTime(playing);
   const [loop, setLoop] = useState<LoopRange | null>(null);
   /** null until the first project arrives; then the home screen or the editor. */
@@ -271,7 +288,8 @@ export default function App() {
   }, [layout]);
   const [surfaceHeight, setSurfaceHeight] = useState(640);
   const [surfaceWidth, setSurfaceWidth] = useState(0);
-  const panels = fitPanelWidths(layout, surfaceWidth);
+  const inspectorShown = !(assistant && surfaceWidth > 0 && surfaceWidth < INSPECTOR_ROOM);
+  const panels = fitPanelWidths(layout, surfaceWidth, inspectorShown);
   const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
   // The stored height is kept as chosen and only clamped to what fits right now.
   const timelineHeight = Math.max(200, Math.min(maxTimelineHeight, layout.timeline));
@@ -350,7 +368,7 @@ export default function App() {
         .catch(() => {});
       setHistory(await rpc("history.status"));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e).message);
     } finally {
       setLoading(false);
     }
@@ -422,7 +440,11 @@ export default function App() {
     }, 1200);
     return () => clearInterval(timer);
   }, [connected]);
-  const command: Command = useCallback(async (method, params = {}) => {
+  /**
+   * Runs one service command. `quiet` is for the library and the inspector, which
+   * show a failure in place: the same failure is not also raised as a toast.
+   */
+  const execute = useCallback(async (method: string, params: Record<string, unknown> = {}, quiet = false) => {
     setError("");
     const switching = ["project.new", "project.open", "project.demo"].includes(
       method,
@@ -472,31 +494,79 @@ export default function App() {
       // fetch rejects with a TypeError only when the service is unreachable.
       if (e instanceof TypeError) setOffline(true);
       if (method === "project.save") setSaveFailed(true);
-      setError(e instanceof Error ? e.message : String(e));
+      if (!quiet) setError(errorText(e).message);
       throw e;
     } finally {
       setPending((count) => count - 1);
     }
   }, []);
+  const command: Command = useCallback((method, params) => execute(method, params), [execute]);
+  const panelCommand: Command = useCallback((method, params) => execute(method, params, true), [execute]);
   const safeCommand: Command = useCallback(
     (method, params) => command(method, params).catch(() => undefined),
     [command],
   );
+  /**
+   * The library adds text and stickers at the playhead. One that would cover a
+   * clip already on its track goes to a track that is free there, or to a new
+   * track above (made by the same edit.add, so it is still one undo step).
+   */
+  const libraryCommand: Command = useCallback(
+    async (method, params = {}) => {
+      const active = current.current;
+      const media = active?.media.find((item) => item.id === params.mediaId);
+      // Text, or a picture placed as an overlay: the library gives a sticker a
+      // transform, and one it has only just uploaded is not in this project copy yet.
+      const kind = params.text
+        ? "text"
+        : params.mediaId && params.transform && (!media || media.kind === "image") ? "video" : null;
+      if (method !== "edit.add" || !active || !kind || typeof params.start !== "number")
+        return panelCommand(method, params);
+      const start = Math.round(params.start * active.fps) / active.fps;
+      const duration = typeof params.duration === "number" ? params.duration : 3;
+      const place = overlayPlacement(active, kind, start, duration, params.trackId as string | undefined);
+      if (!place) return panelCommand(method, params);
+      if ("trackId" in place) return panelCommand(method, { ...params, trackId: place.trackId });
+      // No free track: the core makes one above its kind for this clip, one undo step.
+      const { trackId: _preferred, ...rest } = params;
+      void _preferred;
+      const names = { video: "영상", text: "자막·텍스트" } as const;
+      return panelCommand(method, {
+        ...rest,
+        newTrack: `${names[kind]} ${active.tracks.filter((track) => track.kind === kind).length + 1}`,
+      });
+    },
+    [panelCommand],
+  );
   const total = project ? durationOf(project) : 0;
-  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
+  // A rendered precise preview is one revision of one project; any other is not it.
+  const projectKey = project ? `${project.id}:${project.revision}` : "";
+  const [rendered, setRendered] = useState<{ key: string; url: string } | null>(null);
+  const playbackUrl = rendered?.key === projectKey ? rendered.url : null;
   const [preparing, setPreparing] = useState(false);
   const previewRun = useRef(0);
   const previewJob = useRef<string | null>(null);
+  /** The project revision a precise preview is being rendered for. */
+  const preparingKey = useRef<string | null>(null);
   useEffect(() => {
-    setPlaying(false);
-    setPlaybackUrl(null);
-    setPreparing(false);
-    if (previewJob.current) setBusy("");
-    previewRun.current++;
-    if (previewJob.current)
-      void rpc("export.cancel", { id: previewJob.current }).catch(() => {});
-    previewJob.current = null;
-  }, [project?.id, project?.revision]);
+    // Returning to a project later never resumes on its own.
+    setPlayingFor((id) => (id === project?.id ? id : null));
+    // An edit leaves fast playback running; it only retires what was rendered
+    // for the previous revision.
+    if (rendered && rendered.key !== projectKey) {
+      setRendered(null);
+      setPlaying(false);
+    }
+    if (preparingKey.current && preparingKey.current !== projectKey) {
+      preparingKey.current = null;
+      previewRun.current++;
+      setPreparing(false);
+      setBusy("");
+      if (previewJob.current)
+        void rpc("export.cancel", { id: previewJob.current }).catch(() => {});
+      previewJob.current = null;
+    }
+  }, [projectKey]);
   const requestPlayback = useCallback(
     async (next: boolean) => {
       if (!next) {
@@ -508,6 +578,7 @@ export default function App() {
         if (previewJob.current)
           void rpc("export.cancel", { id: previewJob.current }).catch(() => {});
         previewJob.current = null;
+        preparingKey.current = null;
         return;
       }
       if (previewMode === "fast") {
@@ -521,6 +592,8 @@ export default function App() {
         return;
       }
       const nonce = ++previewRun.current;
+      const key = current.current ? `${current.current.id}:${current.current.revision}` : "";
+      preparingKey.current = key;
       setPreparing(true);
       setError("");
       setBusy("정밀 미리보기를 준비하고 있습니다");
@@ -542,7 +615,7 @@ export default function App() {
             throw new Error(status.error || "미리보기 렌더 실패");
           if (status.state === "cancelled") break;
           if (status.state === "completed") {
-            setPlaybackUrl(assetUrl(result.assetId));
+            setRendered({ key, url: assetUrl(result.assetId) });
             setPlaying(true);
             break;
           }
@@ -553,16 +626,17 @@ export default function App() {
         }
       } catch (e) {
         if (previewRun.current === nonce)
-          setError(e instanceof Error ? e.message : String(e));
+          setError(errorText(e).message);
       } finally {
         if (previewRun.current === nonce) {
           setPreparing(false);
           setBusy("");
           previewJob.current = null;
+          preparingKey.current = null;
         }
       }
     },
-    [playbackUrl, previewMode, snapToFrame],
+    [playbackUrl, previewMode, snapToFrame, setPlaying],
   );
   useEffect(() => setLoop(null), [project?.id]);
   // The repeated range, clamped to the project; a range emptied by an edit is ignored.
@@ -571,6 +645,15 @@ export default function App() {
     const range = { start: Math.max(0, loop.start), end: Math.min(loop.end, total) };
     return range.end - range.start >= 1 / project.fps ? range : null;
   }, [loop, total, project?.fps]);
+  /** The span of the selected clips: what the repeat button repeats. */
+  const selectionRange = useMemo(() => {
+    const clips = project ? selectedClips(project, selectedIds) : [];
+    if (!clips.length) return null;
+    return {
+      start: Math.min(...clips.map((clip) => clip.start)),
+      end: Math.max(...clips.map((clip) => clip.start + clip.duration)),
+    };
+  }, [project, selectedIds]);
   const loopRef = useRef(activeLoop);
   loopRef.current = activeLoop;
   useEffect(() => {
@@ -606,10 +689,11 @@ export default function App() {
     const t = setTimeout(() => setNotice(""), 4500);
     return () => clearTimeout(t);
   }, [notice]);
+  // Editing saves by itself; ⌘S saves at once and stays quiet. The save state
+  // beside the title (and an error, if any) is the feedback.
   const save = useCallback(async () => {
     try {
-      const result = (await command("project.save")) as { path: string };
-      setNotice(`저장됨 · ${result.path}`);
+      await command("project.save");
     } catch {
       /* shown inline */
     }
@@ -834,7 +918,7 @@ export default function App() {
           expectedRevision: current.current?.revision,
         });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e).message);
     }
   };
   const importPaths = async () => {
@@ -848,7 +932,7 @@ export default function App() {
       setBusy("미디어를 가져오고 있습니다");
       await command("media.import", { paths });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e).message);
     } finally {
       setBusy("");
     }
@@ -874,7 +958,7 @@ export default function App() {
         if (current.current?.id === projectId) setHistory(h);
       }
     } catch (e) {
-      setError(String(e));
+      setError(errorText(e).message);
     } finally {
       setBusy("");
       if (files.current) files.current.value = "";
@@ -883,13 +967,16 @@ export default function App() {
   const example = async () => {
     setBusy("예제 프로젝트를 준비하고 있습니다");
     try {
-      await command("project.demo");
+      // An example that already exists is opened again rather than made once more.
+      const existing = current.current?.name === EXAMPLE_PROJECT_NAME
+        ? current.current
+        : (await rpc<ProjectSummary[]>("project.list").catch(() => []))
+            ?.find?.((item) => item.name === EXAMPLE_PROJECT_NAME);
+      if (!existing) await command("project.demo");
+      else if (existing.id !== current.current?.id) await command("project.open", { id: existing.id });
       playbackClock.seek(0);
       selectMany([], null);
       setHome(false);
-      setNotice(
-        "예제 프로젝트 · 제공된 사진과 합성 오디오로 구성되어 있습니다.",
-      );
     } catch {
       /* shown inline */
     } finally {
@@ -955,6 +1042,7 @@ export default function App() {
       <>
         <Home
           currentId={project.id}
+          hiddenId={isBlank(project) ? project.id : null}
           busy={!!busy || pending > 0}
           onCreate={(width, height) => void create(width, height)}
           onOpen={(id) => void open(id)}
@@ -1012,19 +1100,18 @@ export default function App() {
         />
         <header className="studio-topbar">
           <div className="studio-identity">
-            <span className="byori-mark">b</span>
-            <strong>
-              Byori <span>Studio</span>
-            </strong>
+            <button className="home-button" aria-label="홈" title="홈으로" onClick={goHome}>
+              <span className="byori-mark">b</span>
+              <strong>
+                Byori <span>Studio</span>
+              </strong>
+            </button>
             <div className="menu-container">
-              <button className="menu-toggle" onClick={() => setMenu(!menu)}>
-                메뉴 <ChevronDown size={13} />
+              <button className="menu-toggle icon-button" aria-label="메뉴" title="메뉴" aria-haspopup="menu" aria-expanded={menu} onClick={() => setMenu(!menu)}>
+                <Ellipsis size={17} />
               </button>
               {menu && (
                 <div className="app-menu">
-                  <button onClick={goHome}>
-                    <HomeIcon size={15} /> 홈
-                  </button>
                   <button onClick={() => void create()}>
                     <Plus size={15} /> 새 프로젝트
                   </button>
@@ -1033,18 +1120,10 @@ export default function App() {
                       setMenu(false);
                       void rpc<typeof recent>("project.list")
                         .then(setRecent)
-                        .catch((e) => setError(String(e)));
+                        .catch((e) => setError(errorText(e).message));
                     }}
                   >
                     <FolderOpen size={15} /> 프로젝트 열기
-                  </button>
-                  <button
-                    onClick={() => {
-                      setMenu(false);
-                      void save();
-                    }}
-                  >
-                    <Save size={15} /> 저장 <kbd>⌘S</kbd>
                   </button>
                   <button
                     onClick={() => {
@@ -1181,7 +1260,7 @@ export default function App() {
             }}
           >
             <div
-              className="upper-workspace"
+              className={`upper-workspace ${inspectorShown ? "" : "inspector-hidden"}`}
               // Only chosen widths are set here; the stylesheet keeps the responsive defaults.
               style={{
                 ...(panels.library ? { "--library-width": `${panels.library}px` } : {}),
@@ -1194,7 +1273,7 @@ export default function App() {
                 selected={selected}
                 playhead={idleTime}
                 now={playbackClock.get}
-                onCommand={command}
+                onCommand={libraryCommand}
                 onImport={() => void importPaths()}
                 onSelect={selectClip}
               />
@@ -1210,13 +1289,14 @@ export default function App() {
                 previewMode={previewMode}
                 onPreviewMode={(mode) => {
                   void requestPlayback(false);
-                  setPlaybackUrl(null);
+                  setRendered(null);
                   setPreviewMode(mode);
                 }}
                 playing={playing}
                 onTime={seekTime}
                 onPlaying={(v) => void requestPlayback(v)}
                 loop={activeLoop}
+                loopTarget={selectionRange}
                 onLoop={setLoop}
                 playbackUrl={playbackUrl}
                 preparing={preparing}
@@ -1233,7 +1313,7 @@ export default function App() {
               <Inspector
                 project={project}
                 selected={selected}
-                onCommand={command}
+                onCommand={panelCommand}
                 playhead={idleTime}
                 now={playbackClock.get}
               />
@@ -1293,6 +1373,7 @@ export default function App() {
               project={project}
               onTime={seekTime}
               loop={activeLoop}
+              onLoop={setLoop}
               onCopy={copySelection}
               onPaste={pasteAt}
               canPaste={clipboardProject === project.id}
@@ -1316,19 +1397,15 @@ export default function App() {
         </div>
         <footer className="studio-statusbar">
           <div>
-            <LayoutPanelLeft size={12} />
-            <span>{project.media.length}개 소재</span>
-            <span className="status-separator" />
-            <span>
-              {project.width} × {project.height} · {project.fps} fps
-            </span>
+            <span>전체 {total.toFixed(2)}초</span>
+            {selectedIds.length > 0 && (
+              <>
+                <span className="status-separator" />
+                <span>{selectedIds.length}개 선택</span>
+              </>
+            )}
           </div>
           <div>
-            {!project.clips.length && (
-              <button onClick={() => void example()}>
-                예제 프로젝트로 둘러보기
-              </button>
-            )}
             <span
               className={`status-dot ${runtime?.byoridb.connected ? "online" : ""}`}
             />

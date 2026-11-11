@@ -4,6 +4,7 @@ node_modules/
 # Build outputs
 dist/
 coverage/
+output/
 src-tauri/target/
 
 # IDE
@@ -27,6 +28,7 @@ npm-debug.log*
 
 # Tauri
 src-tauri/WixTools/
-src-tauri/icons/*.png
-src-tauri/icons/*.ico
-src-tauri/icons/*.icns
+
+# Python tooling
+__pycache__/
+*.pyc

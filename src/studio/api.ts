@@ -1,0 +1,98 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { Project } from "./types";
+
+export interface Connection {
+  url: string;
+  token: string;
+}
+let connection: Connection | null = null;
+export async function connectStudio(force = false): Promise<Connection> {
+  if (force) connection = null;
+  if (connection) return connection;
+  if (isTauri()) connection = await invoke<Connection>("studio_connection");
+  else {
+    const response = await fetch("http://127.0.0.1:43123/session");
+    if (!response.ok)
+      throw new Error(
+        "편집 서비스에 연결할 수 없습니다. npm run studio를 실행해 주세요.",
+      );
+    connection = (await response.json()) as Connection;
+  }
+  return connection;
+}
+export async function rpc<T = unknown>(
+  method: string,
+  params: Record<string, unknown> = {},
+  projectId?: string,
+): Promise<T> {
+  const c = await connectStudio();
+  let response = await fetch(`${c.url}/rpc`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${c.token}`,
+    },
+    body: JSON.stringify({
+      method,
+      params,
+      ...(projectId ? { projectId } : {}),
+    }),
+  });
+  if (response.status === 401) {
+    const renewed = await connectStudio(true);
+    response = await fetch(`${renewed.url}/rpc`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${renewed.token}`,
+      },
+      body: JSON.stringify({
+        method,
+        params,
+        ...(projectId ? { projectId } : {}),
+      }),
+    });
+  }
+  const body = (await response.json()) as { result?: T; error?: string };
+  if (!response.ok || body.error)
+    throw new Error(body.error || `요청 실패 (${response.status})`);
+  return body.result as T;
+}
+export function assetUrl(id: string, thumbnail = false): string {
+  if (!connection) return "";
+  return `${connection.url}/assets/${encodeURIComponent(id)}${thumbnail ? "/thumbnail" : ""}?token=${encodeURIComponent(connection.token)}`;
+}
+export async function uploadFile(
+  file: File,
+  projectId: string,
+): Promise<Project> {
+  const c = await connectStudio();
+  const response = await fetch(
+    `${c.url}/upload?name=${encodeURIComponent(file.name)}&projectId=${encodeURIComponent(projectId)}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${c.token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: file,
+    },
+  );
+  const body = (await response.json()) as { result?: Project; error?: string };
+  if (!response.ok || body.error)
+    throw new Error(body.error || "미디어를 가져오지 못했습니다.");
+  return body.result!;
+}
+export async function pickFiles(extensions?: string[]): Promise<string[] | null> {
+  return isTauri() ? invoke<string[]>("studio_open_files", { extensions: extensions ?? null }) : null;
+}
+export async function savePath(
+  name: string,
+  extension?: string,
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string | null>("studio_save_file", {
+    name,
+    extension: extension ?? null,
+  });
+}

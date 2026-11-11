@@ -1,256 +1,968 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import Sidebar from "./components/Sidebar";
-import QueryEditor from "./components/QueryEditor";
-import ResultPanel from "./components/ResultPanel";
-import ConnectionModal from "./components/ConnectionModal";
-import "./styles/App.css";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  ChevronDown,
+  Download,
+  Film,
+  FolderOpen,
+  LayoutPanelLeft,
+  LoaderCircle,
+  Plus,
+  Save,
+  Settings2,
+  Sparkles,
+  X,
+} from "lucide-react";
+import {
+  assetUrl,
+  connectStudio,
+  pickFiles,
+  rpc,
+  uploadFile,
+} from "./studio/api";
+import type { Command, Job, Project, RuntimeStatus } from "./studio/types";
+import { durationOf } from "./studio/types";
+import {
+  canEditSelection,
+  clipGroup,
+  moveSelection,
+  newClipIds,
+  selectedClips,
+  shiftSelectionTracks,
+} from "./studio/selection";
+import Player from "./studio/Player";
+import { isPreviewPlaybackWaiting, primePreviewPlayback } from "./studio/mediaPlayback";
+import { clipEditCommands } from "./studio/clipEditing";
+import {
+  PreviewDraftContext,
+  withPreviewDraft,
+  type PreviewDraft,
+  type PreviewDraftHandler,
+} from "./studio/previewDraft";
+import Timeline from "./studio/Timeline";
+import Library from "./studio/Library";
+import Inspector from "./studio/Inspector";
+import AssistantPanel from "./studio/AssistantPanel";
+import Settings from "./studio/Settings";
+import ExportDialog from "./studio/ExportDialog";
+import "./styles/studio.css";
 
-interface ConnectionConfig {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-}
-
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  executionTime: number;
-  rowCount?: number;
-  error?: string;
-}
-
-/** Error shape returned by every Tauri command (see `src-tauri/src/main.rs::TauriError`). */
-interface TauriError {
-  code: string;
-  message: string;
-}
-
-/**
- * Normalize anything thrown from an `invoke` call into `{code, message}`.
- *
- * Tauri commands return a serialized `TauriError` object on `Err(_)`, but
- * defensive coding: network/marshaling failures may still throw a bare
- * string or Error.
- */
-function normalizeError(err: unknown): TauriError {
-  if (err && typeof err === "object" && "code" in err && "message" in err) {
-    return err as TauriError;
-  }
-  return { code: "UNKNOWN", message: String(err) };
-}
-
-/** How often to poll `GET /health` while connected. */
-const HEALTH_POLL_INTERVAL_MS = 30_000;
-
-function App() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [showConnectionModal, setShowConnectionModal] = useState(true);
-  const [connectionConfig, setConnectionConfig] = useState<ConnectionConfig | null>(null);
-  const [currentSpace, setCurrentSpace] = useState<string | null>(null);
-  const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
-  const [isExecuting, setIsExecuting] = useState(false);
-
-  /** Called when we detect the server session or reachability is gone. */
-  const handleConnectionLost = (reason: "session" | "health") => {
-    setIsConnected(false);
-    setConnectionConfig(null);
-    setCurrentSpace(null);
-    setShowConnectionModal(true);
-    if (reason === "health") {
-      setQueryResult({
-        columns: [],
-        rows: [],
-        executionTime: 0,
-        error: "Lost connection to server. Please reconnect.",
-      });
-    }
-  };
-
-  /**
-   * Poll `GET /health` (via the backend `test_connection` command) every
-   * 30s while connected. Surface a lost connection to the UI as soon as
-   * the check fails. The check itself is independent of any in-flight
-   * query, so a long query won't be interrupted.
-   */
+export default function App() {
+  const [project, setProject] = useState<Project | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+  const [time, setTime] = useState(0);
+  const [seekEpoch, setSeekEpoch] = useState(0);
+  const seekTime = useCallback((value: number | ((current: number) => number)) => {
+    setSeekEpoch((epoch) => epoch + 1);
+    setTime(value);
+  }, []);
+  const [playing, setPlaying] = useState(false);
+  const [previewMode, setPreviewMode] = useState<"fast" | "precise">("fast");
+  const [previewDraft, setPreviewDraft] = useState<PreviewDraft | null>(null);
+  const preview: PreviewDraftHandler = useCallback((clipId, patch) => {
+    setPreviewDraft(patch ? { clipId, patch } : null);
+  }, []);
+  useEffect(
+    () => setPreviewDraft(null),
+    [project?.id, project?.revision, selectedId],
+  );
+  const [assistant, setAssistant] = useState(false);
+  const [settings, setSettings] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const [recent, setRecent] = useState<
+    { id: string; name: string; updatedAt: string | number }[] | null
+  >(null);
+  const [busy, setBusy] = useState("");
+  const [history, setHistory] = useState({ canUndo: false, canRedo: false });
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const files = useRef<HTMLInputElement>(null);
+  const editingSurface = useRef<HTMLDivElement>(null);
+  const [timelineHeight, setTimelineHeight] = useState(300);
+  const [surfaceHeight, setSurfaceHeight] = useState(640);
+  const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
+  const resizeTimeline = (height: number) =>
+    setTimelineHeight(Math.max(200, Math.min(maxTimelineHeight, height)));
   useEffect(() => {
-    if (!isConnected || !connectionConfig) return undefined;
-
-    let cancelled = false;
-
-    const check = async () => {
-      try {
-        const ok = await invoke<boolean>("test_connection", {
-          host: connectionConfig.host,
-          port: connectionConfig.port,
-        });
-        if (!ok && !cancelled) {
-          handleConnectionLost("health");
-        }
-      } catch (error) {
-        if (!cancelled) {
-          console.error("Health check failed:", normalizeError(error));
-          handleConnectionLost("health");
-        }
-      }
+    const surface = editingSurface.current;
+    if (!surface) return;
+    const measure = () => {
+      const height = surface.getBoundingClientRect().height;
+      if (!height) return;
+      setSurfaceHeight(height);
+      setTimelineHeight((value) =>
+        Math.max(200, Math.min(height - 248, value)),
+      );
     };
-
-    const id = window.setInterval(check, HEALTH_POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [isConnected, connectionConfig?.host, connectionConfig?.port]);
-
-  const handleConnect = async (config: ConnectionConfig) => {
-    try {
-      await invoke("connect", { config });
-      setConnectionConfig(config);
-      setIsConnected(true);
-      setShowConnectionModal(false);
-    } catch (error) {
-      const e = normalizeError(error);
-      console.error("Connection failed:", e);
-      const hint =
-        e.code === "AUTH_FAILED"
-          ? "\n\nHint: the ByoriDB server reads the root password from the BYORIDB_ROOT_PASSWORD env var. If unset, the server generates a random one at startup and logs it."
-          : "";
-      alert(`Connection failed: ${e.message}${hint}`);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    try {
-      await invoke("disconnect");
-      setIsConnected(false);
-      setConnectionConfig(null);
-      setCurrentSpace(null);
-      setQueryResult(null);
-      setShowConnectionModal(true);
-    } catch (error) {
-      const e = normalizeError(error);
-      console.error("Disconnect failed:", e);
-    }
-  };
-
-  const handleExecuteQuery = async (query: string) => {
-    if (!isConnected) {
-      alert("Not connected to server");
+    const observer = new ResizeObserver(measure);
+    observer.observe(surface);
+    measure();
+    return () => observer.disconnect();
+  }, [!!project]);
+  const current = useRef<Project | null>(null);
+  current.current = project;
+  const selectionProject = useRef<string | null>(null);
+  const projectGeneration = useRef(0);
+  const selectMany = useCallback((ids: string[], primary?: string | null) => {
+    const valid = [...new Set(ids)].filter((id) =>
+      current.current?.clips.some((clip) => clip.id === id),
+    );
+    setSelectedIds(valid);
+    setSelectedId(
+      primary && valid.includes(primary)
+        ? primary
+        : valid[valid.length - 1] || null,
+    );
+    const primaryClip = current.current?.clips.find((clip) => clip.id === (primary || valid[valid.length - 1]));
+    if (primaryClip) setSelectedTrackId(primaryClip.trackId);
+  }, []);
+  const selectClip = useCallback(
+    (id: string | null) => {
+      selectMany(
+        id && current.current ? clipGroup(current.current, id) : [],
+        id,
+      );
+    },
+    [selectMany],
+  );
+  useEffect(() => {
+    if (!project) return;
+    if (selectionProject.current !== project.id) {
+      selectionProject.current = project.id;
+      selectMany([], null);
+      setSelectedTrackId(null);
       return;
     }
-
-    setIsExecuting(true);
+    setSelectedIds((ids) => {
+      const valid = ids.filter((id) =>
+        project.clips.some((clip) => clip.id === id),
+      );
+      return valid.length === ids.length ? ids : valid;
+    });
+    setSelectedId((id) =>
+      project.clips.some((clip) => clip.id === id) ? id : null,
+    );
+    setSelectedTrackId((id) => project.tracks.some((track) => track.id === id) ? id : null);
+  }, [project, selectMany]);
+  const initialize = useCallback(async () => {
+    setLoading(true);
+    setError("");
     try {
-      const startTime = performance.now();
-      const result = await invoke<QueryResult>("execute_query", { query });
-      const endTime = performance.now();
-
-      setQueryResult({
-        ...result,
-        executionTime: endTime - startTime,
-      });
-    } catch (error) {
-      const e = normalizeError(error);
-
-      if (e.code === "SESSION_EXPIRED") {
-        setQueryResult({
-          columns: [],
-          rows: [],
-          executionTime: 0,
-          error: "Session expired. Please reconnect.",
-        });
-        handleConnectionLost("session");
-        return;
-      }
-
-      setQueryResult({
-        columns: [],
-        rows: [],
-        executionTime: 0,
-        error: e.message,
-      });
+      await connectStudio();
+      setConnected(true);
+      setProject(await rpc<Project>("project.get"));
+      void rpc<RuntimeStatus>("runtime.status")
+        .then(setRuntime)
+        .catch(() => {});
+      setHistory(await rpc("history.status"));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setIsExecuting(false);
+      setLoading(false);
     }
-  };
-
-  const handleSelectSpace = async (spaceName: string) => {
-    // Side-effect only: don't pipe USE results through handleExecuteQuery
-    // (which would overwrite the result panel with an empty/dummy response)
-    // and don't flip currentSpace if the switch failed.
+  }, []);
+  useEffect(() => {
+    void initialize();
+  }, [initialize]);
+  useEffect(() => {
+    if (!connected) return;
+    const timer = setInterval(() => {
+      const generation = projectGeneration.current;
+      void rpc<Project>("project.get")
+        .then((p) => {
+          if (projectGeneration.current !== generation) return;
+          if (
+            p.id !== current.current?.id ||
+            p.revision > (current.current?.revision ?? -1)
+          ) {
+            if (p.id !== current.current?.id) projectGeneration.current++;
+            current.current = p;
+            setProject(p);
+            const accepted = projectGeneration.current;
+            void rpc<{ canUndo: boolean; canRedo: boolean }>(
+              "history.status",
+              {},
+              p.id,
+            )
+              .then((h) => {
+                if (projectGeneration.current === accepted) setHistory(h);
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }, 1200);
+    return () => clearInterval(timer);
+  }, [connected]);
+  const command: Command = useCallback(async (method, params = {}) => {
+    setError("");
+    const switching = ["project.new", "project.open", "project.demo"].includes(
+      method,
+    );
+    let generation = switching
+      ? ++projectGeneration.current
+      : projectGeneration.current;
+    const projectId = switching ? undefined : current.current?.id;
     try {
-      await invoke<QueryResult>("execute_query", {
-        query: `USE ${spaceName}`,
-      });
-      setCurrentSpace(spaceName);
-    } catch (error) {
-      const e = normalizeError(error);
-      console.error("Failed to select space:", e);
-      if (e.code === "SESSION_EXPIRED") {
-        handleConnectionLost("session");
+      const guarded =
+        (method.startsWith("edit.") || method === "project.update") &&
+        params.expectedRevision === undefined
+          ? { ...params, expectedRevision: current.current?.revision }
+          : params;
+      const result = await rpc<unknown>(method, guarded, projectId);
+      if (projectGeneration.current !== generation) return result;
+      if (switching) generation = ++projectGeneration.current;
+      if (
+        result &&
+        typeof result === "object" &&
+        "clips" in result &&
+        "tracks" in result
+      ) {
+        if (
+          (result as Project).id === current.current?.id &&
+          (result as Project).revision < current.current.revision
+        )
+          return result;
+        current.current = result as Project;
+        setProject(result as Project);
+        setTime((t) => Math.min(t, durationOf(result as Project)));
+      } else if (result && typeof result === "object" && "project" in result) {
+        current.current = (result as { project: Project }).project;
+        setProject(current.current);
+      }
+      const h = await rpc<{ canUndo: boolean; canRedo: boolean }>(
+        "history.status",
+        {},
+        current.current?.id,
+      );
+      if (projectGeneration.current === generation) setHistory(h);
+      return result;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      throw e;
+    }
+  }, []);
+  const safeCommand: Command = useCallback(
+    (method, params) => command(method, params).catch(() => undefined),
+    [command],
+  );
+  const total = project ? durationOf(project) : 0;
+  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState(false);
+  const previewRun = useRef(0);
+  const previewJob = useRef<string | null>(null);
+  useEffect(() => {
+    setPlaying(false);
+    setPlaybackUrl(null);
+    setPreparing(false);
+    if (previewJob.current) setBusy("");
+    previewRun.current++;
+    if (previewJob.current)
+      void rpc("export.cancel", { id: previewJob.current }).catch(() => {});
+    previewJob.current = null;
+  }, [project?.id, project?.revision]);
+  const requestPlayback = useCallback(
+    async (next: boolean) => {
+      if (!next) {
+        previewRun.current++;
+        setPlaying(false);
+        setPreparing(false);
+        setBusy("");
+        if (previewJob.current)
+          void rpc("export.cancel", { id: previewJob.current }).catch(() => {});
+        previewJob.current = null;
         return;
       }
-      alert(`Failed to switch to space "${spaceName}": ${e.message}`);
+      if (previewMode === "fast") {
+        primePreviewPlayback();
+        setPlaying(true);
+        return;
+      }
+      if (playbackUrl) {
+        primePreviewPlayback();
+        setPlaying(true);
+        return;
+      }
+      const nonce = ++previewRun.current;
+      setPreparing(true);
+      setError("");
+      setBusy("정밀 미리보기를 준비하고 있습니다");
+      try {
+        const result = await rpc<{ id: string; assetId: string }>(
+          "preview.start",
+          { width: 960 },
+          current.current?.id,
+        );
+        if (previewRun.current !== nonce) {
+          void rpc("export.cancel", { id: result.id }).catch(() => {});
+          return;
+        }
+        previewJob.current = result.id;
+        while (previewRun.current === nonce) {
+          const status = await rpc<Job>("export.status", { id: result.id });
+          if (previewRun.current !== nonce) break;
+          if (status.state === "failed")
+            throw new Error(status.error || "미리보기 렌더 실패");
+          if (status.state === "cancelled") break;
+          if (status.state === "completed") {
+            setPlaybackUrl(assetUrl(result.assetId));
+            setPlaying(true);
+            break;
+          }
+          setBusy(
+            `정밀 미리보기 준비 · ${Math.round((status.progress || 0) * 100)}%`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      } catch (e) {
+        if (previewRun.current === nonce)
+          setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (previewRun.current === nonce) {
+          setPreparing(false);
+          setBusy("");
+          previewJob.current = null;
+        }
+      }
+    },
+    [playbackUrl, previewMode],
+  );
+  useEffect(() => {
+    if (!playing) return;
+    if (time >= total) seekTime(0);
+    let id = 0,
+      last = performance.now();
+    const tick = (now: number) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      if (isPreviewPlaybackWaiting()) {
+        id = requestAnimationFrame(tick);
+        return;
+      }
+      setTime((v) => {
+        if (v + dt >= total) {
+          setPlaying(false);
+          return total;
+        }
+        return v + dt;
+      });
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, [playing, total, seekTime]);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(""), 4500);
+    return () => clearTimeout(t);
+  }, [notice]);
+  const save = useCallback(async () => {
+    try {
+      const result = (await command("project.save")) as { path: string };
+      setNotice(`저장됨 · ${result.path}`);
+    } catch {
+      /* shown inline */
+    }
+  }, [command]);
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => {
+      if (
+        (event.target instanceof Element &&
+          event.target.closest(
+            'input,textarea,select,[contenteditable="true"]',
+          )) ||
+        settings ||
+        exportOpen ||
+        recent
+      )
+        return;
+      const cmd = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+      const active = current.current;
+      if (!active) return;
+      const editable = canEditSelection(active, selectedIds);
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (total) void requestPlayback(!playing && !preparing);
+      } else if (cmd && key === "a") {
+        event.preventDefault();
+        selectMany(
+          active.clips
+            .filter(
+              (clip) =>
+                !active.tracks.find((track) => track.id === clip.trackId)
+                  ?.locked,
+            )
+            .map((clip) => clip.id),
+        );
+      } else if (cmd && key === "z") {
+        event.preventDefault();
+        void safeCommand(event.shiftKey ? "history.redo" : "history.undo");
+      } else if (cmd && key === "s") {
+        event.preventDefault();
+        void save();
+      } else if (
+        selectedIds.length && !event.altKey &&
+        ((cmd && key === "b") || (!cmd && !event.shiftKey && (key === "q" || key === "w")))
+      ) {
+        event.preventDefault();
+        if (event.repeat || event.isComposing) return;
+        const action = cmd ? "split" : key === "q" ? "trim-start" : "trim-end";
+        const commands = clipEditCommands(active, selectedIds, time, action);
+        if (!commands.length) return;
+        const result = commands.length === 1
+          ? safeCommand(commands[0].method, { ...commands[0].params, expectedRevision: active.revision })
+          : safeCommand("edit.batch", { commands, expectedRevision: active.revision });
+        void result.then((updated) => {
+          if (action === "split") {
+            const ids = newClipIds(active, updated);
+            if (ids.length) selectMany(ids, ids[ids.length - 1]);
+          }
+        });
+      } else if (cmd && key === "d" && selectedIds.length) {
+        event.preventDefault();
+        if (editable)
+          void safeCommand("edit.duplicate", { ids: selectedIds }).then(
+            (result) => {
+              const ids = newClipIds(active, result);
+              if (ids.length) selectMany(ids);
+            },
+          );
+      } else if (cmd && key === "g" && selectedIds.length) {
+        event.preventDefault();
+        if (editable && (event.shiftKey || selectedIds.length > 1))
+          void safeCommand(event.shiftKey ? "edit.ungroup" : "edit.group", {
+            ids: selectedIds,
+          });
+      } else if (
+        (event.key === "Backspace" || event.key === "Delete") &&
+        selectedIds.length
+      ) {
+        event.preventDefault();
+        if (editable)
+          void safeCommand("edit.delete", {
+            ids: selectedIds,
+            ripple: event.shiftKey,
+          }).then((result) => {
+            if (result) selectMany([], null);
+          });
+      } else if (
+        event.altKey &&
+        ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)
+      ) {
+        event.preventDefault();
+        if (!editable) return;
+        const direction =
+          event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
+        const commands =
+          event.key === "ArrowLeft" || event.key === "ArrowRight"
+            ? moveSelection(
+                selectedClips(active, selectedIds),
+                (direction * (event.shiftKey ? 10 : 1)) / active.fps,
+              )
+            : shiftSelectionTracks(active, selectedIds, direction);
+        if (commands.length)
+          void safeCommand("edit.batch", {
+            commands,
+            expectedRevision: active.revision,
+          });
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        seekTime((value) =>
+          Math.max(0, value - (event.shiftKey ? 1 : 1 / active.fps)),
+        );
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        seekTime((value) =>
+          Math.min(total, value + (event.shiftKey ? 1 : 1 / active.fps)),
+        );
+      } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        event.preventDefault();
+        const edges = [
+          0,
+          total,
+          ...active.clips.flatMap((clip) => [
+            clip.start,
+            clip.start + clip.duration,
+          ]),
+        ].sort((a, b) => a - b);
+        seekTime((value) =>
+          event.key === "ArrowUp"
+            ? ([...edges].reverse().find((edge) => edge < value - 0.001) ?? 0)
+            : (edges.find((edge) => edge > value + 0.001) ?? total),
+        );
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        seekTime(0);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        seekTime(total);
+      } else if (key === "m" && !cmd && !event.altKey)
+        void safeCommand("edit.marker", { time, label: "마커" });
+      else if (event.key === "Escape") {
+        setMenu(false);
+        selectMany([], null);
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [
+    selectedId,
+    selectedIds,
+    time,
+    total,
+    settings,
+    exportOpen,
+    recent,
+    safeCommand,
+    save,
+    playing,
+    preparing,
+    requestPlayback,
+    selectMany,
+    seekTime,
+  ]);
+  const importPaths = async () => {
+    try {
+      const paths = await pickFiles();
+      if (paths === null) {
+        files.current?.click();
+        return;
+      }
+      if (!paths.length) return;
+      setBusy("미디어를 가져오고 있습니다");
+      await command("media.import", { paths });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
     }
   };
-
+  const importBrowser = async (list: FileList | File[]) => {
+    setBusy("미디어를 분석하고 있습니다");
+    setError("");
+    try {
+      const projectId = current.current?.id;
+      if (!projectId) return;
+      for (const file of Array.from(list)) {
+        const updated = await uploadFile(file, projectId);
+        if (current.current?.id !== projectId) break;
+        if (updated.revision >= (current.current?.revision ?? 0)) {
+          current.current = updated;
+          setProject(updated);
+        }
+        const h = await rpc<{ canUndo: boolean; canRedo: boolean }>(
+          "history.status",
+          {},
+          projectId,
+        );
+        if (current.current?.id === projectId) setHistory(h);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+      if (files.current) files.current.value = "";
+    }
+  };
+  const example = async () => {
+    setBusy("예제 프로젝트를 준비하고 있습니다");
+    try {
+      await command("project.demo");
+      setTime(0);
+      selectMany([], null);
+      setNotice(
+        "예제 프로젝트 · 제공된 사진과 합성 오디오로 구성되어 있습니다.",
+      );
+    } catch {
+      /* shown inline */
+    } finally {
+      setBusy("");
+    }
+  };
+  const create = async () => {
+    await safeCommand("project.new", {
+      name: "이름 없는 프로젝트",
+      width: 1920,
+      height: 1080,
+      fps: 30,
+    });
+    setTime(0);
+    selectMany([], null);
+    setMenu(false);
+  };
+  if (!project)
+    return (
+      <main className="connection-screen">
+        <div className="byori-mark">b</div>
+        <h1>Byori Studio</h1>
+        <p>
+          {loading
+            ? "편집 작업 공간을 준비하고 있습니다."
+            : "편집 서비스에 연결해 주세요."}
+        </p>
+        {loading ? (
+          <LoaderCircle className="spin" size={24} />
+        ) : (
+          <>
+            <div className="inline-error">{error}</div>
+            <code>npm run studio</code>
+            <button
+              className="primary-button"
+              onClick={() => void initialize()}
+            >
+              다시 연결
+            </button>
+          </>
+        )}
+      </main>
+    );
+  const selected = project.clips.find((c) => c.id === selectedId) || null;
   return (
-    <div className="app">
-      {showConnectionModal && (
-        <ConnectionModal
-          onConnect={handleConnect}
-          onClose={() => isConnected && setShowConnectionModal(false)}
+    <PreviewDraftContext.Provider value={preview}>
+      <main
+        className={`studio-app ${assistant ? "assistant-open" : ""}`}
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          if (e.dataTransfer.files.length) {
+            e.preventDefault();
+            void importBrowser(e.dataTransfer.files);
+          }
+        }}
+      >
+        <input
+          ref={files}
+          hidden
+          type="file"
+          accept="video/*,audio/*,image/*,.srt,.vtt"
+          multiple
+          onChange={(e) => {
+            if (e.target.files) void importBrowser(e.target.files);
+          }}
         />
-      )}
-
-      <div className="app-header">
-        <div className="app-title">
-          <span className="logo">◆</span>
-          ByoriDB Studio
-        </div>
-        <div className="connection-status">
-          {isConnected ? (
-            <>
-              <span className="status-indicator connected" />
-              <span>{connectionConfig?.host}:{connectionConfig?.port}</span>
-              {currentSpace && <span className="current-space">/ {currentSpace}</span>}
-              <button className="btn-disconnect" onClick={handleDisconnect}>
-                Disconnect
+        <header className="studio-topbar">
+          <div className="studio-identity">
+            <span className="byori-mark">b</span>
+            <strong>
+              Byori <span>Studio</span>
+            </strong>
+            <div className="menu-container">
+              <button className="menu-toggle" onClick={() => setMenu(!menu)}>
+                메뉴 <ChevronDown size={13} />
               </button>
-            </>
-          ) : (
-            <>
-              <span className="status-indicator disconnected" />
-              <span>Not connected</span>
-              <button className="btn-connect" onClick={() => setShowConnectionModal(true)}>
-                Connect
+              {menu && (
+                <div className="app-menu">
+                  <button onClick={() => void create()}>
+                    <Plus size={15} /> 새 프로젝트
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMenu(false);
+                      void rpc<typeof recent>("project.list")
+                        .then(setRecent)
+                        .catch((e) => setError(String(e)));
+                    }}
+                  >
+                    <FolderOpen size={15} /> 프로젝트 열기
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMenu(false);
+                      void save();
+                    }}
+                  >
+                    <Save size={15} /> 저장 <kbd>⌘S</kbd>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMenu(false);
+                      void example();
+                    }}
+                  >
+                    <Film size={15} /> 예제 프로젝트 열기
+                  </button>
+                  <hr />
+                  <button
+                    onClick={() => {
+                      setMenu(false);
+                      setSettings(true);
+                    }}
+                  >
+                    <Settings2 size={15} /> 설정
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="project-title">
+            <input
+              aria-label="프로젝트 이름"
+              key={project.id}
+              defaultValue={project.name}
+              onBlur={(e) => {
+                if (e.target.value.trim() && e.target.value !== project.name)
+                  void safeCommand("project.update", {
+                    patch: { name: e.target.value.trim() },
+                  });
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+            />
+            <span title="자동 저장">
+              <Check size={11} /> 저장됨
+            </span>
+          </div>
+          <div className="topbar-actions">
+            <button
+              className={`assistant-toggle ${assistant ? "active" : ""}`}
+              onClick={() => setAssistant(!assistant)}
+            >
+              <Sparkles size={15} /> 어시스턴트
+            </button>
+            <button
+              className="icon-button"
+              title="설정"
+              onClick={() => setSettings(true)}
+            >
+              <Settings2 size={17} />
+            </button>
+            <button
+              className="export-button"
+              disabled={!project.clips.length}
+              onClick={() => {
+                setPlaying(false);
+                setExportOpen(true);
+              }}
+            >
+              <Download size={15} /> 내보내기
+            </button>
+          </div>
+        </header>
+        {(error || notice || busy) && (
+          <div
+            className={`studio-notification ${error ? "error" : ""}`}
+            role={error ? "alert" : "status"}
+          >
+            {busy ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <Check size={14} />
+            )}
+            <span>{error || busy || notice}</span>
+            {!busy && (
+              <button
+                title="알림 닫기"
+                onClick={() => {
+                  setError("");
+                  setNotice("");
+                }}
+              >
+                <X size={13} />
               </button>
-            </>
+            )}
+          </div>
+        )}
+        <div className="editor-workspace">
+          <div
+            className="editing-surface"
+            ref={editingSurface}
+            style={{
+              gridTemplateRows: `minmax(240px, 1fr) 8px ${timelineHeight}px`,
+            }}
+          >
+            <div className="upper-workspace">
+              <Library
+                project={project}
+                targetTrackId={selectedTrackId}
+                selected={selected}
+                playhead={time}
+                onCommand={command}
+                onImport={() => void importPaths()}
+                onSelect={selectClip}
+              />
+              <Player
+                project={withPreviewDraft(project, previewDraft)}
+                draftActive={!!previewDraft}
+                previewMode={previewMode}
+                onPreviewMode={(mode) => {
+                  void requestPlayback(false);
+                  setPlaybackUrl(null);
+                  setPreviewMode(mode);
+                }}
+                time={time}
+                seekEpoch={seekEpoch}
+                playing={playing}
+                onTime={seekTime}
+                onPlaying={(v) => void requestPlayback(v)}
+                playbackUrl={playbackUrl}
+                preparing={preparing}
+                selectedId={selectedId}
+                onSelect={selectClip}
+                onCommand={safeCommand}
+              />
+              <Inspector
+                project={project}
+                selected={selected}
+                onCommand={command}
+                playhead={time}
+              />
+            </div>
+            <div
+              className="timeline-resizer"
+              role="separator"
+              aria-label="타임라인 높이 조절"
+              aria-orientation="horizontal"
+              aria-valuemin={200}
+              aria-valuemax={Math.round(maxTimelineHeight)}
+              aria-valuenow={Math.round(timelineHeight)}
+              aria-valuetext={`${Math.round(timelineHeight)}픽셀`}
+              title="드래그하거나 위아래 방향키로 타임라인 높이 조절"
+              tabIndex={0}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }}
+              onPointerMove={(event) => {
+                if (
+                  event.currentTarget.hasPointerCapture(event.pointerId) &&
+                  editingSurface.current
+                )
+                  resizeTimeline(
+                    editingSurface.current.getBoundingClientRect().bottom -
+                      event.clientY -
+                      4,
+                  );
+              }}
+              onPointerUp={(event) => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId))
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+              }}
+              onKeyDown={(event) => {
+                if (
+                  !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)
+                )
+                  return;
+                event.preventDefault();
+                event.stopPropagation();
+                resizeTimeline(
+                  event.key === "Home"
+                    ? 200
+                    : event.key === "End"
+                      ? maxTimelineHeight
+                      : timelineHeight + (event.key === "ArrowUp" ? 20 : -20),
+                );
+              }}
+            >
+              <span />
+            </div>
+            <Timeline
+              selectedTrackId={selectedTrackId}
+              onTrackSelect={setSelectedTrackId}
+              project={project}
+              time={time}
+              onTime={seekTime}
+              selectedId={selectedId}
+              selectedIds={selectedIds}
+              onSelection={selectMany}
+              onCommand={safeCommand}
+              history={history}
+            />
+          </div>
+          {assistant && (
+            <AssistantPanel
+              project={project}
+              selected={selected}
+              onCommand={command}
+              onClose={() => setAssistant(false)}
+              onSettings={() => setSettings(true)}
+              runtime={runtime}
+            />
           )}
         </div>
-      </div>
-
-      <div className="app-body">
-        <Sidebar
-          isConnected={isConnected}
-          currentSpace={currentSpace}
-          onSelectSpace={handleSelectSpace}
-          onExecuteQuery={handleExecuteQuery}
-          onConnect={handleConnect}
-        />
-
-        <div className="main-content">
-          <QueryEditor
-            onExecute={handleExecuteQuery}
-            isExecuting={isExecuting}
-            isConnected={isConnected}
+        <footer className="studio-statusbar">
+          <div>
+            <LayoutPanelLeft size={12} />
+            <span>{project.media.length}개 소재</span>
+            <span className="status-separator" />
+            <span>
+              {project.width} × {project.height} · {project.fps} fps
+            </span>
+          </div>
+          <div>
+            {!project.clips.length && (
+              <button onClick={() => void example()}>
+                예제 프로젝트로 둘러보기
+              </button>
+            )}
+            <span
+              className={`status-dot ${runtime?.byoridb.connected ? "online" : ""}`}
+            />
+            <button onClick={() => setSettings(true)}>
+              ByoriDB {runtime?.byoridb.connected ? "연결됨" : "설정"}
+            </button>
+          </div>
+        </footer>
+        {settings && (
+          <Settings onClose={() => setSettings(false)} onUpdate={setRuntime} />
+        )}{" "}
+        {exportOpen && (
+          <ExportDialog
+            project={project}
+            onClose={() => setExportOpen(false)}
           />
-          <ResultPanel result={queryResult} />
-        </div>
-      </div>
-    </div>
+        )}
+        {recent && (
+          <div className="modal-backdrop">
+            <section
+              className="recent-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="recent-title"
+            >
+              <header>
+                <h2 id="recent-title">프로젝트 열기</h2>
+                <button title="닫기" onClick={() => setRecent(null)}>
+                  <X size={18} />
+                </button>
+              </header>
+              <div className="recent-list">
+                {recent.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      void safeCommand("project.open", { id: p.id }).then(
+                        () => {
+                          setRecent(null);
+                          setTime(0);
+                          selectMany([], null);
+                        },
+                      );
+                    }}
+                  >
+                    <Film size={23} />
+                    <span>
+                      <strong>{p.name}</strong>
+                      <small>
+                        {new Date(p.updatedAt).toLocaleString("ko-KR")}
+                      </small>
+                    </span>
+                  </button>
+                ))}
+                {!recent.length && <p>저장된 프로젝트가 없습니다.</p>}
+              </div>
+            </section>
+          </div>
+        )}
+      </main>
+    </PreviewDraftContext.Provider>
   );
 }
-
-export default App;

@@ -1,0 +1,491 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-01T06:07:23.850459+00:00",
+  "title": "Design System: Byori Studio",
+  "extensions": {
+    "colorMeta": {
+      "bg": {
+        "role": "neutral",
+        "displayName": "Workspace Charcoal",
+        "tonalRamp": [
+          "oklch(15% 0.0044 264.46)",
+          "oklch(26% 0.0044 264.46)",
+          "oklch(38% 0.0044 264.46)",
+          "oklch(49% 0.0044 264.46)",
+          "oklch(61% 0.0044 264.46)",
+          "oklch(72% 0.0044 264.46)",
+          "oklch(84% 0.0044 264.46)",
+          "oklch(95% 0.0044 264.46)"
+        ]
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Work Panel",
+        "tonalRamp": [
+          "oklch(15% 0.0065 258.36)",
+          "oklch(26% 0.0065 258.36)",
+          "oklch(38% 0.0065 258.36)",
+          "oklch(49% 0.0065 258.36)",
+          "oklch(61% 0.0065 258.36)",
+          "oklch(72% 0.0065 258.36)",
+          "oklch(84% 0.0065 258.36)",
+          "oklch(95% 0.0065 258.36)"
+        ]
+      },
+      "panel-raised": {
+        "role": "neutral",
+        "displayName": "Raised Graphite",
+        "tonalRamp": [
+          "oklch(15% 0.0079 264.43)",
+          "oklch(26% 0.0079 264.43)",
+          "oklch(38% 0.0079 264.43)",
+          "oklch(49% 0.0079 264.43)",
+          "oklch(61% 0.0079 264.43)",
+          "oklch(72% 0.0079 264.43)",
+          "oklch(84% 0.0079 264.43)",
+          "oklch(95% 0.0079 264.43)"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Panel Divider",
+        "tonalRamp": [
+          "oklch(15% 0.0097 260.72)",
+          "oklch(26% 0.0097 260.72)",
+          "oklch(38% 0.0097 260.72)",
+          "oklch(49% 0.0097 260.72)",
+          "oklch(61% 0.0097 260.72)",
+          "oklch(72% 0.0097 260.72)",
+          "oklch(84% 0.0097 260.72)",
+          "oklch(95% 0.0097 260.72)"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Cool Primary Ink",
+        "tonalRamp": [
+          "oklch(15% 0.0046 258.32)",
+          "oklch(26% 0.0046 258.32)",
+          "oklch(38% 0.0046 258.32)",
+          "oklch(49% 0.0046 258.32)",
+          "oklch(61% 0.0046 258.32)",
+          "oklch(72% 0.0046 258.32)",
+          "oklch(84% 0.0046 258.32)",
+          "oklch(95% 0.0046 258.32)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Cool Muted Ink",
+        "tonalRamp": [
+          "oklch(15% 0.0159 260.73)",
+          "oklch(26% 0.0159 260.73)",
+          "oklch(38% 0.0159 260.73)",
+          "oklch(49% 0.0159 260.73)",
+          "oklch(61% 0.0159 260.73)",
+          "oklch(72% 0.0159 260.73)",
+          "oklch(84% 0.0159 260.73)",
+          "oklch(95% 0.0159 260.73)"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Editing Cyan",
+        "tonalRamp": [
+          "oklch(15% 0.1279 187.31)",
+          "oklch(26% 0.1279 187.31)",
+          "oklch(38% 0.1279 187.31)",
+          "oklch(49% 0.1279 187.31)",
+          "oklch(61% 0.1279 187.31)",
+          "oklch(72% 0.1279 187.31)",
+          "oklch(84% 0.1279 187.31)",
+          "oklch(95% 0.1279 187.31)"
+        ]
+      },
+      "control-bg": {
+        "role": "neutral",
+        "displayName": "Control Graphite",
+        "tonalRamp": [
+          "oklch(15% 0.0101 260.71)",
+          "oklch(26% 0.0101 260.71)",
+          "oklch(38% 0.0101 260.71)",
+          "oklch(49% 0.0101 260.71)",
+          "oklch(61% 0.0101 260.71)",
+          "oklch(72% 0.0101 260.71)",
+          "oklch(84% 0.0101 260.71)",
+          "oklch(95% 0.0101 260.71)"
+        ]
+      },
+      "control-border": {
+        "role": "neutral",
+        "displayName": "Control Boundary",
+        "tonalRamp": [
+          "oklch(15% 0.0166 262.30)",
+          "oklch(26% 0.0166 262.30)",
+          "oklch(38% 0.0166 262.30)",
+          "oklch(49% 0.0166 262.30)",
+          "oklch(61% 0.0166 262.30)",
+          "oklch(72% 0.0166 262.30)",
+          "oklch(84% 0.0166 262.30)",
+          "oklch(95% 0.0166 262.30)"
+        ]
+      },
+      "control-hover": {
+        "role": "neutral",
+        "displayName": "Control Hover",
+        "tonalRamp": [
+          "oklch(15% 0.0134 261.73)",
+          "oklch(26% 0.0134 261.73)",
+          "oklch(38% 0.0134 261.73)",
+          "oklch(49% 0.0134 261.73)",
+          "oklch(61% 0.0134 261.73)",
+          "oklch(72% 0.0134 261.73)",
+          "oklch(84% 0.0134 261.73)",
+          "oklch(95% 0.0134 261.73)"
+        ]
+      },
+      "action-fill": {
+        "role": "primary",
+        "displayName": "Action Teal",
+        "tonalRamp": [
+          "oklch(15% 0.1185 185.38)",
+          "oklch(26% 0.1185 185.38)",
+          "oklch(38% 0.1185 185.38)",
+          "oklch(49% 0.1185 185.38)",
+          "oklch(61% 0.1185 185.38)",
+          "oklch(72% 0.1185 185.38)",
+          "oklch(84% 0.1185 185.38)",
+          "oklch(95% 0.1185 185.38)"
+        ]
+      },
+      "action-ink": {
+        "role": "primary",
+        "displayName": "Action Dark Ink",
+        "tonalRamp": [
+          "oklch(15% 0.0375 184.02)",
+          "oklch(26% 0.0375 184.02)",
+          "oklch(38% 0.0375 184.02)",
+          "oklch(49% 0.0375 184.02)",
+          "oklch(61% 0.0375 184.02)",
+          "oklch(72% 0.0375 184.02)",
+          "oklch(84% 0.0375 184.02)",
+          "oklch(95% 0.0375 184.02)"
+        ]
+      },
+      "action-hover": {
+        "role": "primary",
+        "displayName": "Action Teal Hover",
+        "tonalRamp": [
+          "oklch(15% 0.1055 185.50)",
+          "oklch(26% 0.1055 185.50)",
+          "oklch(38% 0.1055 185.50)",
+          "oklch(49% 0.1055 185.50)",
+          "oklch(61% 0.1055 185.50)",
+          "oklch(72% 0.1055 185.50)",
+          "oklch(84% 0.1055 185.50)",
+          "oklch(95% 0.1055 185.50)"
+        ]
+      },
+      "secondary-fill": {
+        "role": "neutral",
+        "displayName": "Slate Secondary",
+        "tonalRamp": [
+          "oklch(15% 0.0265 255.11)",
+          "oklch(26% 0.0265 255.11)",
+          "oklch(38% 0.0265 255.11)",
+          "oklch(49% 0.0265 255.11)",
+          "oklch(61% 0.0265 255.11)",
+          "oklch(72% 0.0265 255.11)",
+          "oklch(84% 0.0265 255.11)",
+          "oklch(95% 0.0265 255.11)"
+        ]
+      },
+      "secondary-ink": {
+        "role": "neutral",
+        "displayName": "Slate Secondary Ink",
+        "tonalRamp": [
+          "oklch(15% 0.0244 253.96)",
+          "oklch(26% 0.0244 253.96)",
+          "oklch(38% 0.0244 253.96)",
+          "oklch(49% 0.0244 253.96)",
+          "oklch(61% 0.0244 253.96)",
+          "oklch(72% 0.0244 253.96)",
+          "oklch(84% 0.0244 253.96)",
+          "oklch(95% 0.0244 253.96)"
+        ]
+      },
+      "video-track": {
+        "role": "secondary",
+        "displayName": "Video Teal",
+        "tonalRamp": [
+          "oklch(15% 0.0511 214.61)",
+          "oklch(26% 0.0511 214.61)",
+          "oklch(38% 0.0511 214.61)",
+          "oklch(49% 0.0511 214.61)",
+          "oklch(61% 0.0511 214.61)",
+          "oklch(72% 0.0511 214.61)",
+          "oklch(84% 0.0511 214.61)",
+          "oklch(95% 0.0511 214.61)"
+        ]
+      },
+      "image-track": {
+        "role": "secondary",
+        "displayName": "Image Blue Teal",
+        "tonalRamp": [
+          "oklch(15% 0.0457 223.69)",
+          "oklch(26% 0.0457 223.69)",
+          "oklch(38% 0.0457 223.69)",
+          "oklch(49% 0.0457 223.69)",
+          "oklch(61% 0.0457 223.69)",
+          "oklch(72% 0.0457 223.69)",
+          "oklch(84% 0.0457 223.69)",
+          "oklch(95% 0.0457 223.69)"
+        ]
+      },
+      "audio-track": {
+        "role": "secondary",
+        "displayName": "Audio Green",
+        "tonalRamp": [
+          "oklch(15% 0.0467 158.22)",
+          "oklch(26% 0.0467 158.22)",
+          "oklch(38% 0.0467 158.22)",
+          "oklch(49% 0.0467 158.22)",
+          "oklch(61% 0.0467 158.22)",
+          "oklch(72% 0.0467 158.22)",
+          "oklch(84% 0.0467 158.22)",
+          "oklch(95% 0.0467 158.22)"
+        ]
+      },
+      "text-track": {
+        "role": "secondary",
+        "displayName": "Text Ochre",
+        "tonalRamp": [
+          "oklch(15% 0.0659 76.83)",
+          "oklch(26% 0.0659 76.83)",
+          "oklch(38% 0.0659 76.83)",
+          "oklch(49% 0.0659 76.83)",
+          "oklch(61% 0.0659 76.83)",
+          "oklch(72% 0.0659 76.83)",
+          "oklch(84% 0.0659 76.83)",
+          "oklch(95% 0.0659 76.83)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "title": {
+        "displayName": "Dialog title",
+        "purpose": "Shared settings, export and recent-project headings."
+      },
+      "section": {
+        "displayName": "Section title",
+        "purpose": "Settings, concept and memory sections."
+      },
+      "body": {
+        "displayName": "UI baseline",
+        "purpose": "Root desktop interface text."
+      },
+      "panel": {
+        "displayName": "Panel text",
+        "purpose": "Library and inspector text."
+      },
+      "label": {
+        "displayName": "Control label",
+        "purpose": "Fields, panel headings and actions."
+      },
+      "supporting": {
+        "displayName": "Supporting text",
+        "purpose": "Filenames, help and secondary information."
+      }
+    },
+    "shadows": [
+      {
+        "name": "menu",
+        "value": "0 9px 28px #0007",
+        "purpose": "Application menu."
+      },
+      {
+        "name": "notification",
+        "value": "0 8px 24px #0005",
+        "purpose": "Transient workspace notice."
+      },
+      {
+        "name": "dialog",
+        "value": "0 20px 65px #0008",
+        "purpose": "Shared modal container."
+      },
+      {
+        "name": "assistant-overlay",
+        "value": "-10px 0 30px #0006",
+        "purpose": "Assistant at the overlay breakpoint."
+      },
+      {
+        "name": "composition",
+        "value": "0 4px 16px #0003",
+        "purpose": "Preview composition."
+      }
+    ],
+    "motion": [
+      {
+        "name": "control-state",
+        "value": "background-color 0.12s, color 0.12s, border-color 0.12s",
+        "purpose": "Button state feedback."
+      },
+      {
+        "name": "resize-affordance",
+        "value": "background 0.15s, width 0.15s",
+        "purpose": "Timeline separator hover and keyboard focus."
+      },
+      {
+        "name": "activity",
+        "value": "1s linear infinite",
+        "purpose": "Loading spinners; reduced-motion query limits animation to one near-instant iteration."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "assistant-overlay-max-width",
+        "value": "1500px"
+      },
+      {
+        "name": "compact-desktop-max-width",
+        "value": "1200px"
+      },
+      {
+        "name": "short-desktop-max-height",
+        "value": "700px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary action",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Shared action for export dialogs, memory and connection recovery.",
+      "html": "<button class=\"ds-primary\">내보내기</button>",
+      "css": ".ds-primary{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:11px;line-height:1.5;cursor:pointer;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 13px;border-radius:4px;background:#45cfc1;color:#102f2b;font-weight:600;border:1px solid #45cfc1}.ds-primary:hover:not(:disabled){background:#70e1d4;border-color:#70e1d4}.ds-primary:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-primary:disabled{opacity:.4;cursor:not-allowed}"
+    },
+    {
+      "name": "Secondary action",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Subordinate dialog action with a slate fill and fine border.",
+      "html": "<button class=\"ds-secondary\">취소</button>",
+      "css": ".ds-secondary{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:11px;line-height:1.5;cursor:pointer;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 13px;border-radius:4px;background:#303a47;color:#d0dceb;border:1px solid #4a5a70}.ds-secondary:hover:not(:disabled){background:#34383f}.ds-secondary:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-secondary:disabled{opacity:.4;cursor:not-allowed}"
+    },
+    {
+      "name": "Export action",
+      "kind": "button",
+      "refersTo": "button-export",
+      "description": "Compact cyan export action in the desktop top bar.",
+      "html": "<button class=\"ds-export\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/></svg>내보내기</button>",
+      "css": ".ds-export{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:11px;line-height:1.5;cursor:pointer;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 13px;border:0;border-radius:4px;background:var(--accent,#37d7cb);color:#0c302d;font-weight:650}.ds-export:hover:not(:disabled){background:#71e9df}.ds-export:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-export:disabled{opacity:.4;cursor:not-allowed}"
+    },
+    {
+      "name": "Ghost icon action",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "SVG-only utility control with a native tooltip and visible keyboard focus.",
+      "html": "<button class=\"ds-ghost\" aria-label=\"닫기\" title=\"닫기\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M18 6 6 18M6 6l12 12\"/></svg></button>",
+      "css": ".ds-ghost{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:11px;line-height:1.5;cursor:pointer;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:4px;background:transparent;color:#bdc5d0}.ds-ghost:hover:not(:disabled){background:#34383f}.ds-ghost:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-ghost:disabled{opacity:.4;cursor:not-allowed}"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Shared graphite field with cyan caret and focus outline.",
+      "html": "<input class=\"ds-input\" aria-label=\"프로젝트 이름\" value=\"잠시, 멈추는 여행\" />",
+      "css": ".ds-input{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:13px;line-height:1.5;color:var(--text,#f0f2f5);background:#292c31;border:1px solid #41464f;border-radius:4px;padding:7px 9px;caret-color:var(--accent,#37d7cb);outline:none}.ds-input:focus{border-color:#47b6ae}.ds-input:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-input::placeholder{color:#a0a7b3;opacity:1}"
+    },
+    {
+      "name": "Library navigation",
+      "kind": "nav",
+      "refersTo": "navigation",
+      "description": "Fixed-size category controls with active cyan labels and horizontal overflow.",
+      "html": "<nav class=\"ds-nav\" aria-label=\"편집 소재\"><button class=\"ds-nav-item ds-nav-active\" aria-current=\"page\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><rect width=\"20\" height=\"20\" x=\"2\" y=\"2\" rx=\"2.18\" ry=\"2.18\"/><path d=\"M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5\"/></svg>미디어</button><button class=\"ds-nav-item\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M9 18V5l12-2v13\"/><circle cx=\"6\" cy=\"18\" r=\"3\"/><circle cx=\"18\" cy=\"16\" r=\"3\"/></svg>오디오</button><button class=\"ds-nav-item\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7V4h16v3M9 20h6M12 4v16\"/></svg>텍스트</button></nav>",
+      "css": ".ds-nav{display:flex;gap:2px;padding:9px 8px 7px;border-bottom:1px solid var(--border,#34373c);background:var(--panel,#1c1e21);overflow-x:auto}.ds-nav-item{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:11px;line-height:1.5;cursor:pointer;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;flex-shrink:0;min-width:49px;gap:5px;padding:4px 5px;color:var(--muted,#a7adb7);font-size:10px;white-space:nowrap;background:transparent;border:0;border-radius:4px}.ds-nav-item:hover{color:var(--text,#f0f2f5);background:#282b30}.ds-nav-item.ds-nav-active{color:var(--accent,#37d7cb)}.ds-nav-item:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:2px}"
+    },
+    {
+      "name": "Selected context chip",
+      "kind": "chip",
+      "refersTo": "context-chip",
+      "description": "Current assistant context; the shipped 9px label is recorded as a legibility limitation, not a new reading-size token.",
+      "html": "<div class=\"ds-context\"><span></span>선택한 클립: coast.jpg</div>",
+      "css": ".ds-context{display:flex;align-items:center;gap:6px;padding:3px 6px;font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;font-size:9px;line-height:1.5;color:#b9d9d6;border-radius:3px;background:#344b4b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-context>span{height:5px;width:5px;border-radius:50%;background:#65c2b9;flex:none}"
+    },
+    {
+      "name": "Audio media tile",
+      "kind": "card",
+      "refersTo": "media-card",
+      "description": "Media library tile with an inline SVG illustration, filename and add affordance.",
+      "html": "<figure class=\"ds-media\"><div class=\"ds-thumb\"><div class=\"ds-audio\"><svg width=\"34\" height=\"34\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M2 10v4M6 6v12M10 3v18M14 8v8M18 5v14M22 10v4\"/></svg></div><button class=\"ds-add\" aria-label=\"타임라인에 ambient.wav 추가\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg></button></div><p>ambient.wav</p></figure>",
+      "css": ".ds-media{min-width:0;margin:0;width:150px;font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif}.ds-thumb{aspect-ratio:1.55;background:#2b2e34;border-radius:4px;position:relative;overflow:hidden;border:1px solid #41454e;cursor:grab}.ds-thumb:hover{border-color:var(--accent,#37d7cb)}.ds-audio{height:100%;display:flex;align-items:center;justify-content:center;color:#9bc6dd;background:#26323f}.ds-add{transition:background-color .12s,color .12s,border-color .12s;position:absolute;bottom:4px;right:4px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:4px;background:#34383ed9;padding:3px;color:#fff;cursor:pointer}.ds-add:hover{background:var(--accent,#37d7cb);color:#122323}.ds-add:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:2px}.ds-media>p{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10px;line-height:1.5;color:#c5cad2;margin:6px 0 0}"
+    },
+    {
+      "name": "Dialog container",
+      "kind": "custom",
+      "refersTo": "dialog",
+      "description": "Shared modal container showing the actual title, footer and close-control treatment.",
+      "html": "<section class=\"ds-dialog\" aria-label=\"내보내기\"><header><h2>내보내기</h2><button aria-label=\"닫기\"><svg width=\"19\" height=\"19\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M18 6 6 18M6 6l12 12\"/></svg></button></header><footer><span>1920 × 1080 · 30 fps</span></footer></section>",
+      "css": ".ds-dialog{font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;line-height:1.5;display:flex;flex-direction:column;width:min(640px,100%);background:#222831;border:1px solid #4b5667;border-radius:8px;box-shadow:0 20px 65px #0008;overflow:hidden}.ds-dialog>header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:20px 23px 17px;border-bottom:1px solid #3a4555}.ds-dialog h2{font-size:17px;font-weight:500;letter-spacing:-.3px;color:#ecf0f7;margin:0}.ds-dialog header>button{transition:background-color .12s,color .12s,border-color .12s;display:inline-flex;align-items:center;justify-content:center;color:#becbdb;padding:3px;border:0;border-radius:4px;background:transparent;cursor:pointer}.ds-dialog header>button:hover{background:#34383f}.ds-dialog header>button:focus-visible{outline:2px solid var(--accent,#37d7cb);outline-offset:3px;}.ds-dialog>footer{display:flex;justify-content:space-between;align-items:center;gap:16px;border-top:1px solid #3d4a5e;padding:14px 23px;background:#202731;color:#a4b5ce;font-size:10px}"
+    },
+    {
+      "name": "Timeline text clip",
+      "kind": "custom",
+      "refersTo": "timeline-clip",
+      "description": "Selected text clip with visible accent trim handles; each handle is keyboard focusable and supports one-frame arrow nudges.",
+      "html": "<div class=\"ds-clip\" tabindex=\"0\" aria-label=\"선택된 텍스트 클립\"><div class=\"ds-clip-label\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M4 7V4h16v3M9 20h6M12 4v16\"/></svg><span>잠시, 멈춰도 괜찮아</span></div><div class=\"ds-clip-preview\">잠시, 멈춰도 괜찮아</div><button class=\"ds-trim ds-trim-left\" aria-label=\"시작점 트림\"></button><button class=\"ds-trim ds-trim-right\" aria-label=\"끝점 트림\"></button></div>",
+      "css": ".ds-clip{position:relative;height:40px;width:240px;overflow:hidden;border-radius:4px;border:1px solid #a1895a;background:#71572f;color:#fae7bf;font-family:-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans KR\", sans-serif;line-height:1.5;cursor:grab;user-select:none;outline:2px solid #e0fff8;outline-offset:-1px}.ds-clip:active{cursor:grabbing}.ds-clip:focus-visible{box-shadow:0 0 0 2px var(--accent,#37d7cb)}.ds-clip-label{display:flex;align-items:center;gap:5px;min-width:0;height:19px;padding:1px 14px;background:#6b522de6;font-size:9px;white-space:nowrap}.ds-clip-label>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}.ds-clip-preview{font-size:9px;padding:1px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ead5b1}.ds-trim{position:absolute;top:0;bottom:0;width:10px;border:0;padding:0;cursor:ew-resize;opacity:1;background:var(--accent,#37d7cb)}.ds-trim-left{left:0}.ds-trim-right{right:0}.ds-clip:hover .ds-trim,.ds-clip:focus-visible .ds-trim{opacity:.8} .ds-trim:after{content:\"\";position:absolute;left:50%;top:35%;height:30%;width:1px;transform:translateX(-50%);background:#101114}.ds-trim:focus-visible{outline:2px solid #f0f2f5;outline-offset:-2px;background:#f0f2f5}"
+    },
+    {
+      "name": "Preview mode",
+      "kind": "input",
+      "description": "The player mode control distinguishes immediate “빠른 재생” from exact “정밀 재생”. Approximate local feedback is labeled; exact frames replace it after rendering settles.",
+      "html": "<select class=\"ds-preview-mode\" aria-label=\"미리보기 모드\" title=\"빠른 재생은 즉시 시작합니다. LUT·마스크·오디오 효과·역재생 등은 정밀 재생에서 확인하세요.\"><option value=\"fast\">빠른 재생</option><option value=\"precise\">정밀 재생</option></select>",
+      "css": ".ds-preview-mode{margin-left:auto;margin-right:10px;max-width:112px;color:var(--text,#f0f2f5);border:1px solid #41464f;border-radius:4px;background:#292c31;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",\"Noto Sans KR\",sans-serif;font-size:11px;line-height:1.5;padding:3px 5px}.ds-preview-mode:focus-visible{outline:2px solid #37d7cb;outline-offset:2px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The CapCut Desktop Editing Workspace",
+    "overview": "Byori Studio follows the user's pinned CapCut Desktop reference: charcoal working surfaces, restrained cyan emphasis, photographic footage and compact editing controls. The interface is a Korean desktop workspace whose visual hierarchy follows the editing task. Media and the composition carry the imagery; the surrounding chrome stays quiet.\n\nThe assistant, concept notes and memory occupy the same restrained working environment. Their slightly cooler surfaces distinguish an auxiliary workspace without introducing a separate brand. Preserve the Byori Studio name and familiar Korean editing terminology. This document records the implemented React interface in the macOS Tauri app; it does not assert complete CapCut feature parity or a mobile design.",
+    "keyCharacteristics": [
+      "Dark tonal panels separated by narrow gutters and fine dividers.",
+      "Cyan emphasis for actions, active tools, navigation and keyboard focus.",
+      "Compact Korean controls with stable numeric readouts.",
+      "Photographic media tiles, timeline filmstrips and an actual composite preview.",
+      "A resizable timeline and an auxiliary agent, concept and memory drawer.",
+      "Expose split and trim as labeled actions; selected clip handles stay visible and keyboard accessible."
+    ],
+    "rules": [
+      {
+        "name": "The Action and Media Rule",
+        "body": "Cyan identifies interaction; muted track colors identify media types. Preserve that distinction when adding tools or tracks.",
+        "section": "colors"
+      },
+      {
+        "name": "The Stable Readout Rule",
+        "body": "Timecodes and numeric metadata use tabular numerals so changing values do not disturb alignment.",
+        "section": "typography"
+      },
+      {
+        "name": "The Working Plane Rule",
+        "body": "Working panels separate through tone and dividers; floating layers use soft shadows to make their position legible.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do preserve the Byori Studio name and Korean editing terminology.",
+      "Do use cyan for interaction and muted track colors for media classification.",
+      "Do retain visible selection and keyboard focus above rendered media.",
+      "Do keep overflow navigation reachable and timeline height adjustable.",
+      "Do use real project imagery and composite frames in editing and export previews.",
+      "Do keep new controls within the compact desktop panel, field and button language."
+    ],
+    "donts": [
+      "Don't replace working-panel hierarchy with promotional display typography.",
+      "Don't add decorative shadows to ordinary media tiles or editing controls.",
+      "Don't let the rendered preview cover selection affordances.",
+      "Don't treat the demonstrated desktop layout as an implemented mobile system or full CapCut feature parity."
+    ]
+  }
+}

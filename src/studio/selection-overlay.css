@@ -1,0 +1,54 @@
+.selection-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 8;
+  border: 1px solid #b7fff7;
+  pointer-events: none;
+  transform-origin: center;
+}
+.selection-overlay button {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+.selection-overlay .selection-move {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  cursor: move;
+}
+.selection-overlay .selection-handle {
+  width: 7px;
+  height: 7px;
+  background: #e6fffb;
+  border: 1px solid #173b37;
+}
+.selection-handle.nw {
+  left: 0;
+  top: 0;
+  cursor: nwse-resize;
+}
+.selection-handle.ne {
+  right: 0;
+  top: 0;
+  cursor: nesw-resize;
+}
+.selection-handle.sw {
+  left: 0;
+  bottom: 0;
+  cursor: nesw-resize;
+}
+.selection-handle.se {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}
+.selection-overlay button:focus-visible {
+  outline: 2px solid #37d7cb;
+  outline-offset: 2px;
+}

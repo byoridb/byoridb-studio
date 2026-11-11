@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ByoriDB Studio",
+  "productName": "Byori Studio",
   "version": "0.1.0",
   "identifier": "com.byoridb.studio",
   "build": {
@@ -12,10 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "ByoriDB Studio",
+        "title": "Byori Studio",
         "width": 1280,
         "height": 800,
-        "minWidth": 900,
+        "minWidth": 920,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
@@ -30,6 +30,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../public/demo/": "demo/"
+    }
   }
 }

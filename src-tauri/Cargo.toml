@@ -1,12 +1,13 @@
 [package]
 name = "byoridb-studio"
 version = "0.1.0"
-description = "ByoriDB Studio - Desktop management tool for ByoriDB"
+description = "Byori Studio - Video editing with creative memory and CLI agents"
 authors = ["ByoriDB Team"]
 license = "Apache-2.0"
 repository = ""
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
+default-run = "byoridb-studio"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -21,6 +22,18 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }
+rfd = "0.15"
+dirs = "6"
+futures-util = "0.3"
+semver = "1"
+sha2 = "0.10"
+plist = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+fontdue = "0.9"
 
 [features]
 default = ["custom-protocol"]

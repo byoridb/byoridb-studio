@@ -1,165 +1,59 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod client;
+use byoridb_studio::service::{Connection, StudioService};
+use tauri::Manager;
 
-use client::{
-    test_connection as client_test_connection, ByoriDBClient, ClientError, ConnectionConfig,
-    QueryResult, SchemaInfo, SpaceInfo,
-};
-use serde::Serialize;
-use std::sync::Arc;
-use tauri::State;
-use tokio::sync::Mutex;
-use tracing::info;
-
-struct AppState {
-    client: Arc<Mutex<Option<ByoriDBClient>>>,
-}
-
-/// Structured error returned to the frontend from every Tauri command.
-///
-/// The `code` field carries a stable machine-readable tag (e.g.
-/// `SESSION_EXPIRED`) so the UI can react to specific failure modes
-/// (see `src/App.tsx`). `message` is the human-readable description.
-#[derive(Debug, Serialize)]
-struct TauriError {
-    code: String,
-    message: String,
-}
-
-impl TauriError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            code: code.to_string(),
-            message: message.into(),
-        }
-    }
-}
-
-impl From<ClientError> for TauriError {
-    fn from(err: ClientError) -> Self {
-        TauriError {
-            code: err.code().to_string(),
-            message: err.to_string(),
-        }
-    }
-}
-
-impl From<anyhow::Error> for TauriError {
-    fn from(err: anyhow::Error) -> Self {
-        TauriError::new("TRANSPORT", err.to_string())
-    }
+#[tauri::command]
+fn studio_connection(state: tauri::State<'_, Connection>) -> Connection {
+    state.inner().clone()
 }
 
 #[tauri::command]
-async fn connect(config: ConnectionConfig, state: State<'_, AppState>) -> Result<(), TauriError> {
-    info!("Connecting to {}:{}", config.host, config.port);
-
-    let client = ByoriDBClient::connect(config).await?;
-
-    let mut guard = state.client.lock().await;
-    *guard = Some(client);
-
-    info!("Connected successfully");
-    Ok(())
+async fn studio_open_files(extensions: Option<Vec<String>>) -> Vec<String> {
+    let extensions = extensions.unwrap_or_else(|| ["mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg", "jpeg", "webp", "gif", "srt", "cube", "3dl"].into_iter().map(String::from).collect());
+    rfd::AsyncFileDialog::new()
+        .add_filter("파일", &extensions)
+        .pick_files()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.path().to_string_lossy().to_string())
+        .collect()
 }
 
 #[tauri::command]
-async fn disconnect(state: State<'_, AppState>) -> Result<(), TauriError> {
-    info!("Disconnecting...");
-
-    let mut guard = state.client.lock().await;
-    if let Some(client) = guard.take() {
-        client.disconnect().await?;
+async fn studio_save_file(name: String, extension: Option<String>) -> Option<String> {
+    let mut dialog = rfd::AsyncFileDialog::new().set_file_name(&name);
+    if let Some(ext) = extension {
+        dialog = dialog.add_filter("파일", &[&ext]);
     }
-
-    info!("Disconnected");
-    Ok(())
-}
-
-#[tauri::command]
-async fn execute_query(
-    query: String,
-    state: State<'_, AppState>,
-) -> Result<QueryResult, TauriError> {
-    info!("Executing query: {}", query);
-
-    let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
-
-    let result = client.execute(&query).await;
-
-    // If the server told us the session is gone, drop our local ByoriDBClient too
-    // so the UI connection state matches server state.
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriError> {
-    let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
-
-    let result = client.get_spaces().await;
-
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError> {
-    let mut guard = state.client.lock().await;
-    let client = guard.as_mut().ok_or_else(|| {
-        TauriError::from(ClientError::NotConnected)
-    })?;
-
-    let result = client.get_schema().await;
-
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn test_connection(host: String, port: u32) -> Result<bool, TauriError> {
-    info!("Testing connection to {}:{}", host, port);
-    client_test_connection(&host, port).await.map_err(Into::into)
+    dialog
+        .save_file()
+        .await
+        .map(|f| f.path().to_string_lossy().to_string())
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("byoridb_studio=debug".parse().unwrap()),
-        )
+        .with_env_filter("byoridb_studio=info")
         .init();
-
+    let service = tauri::async_runtime::block_on(StudioService::start(None))
+        .expect("Studio 편집 서비스를 시작할 수 없습니다");
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .manage(AppState {
-            client: Arc::new(Mutex::new(None)),
+        .setup(|app| {
+            let demo = app.path().resource_dir()?.join("demo");
+            if demo.is_dir() {
+                std::env::set_var("BYORI_STUDIO_DEMO_DIR", demo);
+            }
+            Ok(())
         })
+        .manage(service.connection.clone())
+        .manage(service)
         .invoke_handler(tauri::generate_handler![
-            connect,
-            disconnect,
-            execute_query,
-            get_spaces,
-            get_schema,
-            test_connection,
+            studio_connection,
+            studio_open_files,
+            studio_save_file
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("Studio 실행 오류");
 }

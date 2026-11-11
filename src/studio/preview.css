@@ -1,0 +1,29 @@
+.preview-mode {
+  margin-left: auto;
+  margin-right: 10px;
+  max-width: 112px;
+  color: var(--text, #f0f2f5);
+  border: 1px solid #41464f;
+  border-radius: 4px;
+  background: #292c31;
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 5px;
+}
+.preview-mode:focus-visible {
+  outline: 2px solid #37d7cb;
+  outline-offset: 2px;
+}
+
+.preview-draft-badge {
+  color: #a7adb7;
+  font-size: 10px;
+  white-space: nowrap;
+  margin-right: 8px;
+}
+.preview-playback-error {
+  padding: 4px 12px;
+  color: var(--text, #f0f2f5);
+  font-size: 11px;
+  line-height: 1.5;
+}

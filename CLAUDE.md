@@ -1,59 +1,53 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Current Work
 
-For the active punch list of next tasks (priorities, acceptance criteria, status), see [NEXT.md](./NEXT.md). Check this at the start of any new work session.
+Byori Studio is now a local video editor using CapCut Desktop's workspace pattern.
+Preserve the name and the broad target in ROADMAP.md; do not represent remaining
+advanced, cloud or generative features as implemented. NEXT.md is the active backlog.
 
-## Build and Development Commands
+## Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Run in development mode (starts both Vite dev server and Tauri)
-npm run tauri dev
-
-# Build for production
-npm run tauri build
-
-# Frontend only (without Tauri)
-npm run dev          # Start Vite dev server on port 1420
-npm run build        # TypeScript check + Vite build
-
-# Tests
-npm test             # Run frontend tests (Vitest, jsdom)
-npm run coverage     # Frontend coverage (v8 provider, html + text reporters)
+npm run studio                       # Vite + standalone local Rust service
+npm run tauri dev                    # native macOS window + service
+npm run build                        # TypeScript + Vite
+npm test
+npm run test:core
+python3 -m unittest discover -s scripts -p 'test_*.py'
+npm run tauri build -- --bundles app
 ```
 
-For Rust backend changes in `src-tauri/`:
-```bash
-cd src-tauri && cargo build    # Build Rust code
-cd src-tauri && cargo check    # Fast type checking
-cd src-tauri && cargo test     # Run Rust unit tests
-```
+FFmpeg/ffprobe and Python 3 are required for media/MCP. Whisper is optional for
+automatic captions; macOS say supplies TTS. Reuse installed CLI authentication;
+never replace a user's global Claude/Codex/Gemini settings. See README.md.
 
-## Architecture
+## Active Architecture
 
-ByoriDB Studio is a Tauri 2 desktop application for managing ByoriDB (a distributed graph database).
+- `src/App.tsx`, `src/studio/`: workspace, library, player, inspector, timeline,
+  agent/memory panel, export and runtime settings.
+- `src-tauri/src/editor.rs`: authoritative project, validated commands, revision,
+  transactional batches, undo/redo and persistent autosave.
+- `media.rs`, `render.rs`: probing, thumbnails, waveforms and FFmpeg rendering.
+- `service.rs`: loopback RPC/upload/assets, origin and bearer-token checks.
+- `runtime.rs`: ByoriDB setup/memory and CLI provider processes.
+- `speech.rs`: cancellable Whisper and system TTS jobs.
+- `main.rs`: native shell/file dialogs; `bin/studio-service.rs`: browser dev service.
+- `scripts/studio-mcp.py`: project-scoped tools shared by the three CLI providers.
 
-**Frontend (React/TypeScript)**
-- `src/App.tsx` - Main component managing connection state, query execution, and space selection
-- `src/components/` - UI components (ConnectionModal, ServerSettings, QueryEditor, ResultPanel, Sidebar)
-- Uses Tauri's `invoke()` to call Rust backend commands
+UI, CLI and MCP must share the same editor state and validated command path.
+Pass expectedRevision for edits; reject stale asynchronous results. Keep user
+media untouched, cancellation explicit, and preview/export output consistent.
+The app stores projects in `~/.byori-studio`; automated integration tests must use
+isolated BYORI_STUDIO_HOME/port, never a user's current project. See IMPLEMENTATION.md.
+Legacy DB browser components and `client.rs` remain as historical source.
 
-**Backend (Rust/Tauri)**
-- `src-tauri/src/main.rs` - Tauri commands exposed to frontend: `connect`, `disconnect`, `execute_query`, `get_spaces`, `get_schema`
-- `src-tauri/src/client.rs` - ByoriDB HTTP API client. Pure parsing helpers (`parse_query_response`, `parse_names`, `parse_spaces`) are extracted for unit testing.
-- State management via `AppState` with `Arc<Mutex<Option<ByoriDBClient>>>`
+## Historical DB Explorer Reference
 
-**Communication Pattern**
-Frontend calls backend via `invoke("command_name", { params })` which maps to `#[tauri::command]` functions.
-
-**Testing**
-- Frontend: Vitest + Testing Library + jsdom. Setup at `src/test/setup.ts`. Tests are co-located next to components (`*.test.tsx`).
-- Backend: `cargo test` runs `#[cfg(test)] mod tests` in `client.rs`. Async tests use `#[tokio::test]`.
+The following material predates the product pivot. It is not the active UI or
+runtime contract. In particular, current ByoriDB session IDs may be decimal strings;
+`runtime.rs` handles the actual current API. Do not copy the old numeric-only assumption.
 
 ## ByoriDB Server (../byoridb)
 

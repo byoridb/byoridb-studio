@@ -1,10 +1,13 @@
 {
-  "name": "byoridb-studio",
+  "name": "byori-studio",
   "version": "0.1.0",
-  "description": "ByoriDB Studio - Desktop management tool for ByoriDB",
+  "description": "Byori Studio - Video editing with creative memory and CLI agents",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "studio": "node scripts/dev.mjs",
+    "service": "cargo run --manifest-path src-tauri/Cargo.toml --bin studio-service",
+    "test:core": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "build": "tsc && vite build",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
@@ -12,7 +15,7 @@
     "tauri": "tauri"
   },
   "keywords": [
-    "graph-database",
+    "video-editor",
     "byoridb",
     "studio"
   ],
@@ -20,6 +23,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",
+    "lucide-react": "^1.66.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },

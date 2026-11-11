@@ -3,13 +3,14 @@
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('method', help='RPC operation, e.g. project.get, edit.split, export.start')
 parser.add_argument('params', nargs='?', default='{}', help='JSON parameters or - to read stdin')
-parser.add_argument('--connection', type=Path, default=Path.home() / '.byori-studio/connection.json')
+parser.add_argument('--connection', type=Path, default=Path(os.environ.get('BYORI_STUDIO_HOME', '~/.byori-studio')).expanduser() / 'connection.json')
 args = parser.parse_args()
 spec = importlib.util.spec_from_file_location('studio_mcp', Path(__file__).with_name('studio-mcp.py'))
 module = importlib.util.module_from_spec(spec)

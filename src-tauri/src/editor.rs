@@ -10,7 +10,38 @@ pub struct Editor {
     redo: Vec<Value>,
     jobs: render::RenderJobs,
     preview_assets: HashMap<String, PathBuf>,
+    notice: Option<String>,
+    file_path: Option<PathBuf>,
 }
+
+pub const SCHEMA_VERSION: u64 = 2;
+const FILTERS: &[&str] = &["none", "cinematic", "warm", "cool", "mono", "vintage"];
+const CLIP_FIELDS: &[&str] = &[
+    "name",
+    "trackId",
+    "mediaId",
+    "start",
+    "duration",
+    "sourceIn",
+    "speed",
+    "reverse",
+    "volume",
+    "fadeIn",
+    "fadeOut",
+    "transform",
+    "color",
+    "text",
+    "filter",
+    "transitionIn",
+    "transitionOut",
+    "keyframes",
+    "crop",
+    "mask",
+    "chromaKey",
+    "audio",
+    "stabilize",
+    "groupId",
+];
 
 pub fn number(v: &Value, key: &str, fallback: f64) -> f64 {
     v.get(key).and_then(Value::as_f64).unwrap_or(fallback)
@@ -20,7 +51,7 @@ pub fn string<'a>(v: &'a Value, key: &str, fallback: &'a str) -> &'a str {
 }
 
 pub fn empty_project(name: &str, width: u64, height: u64, fps: f64) -> Value {
-    json!({"id":media::id("project"),"name":name,"revision":0,"width":width,"height":height,
+    json!({"id":media::id("project"),"schemaVersion":SCHEMA_VERSION,"name":name,"revision":0,"width":width,"height":height,
         "fps":fps,"background":"#111111","media":[],"clips":[],"markers":[],"notes":[],
         "concept":{"audience":"","message":"","appeal":"","direction":""},
         "tracks":[{"id":"video-1","name":"영상 1","kind":"video","muted":false,"hidden":false,"locked":false},
@@ -37,30 +68,319 @@ fn safe_project_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn load_project(path: &Path) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut project: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    migrate_project(&mut project)?;
+    validate_project(&project)?;
+    Ok(project)
+}
+
+fn recent_valid_project(root: &Path) -> Option<Value> {
+    std::fs::read_dir(root.join("projects"))
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter_map(|entry| load_project(&entry.path()).ok())
+        .max_by_key(|p| p["updatedAt"].as_u64().unwrap_or(0))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(from)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Upgrades a stored project in place to the current schema. Files written
+/// before schemaVersion existed are version 1.
+pub fn migrate_project(p: &mut Value) -> Result<(), String> {
+    if !p.is_object() {
+        return Err("프로젝트 파일 형식이 올바르지 않습니다.".into());
+    }
+    let version = match p.get("schemaVersion") {
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .filter(|v| *v >= 1)
+            .ok_or("프로젝트 버전 정보가 올바르지 않습니다.")?,
+    };
+    if version > SCHEMA_VERSION {
+        return Err("더 새로운 버전의 Byori Studio에서 만든 프로젝트입니다. 앱을 업데이트한 뒤 열어 주세요.".into());
+    }
+    if version < 2 {
+        migrate_v1(p);
+    }
+    p["schemaVersion"] = json!(SCHEMA_VERSION);
+    Ok(())
+}
+
+// Older UI builds sent their own filter ids; map them to the built-in ones.
+fn legacy_filter(filter: &Value) -> &'static str {
+    match filter.as_str().unwrap_or("") {
+        "cinema" => "cinematic",
+        id => FILTERS.iter().find(|f| **f == id).copied().unwrap_or("none"),
+    }
+}
+
+// Cuts a display name to the size short_text accepts, on a character boundary.
+fn shorten(name: &mut Value) {
+    if let Some(text) = name.as_str().filter(|s| s.len() > 1000) {
+        let mut end = 1000;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        *name = json!(text[..end]);
+    }
+}
+
+// v1 files were never checked for filter ids, transitions, markers or notes, and
+// older builds omitted some clip defaults. Repair what has an obvious meaning.
+fn migrate_v1(p: &mut Value) {
+    for key in ["markers", "notes"] {
+        if !p[key].is_array() {
+            p[key] = json!([]);
+        }
+    }
+    if !p["concept"].is_object() {
+        p["concept"] = json!({"audience":"","message":"","appeal":"","direction":""});
+    }
+    let markers = p["markers"].as_array_mut().unwrap();
+    markers.retain(|m| {
+        m.is_object()
+            && m["time"]
+                .as_f64()
+                .is_some_and(|t| (0.0..=86400.0).contains(&t))
+    });
+    for marker in markers {
+        if marker["id"].as_str().is_none_or(|id| id.is_empty()) {
+            marker["id"] = json!(media::id("marker"));
+        }
+        if !marker["label"].is_string() {
+            marker["label"] = json!("마커");
+        }
+        shorten(&mut marker["label"]);
+    }
+    p["notes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|note| note["body"].is_string());
+    for track in p["tracks"].as_array_mut().into_iter().flatten() {
+        if !track.is_object() {
+            continue;
+        }
+        for flag in ["muted", "hidden", "locked"] {
+            if !track[flag].is_boolean() {
+                track[flag] = json!(false);
+            }
+        }
+        if !track["name"].is_string() {
+            track["name"] = track["kind"].clone();
+        }
+        shorten(&mut track["name"]);
+    }
+    for clip in p["clips"].as_array_mut().into_iter().flatten() {
+        if !clip.is_object() {
+            continue;
+        }
+        let defaults = default_clip("", "클립", "", 0.0, 0.0);
+        for field in ["sourceIn", "speed", "volume", "fadeIn", "fadeOut"] {
+            if !clip[field].is_number() {
+                clip[field] = defaults[field].clone();
+            }
+        }
+        if !clip["reverse"].is_boolean() {
+            clip["reverse"] = json!(false);
+        }
+        if !clip["name"].is_string() {
+            clip["name"] = defaults["name"].clone();
+        }
+        shorten(&mut clip["name"]);
+        if !clip["keyframes"].is_array() {
+            clip["keyframes"] = json!([]);
+        }
+        for group in ["transform", "color"] {
+            if !clip[group].is_object() {
+                clip[group] = json!({});
+            }
+            for (key, value) in defaults[group].as_object().unwrap() {
+                if !clip[group][key].is_number() {
+                    clip[group][key] = value.clone();
+                }
+            }
+        }
+        // The UI used to store its own filter ids next to the colour values.
+        if let Some(filter) = clip.get_mut("filter") {
+            *filter = json!(legacy_filter(filter));
+        }
+        for transition in ["transitionIn", "transitionOut"] {
+            if clip.get(transition).is_some() && clip[transition]["type"] != "fade" {
+                clip[transition] = Value::Null;
+            }
+        }
+        fit_clip_fades(clip);
+    }
+}
+
 impl Editor {
     pub fn new(root: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(root.join("projects")).map_err(|e| e.to_string())?;
         let root = root.canonicalize().map_err(|e| e.to_string())?;
         let current = root.join("current.json");
-        let project = if current.is_file() {
-            let project: Value =
-                serde_json::from_slice(&std::fs::read(&current).map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("저장된 프로젝트를 읽을 수 없습니다: {e}"))?;
-            validate_project(&project)?;
-            project
-        } else {
-            empty_project("새 프로젝트", 1920, 1080, 30.0)
+        let mut notice = None;
+        let project = match load_project(&current) {
+            Ok(project) => project,
+            Err(_) if std::fs::symlink_metadata(&current).is_err() => {
+                empty_project("새 프로젝트", 1920, 1080, 30.0)
+            }
+            Err(error) => {
+                // Never start from, or silently discard, an unreadable autosave.
+                let kept = format!("current.json.corrupt-{}", media::now());
+                let kept = match std::fs::rename(&current, root.join(&kept)) {
+                    Ok(()) => format!("읽지 못한 파일은 {kept}(으)로 보관했습니다."),
+                    Err(e) => format!("읽지 못한 파일을 보관하지 못했습니다: {e}"),
+                };
+                let recovered = recent_valid_project(&root);
+                notice = Some(match &recovered {
+                    Some(p) => format!(
+                        "저장된 작업을 읽지 못해 가장 최근 프로젝트 '{}'(으)로 복구했습니다. {kept} ({error})",
+                        string(p, "name", "")
+                    ),
+                    None => format!(
+                        "저장된 작업을 읽지 못해 새 프로젝트로 시작했습니다. {kept} ({error})"
+                    ),
+                });
+                recovered.unwrap_or_else(|| empty_project("새 프로젝트", 1920, 1080, 30.0))
+            }
         };
-        let editor = Self {
+        let mut editor = Self {
             root,
             project,
             undo: vec![],
             redo: vec![],
             jobs: render::RenderJobs::default(),
             preview_assets: HashMap::new(),
+            notice,
+            file_path: None,
         };
         editor.persist()?;
+        editor.refresh_missing();
         Ok(editor)
+    }
+
+    /// Flags media whose source file is gone. Derived state: no revision change.
+    fn refresh_missing(&mut self) -> bool {
+        let mut changed = false;
+        for item in self.project["media"].as_array_mut().into_iter().flatten() {
+            let missing = !Path::new(string(item, "path", "")).is_file();
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            if missing != (object.get("missing") == Some(&json!(true))) {
+                changed = true;
+            }
+            if missing {
+                object.insert("missing".into(), json!(true));
+            } else {
+                object.remove("missing");
+            }
+        }
+        changed
+    }
+
+    fn project_file(&self, id: &str) -> PathBuf {
+        self.root.join("projects").join(format!("{id}.json"))
+    }
+
+    fn assets_dir(&self, id: &str) -> PathBuf {
+        self.root.join("projects").join(format!("{id}-assets"))
+    }
+
+    fn stored_project(&self, params: &Value) -> Result<(String, Value), String> {
+        let id = string(params, "id", "");
+        if !safe_project_id(id) {
+            return Err("프로젝트를 선택해 주세요.".into());
+        }
+        if self.project["id"] == id {
+            return Ok((id.to_owned(), self.project.clone()));
+        }
+        let bytes = std::fs::read(self.project_file(id))
+            .map_err(|_| "프로젝트를 찾을 수 없습니다.".to_string())?;
+        let mut project: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("프로젝트 파일을 읽을 수 없습니다: {e}"))?;
+        migrate_project(&mut project)?;
+        Ok((id.to_owned(), project))
+    }
+
+    fn list_projects(&self) -> Result<Value, String> {
+        let mut list = vec![];
+        for entry in std::fs::read_dir(self.root.join("projects"))
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                if let Ok(p) = serde_json::from_slice::<Value>(&bytes) {
+                    list.push(json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]}));
+                }
+            }
+        }
+        list.sort_by_key(|p| std::cmp::Reverse(p["updatedAt"].as_u64().unwrap_or(0)));
+        Ok(json!(list))
+    }
+
+    /// App state lives in the store; its `exports` folder is ordinary output space
+    /// (it is where agents are told to write).
+    fn in_store(&self, path: &Path) -> bool {
+        // The target and some of its folders may not exist yet.
+        let path = path
+            .ancestors()
+            .find_map(|base| {
+                let resolved = base.canonicalize().ok()?;
+                Some(resolved.join(path.strip_prefix(base).ok()?))
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+        path.starts_with(&self.root) && !path.starts_with(self.root.join("exports"))
+    }
+
+    /// Files written on request must never replace app state or source assets.
+    fn guard_output(&self, path: &Path, params: &Value, known: bool) -> Result<(), String> {
+        if self.in_store(path) {
+            return Err("앱 저장소 안에는 저장할 수 없습니다. 다른 위치를 선택해 주세요.".into());
+        }
+        let media = self.project["media"].as_array().into_iter().flatten();
+        let clips = self.project["clips"].as_array().into_iter().flatten();
+        let mut sources = media.filter_map(|m| m["path"].as_str()).chain(
+            clips
+                .flat_map(|c| {
+                    [
+                        c["text"]["fontPath"].as_str(),
+                        c["color"]["lut"]["path"].as_str(),
+                    ]
+                })
+                .flatten(),
+        );
+        if sources.any(|source| media::same_path(Path::new(source), path)) {
+            return Err("원본 미디어·글꼴·LUT 파일은 덮어쓸 수 없습니다.".into());
+        }
+        if !known && params["overwrite"] != true && std::fs::symlink_metadata(path).is_ok() {
+            return Err(
+                "같은 이름의 파일이 이미 있습니다. 덮어쓰려면 확인이 필요합니다. (FILE_EXISTS)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn asset_path(&self, id: &str, thumbnail: bool) -> Option<PathBuf> {
@@ -148,6 +468,7 @@ impl Editor {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.refresh_missing();
         Ok(self.project.clone())
     }
 
@@ -162,32 +483,88 @@ impl Editor {
         }
         self.undo.clear();
         self.redo.clear();
+        self.file_path = None;
+        self.refresh_missing();
         Ok(self.project.clone())
     }
 
     pub async fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.expected(&params)?;
         match method {
-            "project.get" => Ok(self.project.clone()),
-            "project.list" => {
-                let mut list = vec![];
-                for entry in std::fs::read_dir(self.root.join("projects"))
-                    .map_err(|e| e.to_string())?
-                    .flatten()
+            "project.get" => {
+                let changed = self.refresh_missing();
+                if !changed
+                    && params["ifProjectId"].as_str() == self.project["id"].as_str()
+                    && params.get("ifRevision").is_some()
+                    && params["ifRevision"].as_u64() == self.project["revision"].as_u64()
                 {
-                    if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
-                        continue;
-                    }
-                    if let Ok(bytes) = std::fs::read(entry.path()) {
-                        if let Ok(p) = serde_json::from_slice::<Value>(&bytes) {
-                            list.push(
-                                json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]}),
-                            );
+                    let missing: Vec<&Value> = self.project["media"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| m["missing"] == true)
+                        .map(|m| &m["id"])
+                        .collect();
+                    return Ok(
+                        json!({"unchanged":true,"id":self.project["id"],"revision":self.project["revision"],"missing":missing}),
+                    );
+                }
+                Ok(self.project.clone())
+            }
+            "project.list" => self.list_projects(),
+            "project.notice" => Ok(json!({"notice":self.notice})),
+            "project.noticeDismiss" => {
+                self.notice = None;
+                Ok(json!({"notice":null}))
+            }
+            "project.delete" => {
+                let id = string(&params, "id", "");
+                if !safe_project_id(id) {
+                    return Err("프로젝트를 선택해 주세요.".into());
+                }
+                if self.project["id"] == id {
+                    return Err("열려 있는 프로젝트는 삭제할 수 없습니다. 다른 프로젝트를 연 뒤 삭제해 주세요.".into());
+                }
+                std::fs::remove_file(self.project_file(id))
+                    .map_err(|_| "프로젝트를 찾을 수 없습니다.".to_string())?;
+                let _ = std::fs::remove_dir_all(self.assets_dir(id));
+                self.list_projects()
+            }
+            "project.duplicate" => {
+                let (id, mut p) = self.stored_project(&params)?;
+                let new_id = media::id("project");
+                p["id"] = json!(new_id);
+                p["name"] = json!(format!("{} 사본", string(&p, "name", "프로젝트")));
+                p["revision"] = json!(0);
+                p["updatedAt"] = json!(media::now());
+                let (from, to) = (self.assets_dir(&id), self.assets_dir(&new_id));
+                for clip in p["clips"].as_array_mut().into_iter().flatten() {
+                    if let Some(path) = clip.pointer_mut("/color/lut/path") {
+                        if let Some(rest) = path
+                            .as_str()
+                            .and_then(|s| Path::new(s).strip_prefix(&from).ok())
+                        {
+                            *path = json!(to.join(rest));
                         }
                     }
                 }
-                list.sort_by_key(|p| std::cmp::Reverse(p["updatedAt"].as_u64().unwrap_or(0)));
-                Ok(json!(list))
+                validate_project(&p)?;
+                if from.is_dir() {
+                    copy_dir(&from, &to)?;
+                }
+                media::atomic_json(&self.project_file(&new_id), &p)?;
+                Ok(json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]}))
+            }
+            "project.rename" => {
+                let (id, mut p) = self.stored_project(&params)?;
+                p["name"] = json!(required(&params, "name")?.trim());
+                if self.project["id"] == id.as_str() {
+                    self.commit(p)?;
+                } else {
+                    validate_project(&p)?;
+                    media::atomic_json(&self.project_file(&id), &p)?;
+                }
+                self.list_projects()
             }
             "project.new" => {
                 let p = empty_project(
@@ -206,12 +583,13 @@ impl Editor {
                     if !safe_project_id(id) {
                         return Err("프로젝트를 선택해 주세요.".into());
                     }
-                    self.root.join("projects").join(format!("{id}.json"))
+                    self.project_file(id)
                 };
                 let mut p: Value = serde_json::from_slice(
                     &std::fs::read(&path).map_err(|e| format!("프로젝트 열기 실패: {e}"))?,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("프로젝트 파일을 읽을 수 없습니다: {e}"))?;
+                migrate_project(&mut p)?;
                 // Portable project files may keep paths relative to themselves.
                 if let Some(items) = p["media"].as_array_mut() {
                     for item in items {
@@ -244,27 +622,24 @@ impl Editor {
                         }
                     }
                 }
-                self.replace(p)
+                let opened = self.replace(p)?;
+                if params["path"].is_string() && !self.in_store(&path) {
+                    self.file_path = Some(path);
+                }
+                Ok(opened)
             }
             "project.save" => {
                 self.persist()?;
-                let path = params["path"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        self.root
-                            .join("projects")
-                            .join(format!("{}.json", self.project["id"].as_str().unwrap()))
-                    });
-                if self.project["media"].as_array().unwrap().iter().any(|m| {
-                    m["path"]
-                        .as_str()
-                        .map(|p| media::same_path(Path::new(p), &path))
-                        .unwrap_or(false)
-                }) {
-                    return Err("원본 미디어 위에 프로젝트를 저장할 수 없습니다.".into());
-                }
+                let explicit = params["path"].as_str().map(PathBuf::from);
+                let Some(path) = explicit.or_else(|| self.file_path.clone()) else {
+                    let path = self.project_file(string(&self.project, "id", ""));
+                    return Ok(json!({"path":path,"project":self.project}));
+                };
+                // The file this project was opened from or last saved to is ours to update.
+                let known = self.file_path.as_deref() == Some(path.as_path());
+                self.guard_output(&path, &params, known)?;
                 media::atomic_json(&path, &self.project)?;
+                self.file_path = Some(path.clone());
                 Ok(json!({"path":path,"project":self.project}))
             }
             "project.update" => {
@@ -359,6 +734,10 @@ impl Editor {
                 {
                     return Err("프로젝트·목록·원본 파일을 프리셋으로 덮어쓸 수 없습니다.".into());
                 }
+                // Agents always send overwrite:false; the UI picks the path in a save dialog.
+                if params["overwrite"] == false && std::fs::symlink_metadata(path).is_ok() {
+                    return Err("같은 이름의 파일이 이미 있습니다. (FILE_EXISTS)".into());
+                }
                 catalog::export_preset(&self.root, required(&params, "id")?, path)
             }
             "presets.apply" => {
@@ -374,7 +753,7 @@ impl Editor {
                 if (clip["kind"] == "audio") != (preset["target"] == "audio") {
                     return Err("프리셋과 클립 종류가 맞지 않습니다. 영상용 또는 오디오용 프리셋을 선택해 주세요.".into());
                 }
-                let mut patch = preset["patch"].clone();
+                let mut patch = preset_patch(&preset);
                 let ratio = number(clip, "duration", 1.0) / number(&preset, "sourceDuration", 1.0);
                 if let Some(frames) = patch.get_mut("keyframes").and_then(Value::as_array_mut) {
                     for frame in frames {
@@ -500,6 +879,40 @@ impl Editor {
                 }
                 self.commit(p)
             }
+            "media.relink" => {
+                let id = required(&params, "id")?;
+                let asset = media::probe(Path::new(required(&params, "path")?), &self.root).await?;
+                let mut p = self.project.clone();
+                if p["media"].as_array().unwrap().iter().any(|m| {
+                    m["id"] != id
+                        && media::same_path(
+                            Path::new(string(m, "path", "")),
+                            Path::new(string(&asset, "path", "")),
+                        )
+                }) {
+                    return Err("이미 프로젝트에 있는 소재 파일입니다.".into());
+                }
+                // Only media.reprobe may turn a mislabelled video into audio.
+                if p["media"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["id"] == id && m["kind"] != asset["kind"])
+                {
+                    return Err("소재 종류가 다릅니다. 같은 종류의 파일을 선택해 주세요.".into());
+                }
+                let path = asset["path"].clone();
+                refresh_media_metadata(&mut p, id, asset)?;
+                let item = p["media"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|m| m["id"] == id)
+                    .unwrap();
+                item["path"] = path;
+                item.as_object_mut().unwrap().remove("missing");
+                self.commit(p)
+            }
             "media.remove" => {
                 let id = required(&params, "id")?;
                 if self.project["clips"]
@@ -553,6 +966,7 @@ impl Editor {
                 } else {
                     self.undo.push(before)
                 };
+                self.refresh_missing();
                 Ok(self.project.clone())
             }
             "edit.batch" => {
@@ -619,14 +1033,7 @@ impl Editor {
             }
             "captions.export" => {
                 let path = PathBuf::from(required(&params, "path")?);
-                if self.project["media"].as_array().unwrap().iter().any(|m| {
-                    m["path"]
-                        .as_str()
-                        .map(|p| media::same_path(Path::new(p), &path))
-                        .unwrap_or(false)
-                }) {
-                    return Err("원본 미디어를 덮어쓸 수 없습니다.".into());
-                }
+                self.guard_output(&path, &params, false)?;
                 let mut clips: Vec<&Value> = self.project["clips"]
                     .as_array()
                     .unwrap()
@@ -651,7 +1058,13 @@ impl Editor {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                std::fs::write(&path, content).map_err(|e| e.to_string())?;
+                let temporary = path.with_extension(format!("tmp-{}", media::id("srt")));
+                std::fs::write(&temporary, content)
+                    .and_then(|_| std::fs::rename(&temporary, &path))
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&temporary);
+                        format!("자막 파일 저장 실패: {e}")
+                    })?;
                 Ok(json!({"path":path}))
             }
             _ => Err(format!("지원하지 않는 편집 명령입니다: {method}")),
@@ -868,8 +1281,17 @@ pub(crate) fn validate_preset(preset: &Value) -> Result<(), String> {
     mutate(
         &mut project,
         "edit.update",
-        &json!({"id":"preset-validation","patch":preset["patch"]}),
+        &json!({"id":"preset-validation","patch":preset_patch(preset)}),
     )
+}
+
+// Presets saved by older builds may carry a legacy filter id.
+fn preset_patch(preset: &Value) -> Value {
+    let mut patch = preset["patch"].clone();
+    if let Some(filter) = patch.get_mut("filter") {
+        *filter = json!(legacy_filter(filter));
+    }
+    patch
 }
 
 pub fn keyframe_property(property: &str) -> &str {
@@ -974,12 +1396,36 @@ fn trim_keyframes(clip: &Value, start: f64, duration: f64) -> Value {
 fn fit_clip_fades(clip: &mut Value) {
     let duration = number(clip, "duration", 0.0);
     for (fade, transition) in [("fadeIn", "transitionIn"), ("fadeOut", "transitionOut")] {
-        let length = number(clip, fade, 0.0).min(duration);
-        clip[fade] = json!(length);
-        if clip[transition]["type"] == "fade" {
-            clip[transition]["duration"] = json!(length);
-        }
+        clip[fade] = json!(number(clip, fade, 0.0).min(duration));
+        sync_transition(clip, fade, transition);
     }
+}
+
+// fadeIn/fadeOut are what the renderer reads; a fade transition object mirrors them.
+fn sync_transition(clip: &mut Value, fade: &str, transition: &str) {
+    if clip.get(transition).is_some_and(|t| t["type"] == "fade") {
+        let length = number(clip, fade, 0.0);
+        clip[transition] = if length > 0.0 {
+            json!({"type":"fade","duration":length})
+        } else {
+            Value::Null
+        };
+    }
+}
+
+fn filter_color(filter: &str) -> Option<Value> {
+    let (brightness, contrast, saturation, temperature) = match filter {
+        "none" => (0.0, 1.0, 1.0, 0.0),
+        "cinematic" => (-0.02, 1.15, 0.85, 0.0),
+        "warm" => (0.02, 1.03, 1.05, 0.5),
+        "cool" => (0.0, 1.05, 0.95, -0.5),
+        "mono" => (0.0, 1.1, 0.0, 0.0),
+        "vintage" => (0.03, 0.9, 0.75, 0.3),
+        _ => return None,
+    };
+    Some(
+        json!({"brightness":brightness,"contrast":contrast,"saturation":saturation,"temperature":temperature}),
+    )
 }
 
 fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
@@ -1074,6 +1520,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                     merge(&mut clip["text"], &args["text"]);
                 }
                 clip["name"] = clip["text"]["content"].clone();
+                shorten(&mut clip["name"]);
                 clip["transform"]["y"] = json!(number(p, "height", 1080.0) * 0.32);
             }
             if let Some(source) = args.get("sourceIn") {
@@ -1098,34 +1545,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 ensure_unlocked(p, track)?;
             }
             for (key, value) in patch {
-                if ![
-                    "name",
-                    "trackId",
-                    "mediaId",
-                    "start",
-                    "duration",
-                    "sourceIn",
-                    "speed",
-                    "reverse",
-                    "volume",
-                    "fadeIn",
-                    "fadeOut",
-                    "transform",
-                    "color",
-                    "text",
-                    "filter",
-                    "transitionIn",
-                    "transitionOut",
-                    "keyframes",
-                    "crop",
-                    "mask",
-                    "chromaKey",
-                    "audio",
-                    "stabilize",
-                    "groupId",
-                ]
-                .contains(&key.as_str())
-                {
+                if !CLIP_FIELDS.contains(&key.as_str()) {
                     return Err(format!("클립 속성을 변경할 수 없습니다: {key}"));
                 }
                 merge(&mut p["clips"][index][key], value);
@@ -1142,29 +1562,11 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                     }
                 }
             }
+            // A filter sets only the basic grade; hue, HSL, curves and LUT stay.
             if patch.contains_key("filter") && !patch.contains_key("color") {
-                let color = match string(&p["clips"][index], "filter", "none") {
-                    "none" => {
-                        json!({"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0})
-                    }
-                    "cinematic" => {
-                        json!({"brightness":-0.02,"contrast":1.15,"saturation":0.85,"temperature":0.0})
-                    }
-                    "warm" => {
-                        json!({"brightness":0.02,"contrast":1.03,"saturation":1.05,"temperature":0.5})
-                    }
-                    "cool" => {
-                        json!({"brightness":0.0,"contrast":1.05,"saturation":0.95,"temperature":-0.5})
-                    }
-                    "mono" => {
-                        json!({"brightness":0.0,"contrast":1.1,"saturation":0.0,"temperature":0.0})
-                    }
-                    "vintage" => {
-                        json!({"brightness":0.03,"contrast":0.9,"saturation":0.75,"temperature":0.3})
-                    }
-                    _ => return Err("지원하지 않는 필터 프리셋입니다.".into()),
-                };
-                p["clips"][index]["color"] = color;
+                let color = filter_color(string(&p["clips"][index], "filter", "none"))
+                    .ok_or("지원하지 않는 필터 프리셋입니다.")?;
+                merge(&mut p["clips"][index]["color"], &color);
             }
             for (transition, fade) in [("transitionIn", "fadeIn"), ("transitionOut", "fadeOut")] {
                 if let Some(value) = patch.get(transition) {
@@ -1176,6 +1578,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                         return Err("현재 전환은 fade 형식만 지원합니다. fadeIn/fadeOut으로 길이를 지정할 수도 있습니다.".into());
                     }
                 }
+                sync_transition(&mut p["clips"][index], fade, transition);
             }
             if patch.contains_key("speed") && !patch.contains_key("duration") {
                 let speed = number(&p["clips"][index], "speed", 1.0);
@@ -1199,11 +1602,15 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                     p["clips"][index]["keyframes"] = left;
                 }
             }
+            if patch.contains_key("speed") || patch.contains_key("duration") {
+                fit_clip_fades(&mut p["clips"][index]);
+            }
             if patch.contains_key("text")
                 && p["clips"][index]["kind"] == "text"
                 && !patch.contains_key("name")
             {
                 p["clips"][index]["name"] = p["clips"][index]["text"]["content"].clone();
+                shorten(&mut p["clips"][index]["name"]);
             }
         }
         "edit.trim" => {
@@ -1463,6 +1870,108 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 json!({"id":media::id("marker"),"time":time,"label":string(args,"label","마커")}),
             );
         }
+        "edit.markerUpdate" => {
+            let id = required(args, "id")?;
+            let marker = p["markers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|m| m["id"] == id)
+                .ok_or("마커를 찾을 수 없습니다.")?;
+            for key in ["time", "label"] {
+                if let Some(value) = args.get(key) {
+                    marker[key] = value.clone();
+                }
+            }
+        }
+        "edit.markerDelete" => {
+            let id = required(args, "id")?;
+            let markers = p["markers"].as_array_mut().unwrap();
+            let count = markers.len();
+            markers.retain(|m| m["id"] != id);
+            if markers.len() == count {
+                return Err("마커를 찾을 수 없습니다.".into());
+            }
+        }
+        "edit.trackDelete" => {
+            let id = required(args, "id")?;
+            ensure_unlocked(p, id)?;
+            p["tracks"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| t["id"] != id);
+            p["clips"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|c| c["trackId"] != id);
+        }
+        "edit.trackMove" => {
+            let id = required(args, "id")?;
+            let tracks = p["tracks"].as_array_mut().unwrap();
+            let from = tracks
+                .iter()
+                .position(|t| t["id"] == id)
+                .ok_or("트랙을 찾을 수 없습니다.")?;
+            let index = args["index"]
+                .as_u64()
+                .filter(|index| (*index as usize) < tracks.len())
+                .ok_or("트랙을 옮길 위치가 올바르지 않습니다.")? as usize;
+            let track = tracks.remove(from);
+            tracks.insert(index, track);
+        }
+        "edit.paste" => {
+            let clips = args["clips"]
+                .as_array()
+                .filter(|clips| !clips.is_empty() && clips.len() <= 1000)
+                .ok_or("붙여넣을 클립 1~1,000개가 필요합니다.")?;
+            let at = args["at"]
+                .as_f64()
+                .filter(|at| at.is_finite() && *at >= 0.0)
+                .ok_or("붙여넣을 위치가 올바르지 않습니다.")?;
+            let earliest = clips
+                .iter()
+                .map(|c| number(c, "start", 0.0))
+                .fold(f64::INFINITY, f64::min);
+            let mut groups = HashMap::new();
+            for source in clips {
+                let fields = source
+                    .as_object()
+                    .ok_or("붙여넣을 클립 형식이 올바르지 않습니다.")?;
+                let mut clip = json!({});
+                for (key, value) in fields {
+                    if key == "kind" || CLIP_FIELDS.contains(&key.as_str()) {
+                        clip[key] = value.clone();
+                    }
+                }
+                let wanted = match string(&clip, "kind", "") {
+                    "text" => "text",
+                    "audio" => "audio",
+                    "video" | "image" => "video",
+                    _ => return Err("붙여넣을 클립 종류가 올바르지 않습니다.".into()),
+                };
+                let usable = |t: &&Value| t["kind"] == wanted && t["locked"] != true;
+                let tracks = p["tracks"].as_array().unwrap();
+                let track = tracks
+                    .iter()
+                    .filter(usable)
+                    .find(|t| t["id"] == clip["trackId"])
+                    .or_else(|| tracks.iter().find(usable))
+                    .ok_or(
+                        "붙여넣을 수 있는 트랙이 없습니다. 트랙을 추가하거나 잠금을 해제해 주세요.",
+                    )?;
+                clip["trackId"] = track["id"].clone();
+                clip["id"] = json!(media::id("clip"));
+                clip["start"] = json!(at + number(&clip, "start", 0.0) - earliest);
+                if let Some(group) = clip["groupId"].as_str() {
+                    let new = groups
+                        .entry(group.to_owned())
+                        .or_insert_with(|| media::id("group"))
+                        .clone();
+                    clip["groupId"] = json!(new);
+                }
+                p["clips"].as_array_mut().unwrap().push(clip);
+            }
+        }
         _ => return Err(format!("배치에서 지원하지 않는 편집 명령입니다: {method}")),
     }
     validate_project(p)
@@ -1610,6 +2119,12 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
     if name.len() > 1000 {
         return Err("프로젝트 이름이 너무 깁니다.".into());
     }
+    if p.get("schemaVersion").is_some_and(|v| {
+        !v.as_u64()
+            .is_some_and(|v| (1..=SCHEMA_VERSION).contains(&v))
+    }) {
+        return Err("지원하지 않는 프로젝트 버전입니다.".into());
+    }
     bounded(p, "width", 16.0, 8192.0)?;
     bounded(p, "height", 16.0, 8192.0)?;
     bounded(p, "fps", 1.0, 120.0)?;
@@ -1642,8 +2157,14 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
                 return Err(format!("트랙 {field} 값이 올바르지 않습니다."));
             }
         }
+        if !short_text(t.get("name")) {
+            return Err("트랙 이름이 올바르지 않습니다.".into());
+        }
     }
     for asset in assets {
+        if asset.get("missing").is_some_and(|v| !v.is_boolean()) {
+            return Err("소재 누락 표시 값이 올바르지 않습니다.".into());
+        }
         required(asset, "path")?;
         bounded(asset, "duration", 0.001, 86400.0)?;
         if !["video", "audio", "image"].contains(&string(asset, "kind", "")) {
@@ -1678,6 +2199,26 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
         bounded(c, "volume", 0.0, 4.0)?;
         bounded(c, "fadeIn", 0.0, 86400.0)?;
         bounded(c, "fadeOut", 0.0, 86400.0)?;
+        if !short_text(c.get("name")) {
+            return Err("클립 이름이 올바르지 않습니다.".into());
+        }
+        if c.get("reverse").is_some_and(|v| !v.is_boolean()) {
+            return Err("역재생 값은 true 또는 false여야 합니다.".into());
+        }
+        if let Some(filter) = c.get("filter").filter(|v| !v.is_null()) {
+            if !filter.as_str().is_some_and(|id| FILTERS.contains(&id)) {
+                return Err("지원하지 않는 필터 프리셋입니다.".into());
+            }
+        }
+        for field in ["transitionIn", "transitionOut"] {
+            if let Some(transition) = c.get(field).filter(|v| !v.is_null()) {
+                optional_fields(transition, &["type", "duration"], "transition")?;
+                if transition["type"] != "fade" {
+                    return Err("현재 전환은 fade 형식만 지원합니다.".into());
+                }
+                bounded(transition, "duration", 0.0, 86400.0)?;
+            }
+        }
         if kind != "text" {
             let m = assets
                 .iter()
@@ -1820,10 +2361,39 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
             bounded(k, "value", bounds.0, bounds.1)?;
         }
     }
-    if !p["notes"].is_array() || !p["markers"].is_array() || !p["concept"].is_object() {
+    let (Some(notes), Some(markers), true) = (
+        p["notes"].as_array(),
+        p["markers"].as_array(),
+        p["concept"].is_object(),
+    ) else {
         return Err("프로젝트 메모/마커/컨셉 형식이 올바르지 않습니다.".into());
+    };
+    if notes.len() > 10000 || markers.len() > 10000 {
+        return Err("프로젝트 크기 제한을 초과했습니다.".into());
+    }
+    let mut marker_ids = HashSet::new();
+    for marker in markers {
+        if !marker.is_object()
+            || !marker_ids.insert(required(marker, "id")?)
+            || !short_text(marker.get("label"))
+        {
+            return Err("마커 형식이 올바르지 않습니다.".into());
+        }
+        bounded(marker, "time", 0.0, 86400.0)?;
+    }
+    for note in notes {
+        if note["body"].as_str().is_none_or(|body| body.len() > 20000)
+            || note.get("id").is_some_and(|id| !id.is_string())
+        {
+            return Err("메모 형식이 올바르지 않습니다.".into());
+        }
     }
     Ok(())
+}
+
+// An optional display name: absent, or a string of bounded size.
+fn short_text(value: Option<&Value>) -> bool {
+    value.is_none_or(|v| v.as_str().is_some_and(|s| s.len() <= 1000))
 }
 
 fn optional_fields(value: &Value, allowed: &[&str], name: &str) -> Result<(), String> {
@@ -2060,7 +2630,13 @@ fn parse_timestamp(s: &str) -> Option<f64> {
     Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec)
 }
 fn parse_srt(content: &str) -> Result<Vec<(f64, f64, String)>, String> {
-    let normalized = content.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    // Lines holding only spaces still separate captions.
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(|line| if line.trim().is_empty() { "" } else { line })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut result = vec![];
     for block in normalized.split("\n\n") {
         let lines: Vec<_> = block.lines().collect();
@@ -2103,11 +2679,7 @@ mod tests {
         std::env::temp_dir().join(media::id("studio-editor-test"))
     }
 
-    fn misclassified_audio_editor() -> (Editor, PathBuf) {
-        let dir = temp();
-        let mut e = Editor::new(dir.clone()).unwrap();
-        let path = dir.join("music.wav");
-        let samples = 16_000u32;
+    fn write_wav(path: &Path, samples: u32) {
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
@@ -2122,7 +2694,14 @@ mod tests {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&(samples * 2).to_le_bytes());
         wav.resize(wav.len() + samples as usize * 2, 0);
-        std::fs::write(&path, wav).unwrap();
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn misclassified_audio_editor() -> (Editor, PathBuf) {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let path = dir.join("music.wav");
+        write_wav(&path, 16_000);
         e.project["media"] = json!([{"id":"old-audio","name":"내 음악","path":path,"kind":"video","duration":2.0,"width":720,"height":720,"hasAudio":true}]);
         let mut clip = default_clip("video", "음악 클립", "video-1", 3.0, 0.75);
         clip["mediaId"] = json!("old-audio");
@@ -2520,6 +3099,11 @@ mod tests {
         assert_eq!(v[0], (1.2, 3.45, "첫 줄\n둘째 줄".into()));
         assert_eq!(srt_time(v[0].1), "00:00:03,450");
         assert!(parse_srt("1\n00:00:05,000 --> 00:00:01,000\nno").is_err());
+        let spaced =
+            "1\n00:00:01,000 --> 00:00:02,000\n하나\n \t\n2\n00:00:03,000 --> 00:00:04,000\n둘\n";
+        let v = parse_srt(spaced).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].2, "하나");
     }
 
     fn trim_project(kind: &str, reverse: bool, speed: f64) -> Value {
@@ -2754,6 +3338,7 @@ mod tests {
         for reverse in [false, true] {
             e.project = trim_project("video", reverse, 2.0);
             e.persist().unwrap();
+            e.refresh_missing();
             let before = e.project.clone();
             let invalid = [
                 json!({}),
@@ -2859,8 +3444,8 @@ mod tests {
         assert_eq!(p["clips"][0]["fadeOut"], 0.0);
         assert_eq!(p["clips"][1]["fadeIn"], 0.0);
         assert_eq!(p["clips"][1]["fadeOut"], 3.0);
-        assert_eq!(p["clips"][0]["transitionOut"]["duration"], 0.0);
-        assert_eq!(p["clips"][1]["transitionIn"]["duration"], 0.0);
+        assert!(p["clips"][0]["transitionOut"].is_null());
+        assert!(p["clips"][1]["transitionIn"].is_null());
         let mut image = trim_project("image", false, 2.0);
         mutate(
             &mut image,
@@ -3038,5 +3623,1156 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    // The exact shape written by builds that predate schemaVersion, including
+    // the filter ids the UI stored and a zero-length fade transition.
+    fn v1_project() -> Value {
+        json!({"id":"project-legacy","name":"여행 브이로그","revision":41,"width":1080,"height":1920,
+            "fps":30.0,"background":"#111111","updatedAt":1700000000000u64,
+            "concept":{"audience":"친구","message":"쉼","appeal":"","direction":""},
+            "media":[{"id":"media-1","name":"clip.mp4","path":"/nonexistent/clip.mp4","kind":"video",
+                "duration":12.5,"width":1920,"height":1080,"hasAudio":true,"thumbnail":"/nonexistent/t.jpg","waveform":[0.1,0.4]}],
+            "tracks":[{"id":"video-1","name":"영상 1","kind":"video","muted":false,"hidden":false,"locked":false},
+                {"id":"audio-1","name":"오디오 1","kind":"audio","muted":false,"hidden":false,"locked":false},
+                {"id":"text-1","name":"텍스트 1","kind":"text","muted":false,"hidden":false,"locked":true}],
+            "clips":[{"id":"clip-1","name":"clip.mp4","kind":"video","trackId":"video-1","mediaId":"media-1",
+                "start":0.0,"duration":4.0,"sourceIn":1.0,"speed":1.0,"reverse":false,"volume":0.8,
+                "fadeIn":0.5,"fadeOut":0.0,"filter":"cinema","transitionIn":{"type":"fade","duration":0.2},
+                "transitionOut":{"type":"fade","duration":0.0},
+                "transform":{"x":0.0,"y":0.0,"scale":1.2,"rotation":0.0,"opacity":1.0,"flipX":true},
+                "color":{"brightness":-0.02,"contrast":1.15,"saturation":0.85,"temperature":0.0,"hue":12.0},
+                "keyframes":[{"property":"opacity","time":1.0,"value":0.5}],"groupId":"group-1"},
+              {"id":"clip-2","name":"자막","kind":"text","trackId":"text-1","start":1.0,"duration":2.0,
+                "sourceIn":0.0,"speed":1.0,"reverse":false,"volume":1.0,"fadeIn":0.0,"fadeOut":0.0,"filter":"original",
+                "transform":{"x":0.0,"y":614.4,"scale":1.0,"rotation":0.0,"opacity":1.0},
+                "color":{"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0},"keyframes":[],
+                "text":{"content":"자막","fontSize":64,"color":"#ffffff","fontFamily":"sans-serif","bold":false,"align":"center","background":"transparent"}}],
+            "markers":[{"id":"marker-1","time":2.0,"label":"컷"}],
+            "notes":[{"id":"note-1","body":"메모","kind":"context","createdAt":1700000000000u64}]})
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn corrupt_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("current.json.corrupt-")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn existing_v1_project_opens_unchanged_apart_from_documented_repairs() {
+        let dir = temp();
+        let legacy = v1_project();
+        write_json(&dir.join("current.json"), &legacy);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert_eq!(
+            e.dispatch("project.notice", json!({})).await.unwrap()["notice"],
+            Value::Null
+        );
+        assert!(corrupt_files(&dir).is_empty());
+        let p = e.dispatch("project.get", json!({})).await.unwrap();
+        assert_eq!(p["schemaVersion"], 2);
+        let mut expected = legacy.clone();
+        expected["schemaVersion"] = json!(2);
+        expected["media"][0]["missing"] = json!(true);
+        expected["clips"][0]["filter"] = json!("cinematic");
+        expected["clips"][0]["transitionIn"]["duration"] = json!(0.5);
+        expected["clips"][0]["transitionOut"] = Value::Null;
+        expected["clips"][1]["filter"] = json!("none");
+        assert_eq!(p, expected);
+        // Editing and reopening keeps working on the migrated file.
+        let edited = e
+            .dispatch(
+                "edit.update",
+                json!({"id":"clip-1","patch":{"start":1.0},"expectedRevision":41}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["revision"], 42);
+        drop(e);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, edited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_caption_text_is_editable_and_opens_from_v1_with_a_shortened_name() {
+        let dir = temp();
+        let long = "가".repeat(2000); // 6000 bytes: valid content, too long for a name
+        let mut legacy = v1_project();
+        legacy["clips"][1]["text"]["content"] = json!(long);
+        legacy["clips"][1]["name"] = json!(long);
+        legacy["tracks"][0]["name"] = json!(long);
+        legacy["tracks"][2]["locked"] = json!(false);
+        legacy["markers"][0]["label"] = json!(long);
+        write_json(&dir.join("current.json"), &legacy);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(corrupt_files(&dir).is_empty());
+        assert_eq!(e.project["id"], legacy["id"]);
+        let short = "가".repeat(333);
+        assert_eq!(e.project["clips"][1]["text"]["content"], long.as_str());
+        assert_eq!(e.project["clips"][1]["name"], short.as_str());
+        assert_eq!(e.project["tracks"][0]["name"], short.as_str());
+        assert_eq!(e.project["markers"][0]["label"], short.as_str());
+
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":long},"start":10.0}))
+            .await
+            .unwrap();
+        let added = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(added["text"]["content"], long.as_str());
+        assert_eq!(added["name"], short.as_str());
+        let longer = format!("a{long}");
+        let p = e
+            .dispatch(
+                "edit.update",
+                json!({"id":"clip-2","patch":{"text":{"content":longer}}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][1]["text"]["content"], longer.as_str());
+        assert_eq!(
+            p["clips"][1]["name"],
+            format!("a{}", "가".repeat(333)).as_str()
+        );
+        drop(e);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, p);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn presets_with_legacy_filter_ids_still_apply_and_import() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":"preset"}}))
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        e.dispatch(
+            "edit.update",
+            json!({"id":id,"patch":{"color":{"hue":12.0}}}),
+        )
+        .await
+        .unwrap();
+        // A catalog written by the previous build, and a file exported from it.
+        let preset = |filter: &str| {
+            json!({"version":1,"id":format!("preset-{filter}"),"name":filter,"kind":"filter","target":"visual",
+            "sourceDuration":4.0,"patch":{"filter":filter,"color":{"brightness":0.1,"contrast":1.2,"saturation":0.9,"temperature":0.0}}})
+        };
+        write_json(
+            &dir.join("catalog/index.json"),
+            &json!({"version":1,"presets":[preset("cinema"), preset("vivid")],"fonts":[],"luts":[]}),
+        );
+        for (filter, expected) in [("cinema", "cinematic"), ("vivid", "none")] {
+            let p = e
+                .dispatch(
+                    "presets.apply",
+                    json!({"id":format!("preset-{filter}"),"clipId":id}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(p["clips"][0]["filter"], expected);
+            assert_eq!(p["clips"][0]["color"]["contrast"], 1.2);
+            assert_eq!(p["clips"][0]["color"]["hue"], 12.0);
+        }
+        let file = dir.join("old-preset.json");
+        write_json(&file, &preset("soft"));
+        let imported = e
+            .dispatch("presets.import", json!({"path":file}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("presets.apply", json!({"id":imported["id"],"clipId":id}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["filter"], "none");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_repairs_sloppy_v1_fields_and_rejects_newer_files() {
+        let mut p = v1_project();
+        for field in [
+            "sourceIn",
+            "speed",
+            "volume",
+            "fadeOut",
+            "reverse",
+            "keyframes",
+            "color",
+        ] {
+            p["clips"][0].as_object_mut().unwrap().remove(field);
+        }
+        p["clips"][0]["fadeIn"] = json!(9.0);
+        p["clips"][0]["transitionOut"] = json!("dissolve");
+        p["clips"][0]["filter"] = json!(3);
+        p["clips"][1]["name"] = json!(7);
+        p["tracks"][0].as_object_mut().unwrap().remove("muted");
+        p["markers"] = json!([{"time":1.0},{"id":"m","time":-4,"label":"x"},"junk",{"id":"keep","time":3.0,"label":5}]);
+        p["notes"] = json!([{"body":"ok"}, 3, {"id":"n"}]);
+        p.as_object_mut().unwrap().remove("concept");
+        assert!(validate_project(&p).is_err());
+        migrate_project(&mut p).unwrap();
+        validate_project(&p).unwrap();
+        let clip = &p["clips"][0];
+        assert_eq!(clip["speed"], 1.0);
+        assert_eq!(clip["fadeIn"], 4.0);
+        assert_eq!(clip["transitionIn"], json!({"type":"fade","duration":4.0}));
+        assert!(clip["transitionOut"].is_null());
+        assert_eq!(clip["filter"], "none");
+        assert_eq!(clip["color"]["contrast"], 1.0);
+        assert_eq!(p["markers"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            p["markers"][1],
+            json!({"id":"keep","time":3.0,"label":"마커"})
+        );
+        assert_eq!(p["notes"], json!([{"body":"ok"}]));
+        let migrated = p.clone();
+        migrate_project(&mut p).unwrap();
+        assert_eq!(p, migrated, "v2 files are left alone");
+        p["schemaVersion"] = json!(3);
+        assert!(migrate_project(&mut p.clone()).is_err());
+        assert!(validate_project(&p).is_err());
+        assert!(migrate_project(&mut json!([])).is_err());
+    }
+
+    #[tokio::test]
+    async fn unreadable_current_file_is_kept_and_startup_recovers() {
+        // Broken JSON: fall back to the newest valid stored project.
+        let dir = temp();
+        let mut older = v1_project();
+        older["id"] = json!("project-older");
+        older["updatedAt"] = json!(5);
+        write_json(&dir.join("projects/project-older.json"), &older);
+        write_json(&dir.join("projects/project-legacy.json"), &v1_project());
+        std::fs::write(dir.join("projects/broken.json"), "{").unwrap();
+        std::fs::write(dir.join("current.json"), "{\"id\":\"project-legacy\",").unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert_eq!(e.project["id"], "project-legacy");
+        let kept = corrupt_files(&dir);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&kept[0]).unwrap(),
+            "{\"id\":\"project-legacy\","
+        );
+        let notice = e.dispatch("project.notice", json!({})).await.unwrap();
+        assert!(notice["notice"].as_str().unwrap().contains("여행 브이로그"));
+        assert_eq!(
+            e.dispatch("project.noticeDismiss", json!({}))
+                .await
+                .unwrap(),
+            json!({"notice":null})
+        );
+        assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_null());
+        drop(e);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_null());
+        assert_eq!(corrupt_files(&dir).len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // Valid JSON that fails validation, or a newer schema, and nothing to fall back to.
+        for broken in [json!({"id":"project-x","name":"x"}), {
+            let mut p = v1_project();
+            p["schemaVersion"] = json!(99);
+            p
+        }] {
+            let dir = temp();
+            write_json(&dir.join("current.json"), &broken);
+            let mut e = Editor::new(dir.clone()).unwrap();
+            assert!(e.project["clips"].as_array().unwrap().is_empty());
+            assert_ne!(e.project["id"], broken["id"]);
+            assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_string());
+            assert_eq!(corrupt_files(&dir).len(), 1);
+            e.dispatch("edit.add", json!({"text":{"content":"계속 작업"}}))
+                .await
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn project_lifecycle_new_list_open_rename_duplicate_delete() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        e.dispatch("edit.add", json!({"text":{"content":"첫 프로젝트"}}))
+            .await
+            .unwrap();
+        let second = e
+            .dispatch(
+                "project.new",
+                json!({"name":"두 번째","width":1080,"height":1920,"fps":24}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (second["width"].clone(), second["fps"].clone()),
+            (json!(1080), json!(24.0))
+        );
+        assert_eq!(second["schemaVersion"], 2);
+        assert!(e.undo.is_empty());
+        let second_id = second["id"].as_str().unwrap().to_owned();
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert_eq!(list[0]["id"], second_id.as_str());
+
+        // Conditional get.
+        let revision = second["revision"].clone();
+        assert_eq!(
+            e.dispatch(
+                "project.get",
+                json!({"ifProjectId":second_id,"ifRevision":revision})
+            )
+            .await
+            .unwrap(),
+            json!({"unchanged":true,"id":second_id,"revision":revision,"missing":[]})
+        );
+        for params in [
+            json!({"ifProjectId":first,"ifRevision":revision}),
+            json!({"ifProjectId":second_id,"ifRevision":0}),
+            json!({"ifProjectId":second_id}),
+            json!({"ifRevision":revision}),
+            json!({}),
+        ] {
+            assert_eq!(e.dispatch("project.get", params).await.unwrap(), e.project);
+        }
+
+        // Rename: a stored project, then the open one.
+        let list = e
+            .dispatch("project.rename", json!({"id":first,"name":"  이름 바꿈 "}))
+            .await
+            .unwrap();
+        assert!(list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == first.as_str() && p["name"] == "이름 바꿈"));
+        assert_eq!(e.project["revision"], revision);
+        e.dispatch(
+            "project.rename",
+            json!({"id":second_id,"name":"열린 프로젝트"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(e.project["name"], "열린 프로젝트");
+        assert_eq!(
+            e.project["revision"].as_u64(),
+            revision.as_u64().map(|r| r + 1)
+        );
+        for params in [
+            json!({"id":first,"name":""}),
+            json!({"id":"nope","name":"x"}),
+            json!({"id":"../x","name":"x"}),
+        ] {
+            assert!(e.dispatch("project.rename", params).await.is_err());
+        }
+
+        // Duplicate does not switch projects and copies project-owned LUTs.
+        let lut = e.assets_dir(&first).join("luts/look.cube");
+        std::fs::create_dir_all(lut.parent().unwrap()).unwrap();
+        std::fs::write(&lut, "LUT_3D_SIZE 2\n").unwrap();
+        let mut stored: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap();
+        stored["clips"][0]["color"]["lut"] = json!({"path":lut,"name":"look","enabled":true});
+        write_json(&e.project_file(&first), &stored);
+        let copy = e
+            .dispatch("project.duplicate", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(copy["name"], "이름 바꿈 사본");
+        assert_eq!(e.project["id"], second_id.as_str());
+        let copy_id = copy["id"].as_str().unwrap().to_owned();
+        let opened = e
+            .dispatch("project.open", json!({"id":copy_id}))
+            .await
+            .unwrap();
+        assert_eq!(opened["clips"][0]["text"]["content"], "첫 프로젝트");
+        let copied_lut =
+            PathBuf::from(opened["clips"][0]["color"]["lut"]["path"].as_str().unwrap());
+        assert_eq!(copied_lut, e.assets_dir(&copy_id).join("luts/look.cube"));
+        assert!(copied_lut.is_file());
+
+        // Delete: never the open project; removes the file and its assets only.
+        assert!(e
+            .dispatch("project.delete", json!({"id":copy_id}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch("project.delete", json!({"id":"missing"}))
+            .await
+            .is_err());
+        assert!(e.dispatch("project.delete", json!({})).await.is_err());
+        let list = e
+            .dispatch("project.delete", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert!(!e.project_file(&first).exists() && !e.assets_dir(&first).exists());
+        assert!(copied_lut.is_file());
+        assert!(e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .is_err());
+        assert_eq!(e.project["id"], copy_id.as_str());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_requires_overwrite_remembers_the_file_and_protects_store_and_sources() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.join("state")).unwrap();
+        let source = out.join("source.wav");
+        write_wav(&source, 8_000);
+        e.dispatch("media.import", json!({"paths":[source]}))
+            .await
+            .unwrap();
+
+        // Without a path the store copy is the target.
+        let saved = e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(
+            PathBuf::from(saved["path"].as_str().unwrap()),
+            e.project_file(e.project["id"].as_str().unwrap())
+        );
+
+        let file = out.join("my.byori.json");
+        let saved = e
+            .dispatch("project.save", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(saved["project"], e.project);
+        // Later plain saves go to the remembered file, including new edits.
+        e.dispatch("project.update", json!({"patch":{"name":"저장됨"}}))
+            .await
+            .unwrap();
+        let saved = e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(PathBuf::from(saved["path"].as_str().unwrap()), file);
+        assert_eq!(load_project(&file).unwrap()["name"], "저장됨");
+
+        let other = out.join("other.json");
+        std::fs::write(&other, "keep").unwrap();
+        let error = e
+            .dispatch("project.save", json!({"path":other}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        assert!(e
+            .dispatch("project.save", json!({"path":other,"overwrite":false}))
+            .await
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+        e.dispatch("project.save", json!({"path":other,"overwrite":true}))
+            .await
+            .unwrap();
+        assert_eq!(load_project(&other).unwrap()["id"], e.project["id"]);
+
+        let source_bytes = std::fs::read(&source).unwrap();
+        for target in [
+            json!(source),
+            json!(dir.join("state/current.json")),
+            json!(dir.join("state/projects/another.json")),
+            json!(dir.join("state/catalog/index.json")),
+        ] {
+            for method in ["project.save", "captions.export"] {
+                let error = e
+                    .dispatch(method, json!({"path":target,"overwrite":true}))
+                    .await
+                    .unwrap_err();
+                assert!(!error.contains("FILE_EXISTS"), "{error}");
+            }
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        // The store's exports folder is output space: new files only, like any other folder.
+        let exported = dir.join("state/exports/captions.srt");
+        std::fs::create_dir_all(exported.parent().unwrap()).unwrap();
+        std::fs::write(&exported, "keep").unwrap();
+        let error = e
+            .dispatch("captions.export", json!({"path":exported,"overwrite":false}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        let copy = dir.join("state/exports/copy.json");
+        e.dispatch("project.save", json!({"path":copy,"overwrite":false}))
+            .await
+            .unwrap();
+        assert_eq!(load_project(&copy).unwrap()["id"], e.project["id"]);
+
+        // Opening by path remembers that file; switching projects forgets it.
+        let id = e.project["id"].clone();
+        e.dispatch("project.new", json!({})).await.unwrap();
+        assert!(e.file_path.is_none());
+        let opened = e
+            .dispatch("project.open", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(opened["id"], id);
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+        e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(
+            load_project(&file).unwrap()["markers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn captions_import_and_export_through_dispatch() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(e
+            .dispatch("captions.export", json!({"path":out.join("empty.srt")}))
+            .await
+            .is_err());
+        let input = out.join("in.srt");
+        std::fs::write(&input, "\u{feff}1\r\n00:00:01,000 --> 00:00:02,500\r\n첫 자막\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n둘째\r\n줄\r\n").unwrap();
+        assert!(e
+            .dispatch(
+                "captions.import",
+                json!({"path":input,"expectedRevision":7})
+            )
+            .await
+            .is_err());
+        let p = e
+            .dispatch(
+                "captions.import",
+                json!({"path":input,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["revision"], 1);
+        assert_eq!(e.undo.len(), 1, "one undo for the whole file");
+        assert_eq!(p["clips"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            (
+                p["clips"][0]["start"].clone(),
+                p["clips"][0]["duration"].clone()
+            ),
+            (json!(1.0), json!(1.5))
+        );
+        assert_eq!(p["clips"][1]["text"]["content"], "둘째\n줄");
+        assert_eq!(p["clips"][1]["trackId"], "text-1");
+
+        let exported = out.join("out.srt");
+        e.dispatch("captions.export", json!({"path":exported}))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&exported).unwrap();
+        assert_eq!(text, "1\n00:00:01,000 --> 00:00:02,500\n첫 자막\n\n2\n00:00:03,000 --> 00:00:04,000\n둘째\n줄\n");
+        let error = e
+            .dispatch("captions.export", json!({"path":exported}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        e.dispatch("captions.export", json!({"path":exported,"overwrite":true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            2,
+            "no temporary files left"
+        );
+        assert_eq!(e.project["revision"], 1);
+
+        std::fs::write(&input, "1\n00:00:05,000 --> 00:00:01,000\n거꾸로\n").unwrap();
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("captions.import", json!({"path":input}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch("captions.import", json!({"path":out.join("none.srt")}))
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn markers_add_update_delete_and_are_validated() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.marker", json!({"time":2.5,"label":"인트로"}))
+            .await
+            .unwrap();
+        let id = p["markers"][0]["id"].clone();
+        let p = e
+            .dispatch("edit.marker", json!({"time":4.0}))
+            .await
+            .unwrap();
+        assert_eq!(p["markers"][1]["label"], "마커");
+        let p = e
+            .dispatch(
+                "edit.markerUpdate",
+                json!({"id":id,"time":3.0,"expectedRevision":2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p["markers"][0],
+            json!({"id":id,"time":3.0,"label":"인트로"})
+        );
+        let p = e
+            .dispatch("edit.markerUpdate", json!({"id":id,"label":"본편"}))
+            .await
+            .unwrap();
+        assert_eq!(p["markers"][0], json!({"id":id,"time":3.0,"label":"본편"}));
+        let before = e.project.clone();
+        for (method, params) in [
+            ("edit.marker", json!({"time":-1.0})),
+            ("edit.marker", json!({"label":"x"})),
+            ("edit.markerUpdate", json!({"id":id,"time":-1})),
+            ("edit.markerUpdate", json!({"id":id,"time":"3"})),
+            ("edit.markerUpdate", json!({"id":id,"label":4})),
+            ("edit.markerUpdate", json!({"id":"missing","time":1})),
+            (
+                "edit.markerUpdate",
+                json!({"id":id,"time":1,"expectedRevision":0}),
+            ),
+            ("edit.markerDelete", json!({"id":"missing"})),
+            ("edit.markerDelete", json!({})),
+            (
+                "project.update",
+                json!({"patch":{"markers":[{"id":"a","time":"soon","label":"x"}]}}),
+            ),
+            (
+                "project.update",
+                json!({"patch":{"markers":[{"id":"a","time":1},{"id":"a","time":2}]}}),
+            ),
+            ("project.update", json!({"patch":{"markers":["x"]}})),
+            ("project.update", json!({"patch":{"notes":[{"id":"n"}]}})),
+            ("project.update", json!({"patch":{"notes":[3]}})),
+        ] {
+            assert!(
+                e.dispatch(method, params.clone()).await.is_err(),
+                "accepted {method} {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"notes":[{"id":"n","body":"메모","kind":"context","createdAt":1}]}}),
+        )
+        .await
+        .unwrap();
+        let second = e.project["markers"][1]["id"].clone();
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[
+                {"method":"edit.markerDelete","params":{"id":id}},
+                {"method":"edit.markerUpdate","params":{"id":second,"label":"끝"}}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["markers"], json!([{"id":second,"time":4.0,"label":"끝"}]));
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["markers"], before["markers"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn track_delete_and_move_are_single_undo_and_respect_locks() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("edit.add", json!({"text":{"content":"남는 자막"}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("edit.track", json!({"kind":"text","name":"자막 2"}))
+            .await
+            .unwrap();
+        let extra = p["tracks"][3]["id"].clone();
+        for content in ["지울 자막 1", "지울 자막 2"] {
+            e.dispatch(
+                "edit.add",
+                json!({"text":{"content":content},"trackId":extra}),
+            )
+            .await
+            .unwrap();
+        }
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+
+        e.dispatch("edit.track", json!({"id":extra,"patch":{"locked":true}}))
+            .await
+            .unwrap();
+        assert!(e
+            .dispatch("edit.trackDelete", json!({"id":extra}))
+            .await
+            .is_err());
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        for params in [
+            json!({"id":"missing"}),
+            json!({}),
+            json!({"id":extra,"expectedRevision":0}),
+        ] {
+            assert!(e.dispatch("edit.trackDelete", params).await.is_err());
+        }
+        assert_eq!(e.project["clips"], before["clips"]);
+
+        let p = e
+            .dispatch("edit.trackDelete", json!({"id":extra}))
+            .await
+            .unwrap();
+        assert_eq!(p["tracks"].as_array().unwrap().len(), 3);
+        assert_eq!(p["clips"].as_array().unwrap().len(), 1);
+        assert_eq!(p["clips"][0]["text"]["content"], "남는 자막");
+        assert_eq!(e.undo.len(), undo_count + 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(
+            (&undone["tracks"], &undone["clips"]),
+            (&before["tracks"], &before["clips"])
+        );
+
+        let order = |p: &Value| -> Vec<Value> {
+            p["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].clone())
+                .collect()
+        };
+        let p = e
+            .dispatch("edit.trackMove", json!({"id":extra,"index":0}))
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&p),
+            vec![
+                extra.clone(),
+                json!("video-1"),
+                json!("audio-1"),
+                json!("text-1")
+            ]
+        );
+        assert_eq!(p["clips"], before["clips"]);
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[
+                {"method":"edit.trackMove","params":{"id":"video-1","index":3}},
+                {"method":"edit.trackDelete","params":{"id":"audio-1"}}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&p),
+            vec![extra.clone(), json!("text-1"), json!("video-1")]
+        );
+        let current = e.project.clone();
+        for params in [
+            json!({"id":extra,"index":3}),
+            json!({"id":extra,"index":-1}),
+            json!({"id":extra}),
+            json!({"id":"missing","index":0}),
+        ] {
+            assert!(e.dispatch("edit.trackMove", params).await.is_err());
+            assert_eq!(e.project, current);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paste_inserts_copies_with_new_ids_groups_spacing_and_track_fallback() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        for start in [2.0, 5.0] {
+            e.dispatch(
+                "edit.add",
+                json!({"text":{"content":"복사"},"start":start,"duration":1.0}),
+            )
+            .await
+            .unwrap();
+        }
+        let ids: Vec<Value> = e.project["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].clone())
+            .collect();
+        let p = e.dispatch("edit.group", json!({"ids":ids})).await.unwrap();
+        let copied = p["clips"].clone();
+        let undo_count = e.undo.len();
+        let p = e
+            .dispatch(
+                "edit.paste",
+                json!({"clips":copied,"at":10.0,"expectedRevision":p["revision"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.undo.len(), undo_count + 1);
+        let clips = p["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 4);
+        assert_eq!(
+            (clips[2]["start"].clone(), clips[3]["start"].clone()),
+            (json!(10.0), json!(13.0))
+        );
+        assert_eq!(clips[2]["groupId"], clips[3]["groupId"]);
+        assert_ne!(clips[2]["groupId"], clips[0]["groupId"]);
+        assert_eq!(
+            clips
+                .iter()
+                .map(|c| c["id"].as_str().unwrap())
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        let mut expected = copied[0].clone();
+        for field in ["id", "start", "groupId"] {
+            expected[field] = clips[2][field].clone();
+        }
+        assert_eq!(clips[2], expected);
+
+        // Source track gone, then locked: use the first compatible unlocked track.
+        let p = e
+            .dispatch("edit.track", json!({"kind":"text","name":"자막 2"}))
+            .await
+            .unwrap();
+        let second = p["tracks"][3]["id"].clone();
+        let mut foreign = copied[0].clone();
+        foreign["trackId"] = json!("track-from-another-project");
+        foreign["unknownField"] = json!({"x":1});
+        let p = e
+            .dispatch("edit.paste", json!({"clips":[foreign],"at":0.0}))
+            .await
+            .unwrap();
+        let pasted = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            (pasted["trackId"].clone(), pasted["start"].clone()),
+            (json!("text-1"), json!(0.0))
+        );
+        assert!(pasted.get("unknownField").is_none());
+        e.dispatch("edit.track", json!({"id":"text-1","patch":{"locked":true}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("edit.batch", json!({"commands":[{"method":"edit.paste","params":{"clips":[copied[1]],"at":1.0}}]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            p["clips"].as_array().unwrap().last().unwrap()["trackId"],
+            second
+        );
+        e.dispatch("edit.track", json!({"id":second,"patch":{"locked":true}}))
+            .await
+            .unwrap();
+
+        let before = e.project.clone();
+        let mut no_media = copied[0].clone();
+        no_media["kind"] = json!("video");
+        no_media["mediaId"] = json!("media-from-another-project");
+        for params in [
+            json!({"clips":copied,"at":1.0}),
+            json!({"clips":[],"at":1.0}),
+            json!({"clips":["x"],"at":1.0}),
+            json!({"clips":[no_media],"at":1.0}),
+            json!({"clips":[copied[0]],"at":-1.0}),
+            json!({"clips":[copied[0]]}),
+            json!({"at":1.0}),
+        ] {
+            assert!(
+                e.dispatch("edit.paste", params.clone()).await.is_err(),
+                "accepted {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filter_merges_basic_grade_and_fades_stay_in_sync_with_transitions() {
+        let mut p = empty_project("filter", 320, 180, 24.0);
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"text"},"duration":4.0}),
+        )
+        .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        let update =
+            |p: &mut Value, patch: Value| mutate(p, "edit.update", &json!({"id":id,"patch":patch}));
+        let lut = json!({"path":"/tmp/look.cube","name":"look","enabled":true});
+        update(&mut p, json!({"color":{"hue":20.0,"hsl":{"red":{"hue":30.0}},"curves":{"preset":"vintage"},"lut":lut}})).unwrap();
+        update(&mut p, json!({"filter":"warm"})).unwrap();
+        assert_eq!(
+            p["clips"][0]["color"],
+            json!({"brightness":0.02,"contrast":1.03,"saturation":1.05,"temperature":0.5,
+                "hue":20.0,"hsl":{"red":{"hue":30.0}},"curves":{"preset":"vintage"},"lut":lut})
+        );
+        // With explicit colour values the filter id is still checked.
+        update(&mut p, json!({"filter":"mono","color":{"saturation":0.2}})).unwrap();
+        assert_eq!(p["clips"][0]["color"]["saturation"], 0.2);
+        assert_eq!(p["clips"][0]["color"]["hue"], 20.0);
+        for patch in [
+            json!({"filter":"cinema"}),
+            json!({"filter":"original","color":{"saturation":1.0}}),
+            json!({"filter":3,"color":{"saturation":1.0}}),
+            json!({"reverse":"yes"}),
+            json!({"name":5}),
+            json!({"transitionIn":{"type":"wipe","duration":1.0}}),
+            json!({"transitionOut":"fade"}),
+        ] {
+            assert!(
+                update(&mut p.clone(), patch.clone()).is_err(),
+                "accepted {patch}"
+            );
+        }
+        let mut invalid = p.clone();
+        invalid["clips"][0]["transitionOut"] = json!({"type":"wipe","duration":1.0});
+        assert!(validate_project(&invalid).is_err());
+        let mut invalid = p.clone();
+        invalid["tracks"][0]["name"] = json!(1);
+        assert!(validate_project(&invalid).is_err());
+
+        update(
+            &mut p,
+            json!({"transitionIn":{"type":"fade","duration":1.0},"fadeOut":0.5}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.0);
+        assert!(
+            p["clips"][0].get("transitionOut").is_none(),
+            "a plain fade needs no transition object"
+        );
+        update(&mut p, json!({"fadeIn":2.0})).unwrap();
+        assert_eq!(
+            p["clips"][0]["transitionIn"],
+            json!({"type":"fade","duration":2.0})
+        );
+        update(&mut p, json!({"duration":1.5})).unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.5);
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.5);
+        assert_eq!(p["clips"][0]["fadeOut"], 0.5);
+        update(&mut p, json!({"fadeIn":0.0})).unwrap();
+        assert!(p["clips"][0]["transitionIn"].is_null());
+        update(
+            &mut p,
+            json!({"transitionOut":{"type":"fade","duration":0.0}}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][0]["fadeOut"], 0.0);
+        assert!(p["clips"][0]["transitionOut"].is_null());
+    }
+
+    #[tokio::test]
+    async fn media_import_and_add_remove_missing_flag_and_relink() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let (first, second, moved) = (out.join("a.wav"), out.join("b.wav"), out.join("moved.wav"));
+        write_wav(&first, 16_000);
+        write_wav(&second, 8_000);
+        let p = e
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[first, second],"start":3.0,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["revision"], 1);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(p["media"].as_array().unwrap().len(), 2);
+        let clips = p["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0]["trackId"], "audio-1");
+        assert_eq!(
+            (clips[0]["start"].clone(), clips[1]["start"].clone()),
+            (json!(3.0), json!(5.0))
+        );
+        assert!(p["media"][0].get("missing").is_none());
+        let (a, b) = (p["media"][0]["id"].clone(), p["media"][1]["id"].clone());
+        assert!(e
+            .dispatch("media.importAndAdd", json!({"paths":[]}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[out.join("none.wav")]})
+            )
+            .await
+            .is_err());
+
+        // media.remove: refused while used, one undo otherwise.
+        assert!(e.dispatch("media.remove", json!({"id":b})).await.is_err());
+        assert!(e
+            .dispatch("media.remove", json!({"id":"missing"}))
+            .await
+            .is_err());
+        e.dispatch("edit.delete", json!({"ids":[clips[1]["id"]]}))
+            .await
+            .unwrap();
+        let p = e.dispatch("media.remove", json!({"id":b})).await.unwrap();
+        assert_eq!(p["media"].as_array().unwrap().len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["media"].as_array().unwrap().len(), 2);
+
+        // A moved source is flagged without a new revision, even on a conditional get.
+        std::fs::rename(&first, &moved).unwrap();
+        let revision = e.project["revision"].clone();
+        let p = e
+            .dispatch(
+                "project.get",
+                json!({"ifProjectId":e.project["id"],"ifRevision":revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["media"][0]["missing"], true);
+        assert!(p["media"][1].get("missing").is_none());
+        assert_eq!(p["revision"], revision);
+        assert_eq!(
+            e.dispatch(
+                "project.get",
+                json!({"ifProjectId":e.project["id"],"ifRevision":revision})
+            )
+            .await
+            .unwrap(),
+            json!({"unchanged":true,"id":e.project["id"],"revision":revision,"missing":[a]})
+        );
+
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+        for params in [
+            json!({"id":a,"path":out.join("none.wav")}),
+            json!({"id":a,"path":second}),
+            json!({"id":"missing","path":moved}),
+            json!({"id":a,"path":moved,"expectedRevision":0}),
+            json!({"id":a}),
+        ] {
+            assert!(
+                e.dispatch("media.relink", params.clone()).await.is_err(),
+                "accepted {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        let p = e
+            .dispatch(
+                "media.relink",
+                json!({"id":a,"path":moved,"expectedRevision":revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.undo.len(), undo_count + 1);
+        assert!(p["media"][0].get("missing").is_none());
+        assert!(media::same_path(
+            Path::new(p["media"][0]["path"].as_str().unwrap()),
+            &moved
+        ));
+        assert_eq!(
+            (&p["media"][0]["id"], &p["media"][0]["name"]),
+            (&a, &before["media"][0]["name"])
+        );
+        assert_eq!(p["clips"], before["clips"]);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["media"], before["media"]);
+
+        // A replacement too short for the clips that use it is refused.
+        e.dispatch("history.redo", json!({})).await.unwrap();
+
+        // Relinking a video source to an audio file is refused, not converted.
+        let mut as_video = e.project.clone();
+        as_video["media"][0]["kind"] = json!("video");
+        as_video["media"][0]["width"] = json!(720);
+        as_video["media"][0]["height"] = json!(720);
+        as_video["clips"][0]["kind"] = json!("video");
+        as_video["clips"][0]["trackId"] = json!("video-1");
+        validate_project(&as_video).unwrap();
+        let other = out.join("other.wav");
+        write_wav(&other, 16_000);
+        let audio_project = std::mem::replace(&mut e.project, as_video.clone());
+        let error = e
+            .dispatch("media.relink", json!({"id":a,"path":other}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("소재 종류가 다릅니다"), "{error}");
+        assert_eq!(e.project, as_video);
+        e.project = audio_project;
+
+        std::fs::remove_file(&moved).unwrap();
+        let short = out.join("short.wav");
+        write_wav(&short, 800);
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("media.relink", json!({"id":a,"path":short}))
+            .await
+            .is_err());
+        assert_eq!(e.project["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn demo_project_replaces_current_and_history_is_bounded() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let first = e.project["id"].clone();
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+        let demo = e.dispatch("project.demo", json!({})).await.unwrap();
+        assert_ne!(demo["id"], first);
+        assert!(e.undo.is_empty());
+        assert!(!demo["media"].as_array().unwrap().is_empty());
+        assert!(demo["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("missing").is_none()));
+        assert!(demo["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["kind"] == "text"));
+        assert_eq!(
+            e.dispatch("project.list", json!({}))
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, demo);
+
+        for i in 0..103 {
+            e.dispatch("edit.marker", json!({"time":i as f64}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(e.undo.len(), 100);
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(
+            e.dispatch("history.status", json!({})).await.unwrap(),
+            json!({"canUndo":true,"canRedo":true})
+        );
+        e.dispatch("edit.marker", json!({"time":500.0}))
+            .await
+            .unwrap();
+        assert!(e.redo.is_empty(), "a new edit discards redo");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

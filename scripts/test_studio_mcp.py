@@ -1,5 +1,10 @@
 import importlib.util
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location('mcp', Path(__file__).with_name('studio-mcp.py'))
@@ -18,6 +23,32 @@ class ToolBoundaryTests(unittest.TestCase):
         self.assertIn('presets.apply', methods)
         self.assertNotIn('runtime.install', methods)
         self.assertNotIn('agent.start', methods)
+
+    def test_contract_commands_are_exposed_without_project_switching_or_deletion(self):
+        methods = {m for t in mcp.TOOLS for m in t['methods']}
+        for method in ['media.relink', 'edit.trackDelete', 'edit.trackMove', 'edit.markerUpdate',
+                       'edit.markerDelete', 'edit.paste', 'project.notice']:
+            self.assertIn(method, methods)
+        for method in ['project.delete', 'project.open', 'project.new', 'project.duplicate',
+                       'project.rename', 'agent.list', 'runtime.status']:
+            self.assertNotIn(method, methods)
+        self.assertEqual(len(methods), sum(len(t['methods']) for t in mcp.TOOLS))
+
+    def test_cli_honors_isolated_home(self):
+        cli = Path(__file__).with_name('studio-cli.py')
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, BYORI_STUDIO_HOME=home)
+            missing = subprocess.run([sys.executable, str(cli), 'project.get'], env=env, capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn(home, missing.stderr)
+            # A non-loopback address proves the isolated connection file was the one read.
+            Path(home, 'connection.json').write_text(json.dumps({'url': 'http://example.invalid', 'token': 'x'}))
+            isolated = subprocess.run([sys.executable, str(cli), 'project.get'], env=env, capture_output=True, text=True)
+            self.assertNotEqual(isolated.returncode, 0)
+            self.assertIn('loopback', isolated.stderr)
+            denied = subprocess.run([sys.executable, str(cli), 'project.delete'], env=env, capture_output=True, text=True)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn('Unsupported method', denied.stderr)
 
     def test_tool_rejects_cross_category_and_runtime_actions(self):
         for name, method in [('studio_project', 'edit.delete'), ('studio_edit', 'runtime.install'), ('studio_assets', 'runtime.mcpSave')]:

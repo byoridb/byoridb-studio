@@ -1,4 +1,3 @@
-pub mod client;
 pub mod editor;
 pub mod media;
 pub mod mcp_connections;

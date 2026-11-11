@@ -28,3 +28,13 @@
 .timeline-clip .clip-trim:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
 .timeline-clip .clip-trim:disabled { opacity: 0; cursor: default; pointer-events: none; }
 .timeline-clip.selected .clip-label { padding-inline: 14px; }
+.timeline-workspace .track-labels { flex-basis: 148px; }
+.track-labels .track-switches { gap: 6px; padding-left: 0; }
+.playhead > .playhead-handle { pointer-events: auto; cursor: ew-resize; touch-action: none; }
+.timeline-ruler { touch-action: none; }
+.marker-popover { position: absolute; z-index: 20; top: 30px; display: flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-raised); box-shadow: 0 9px 28px #0007; cursor: default; }
+.marker-popover > input { width: 120px; height: 24px; padding: 2px 6px; border: 1px solid #41464f; border-radius: 3px; background: #292c31; color: var(--text); font-size: 11px; }
+.marker-popover > input:focus { outline: 1px solid var(--accent); }
+.marker-popover > button { display: flex; padding: 5px; color: var(--muted); }
+.marker-popover > button:hover { color: var(--text); background: #34383f; }
+.timeline-clip.missing { outline: 1px dashed #d98a94; opacity: .75; }

@@ -42,3 +42,52 @@ export function trimClipPreview(project: Project, clip: Clip, edge: "start" | "e
     : clip.sourceIn;
   return { start, duration: end - start, sourceIn };
 }
+
+const animates = (property: string) => (key: Clip["keyframes"][number]) =>
+  key.property === property || key.property === `transform.${property}`;
+
+/**
+ * A canvas move/scale edits what is on screen. An animated property is written
+ * as a keyframe at the playhead (replacing one within half a frame); a static
+ * property is written to the transform.
+ */
+export function canvasTransformPatch(
+  clip: Clip,
+  values: Partial<Record<"x" | "y" | "scale", number>>,
+  time: number,
+  fps: number,
+): Partial<Clip> {
+  const local = Math.max(0, Math.min(clip.duration, time - clip.start));
+  const transform = { ...clip.transform };
+  let keyframes = clip.keyframes || [];
+  let animated = false;
+  for (const [property, value] of Object.entries(values) as ["x" | "y" | "scale", number][]) {
+    const matches = animates(property);
+    const existing = keyframes.filter(matches);
+    if (!existing.length) { transform[property] = value; continue; }
+    animated = true;
+    keyframes = [
+      ...keyframes.filter((key) => !matches(key) || Math.abs(key.time - local) > 1 / fps / 2),
+      { property: existing[0].property, time: local, value },
+    ];
+  }
+  return animated
+    ? { transform, keyframes: [...keyframes].sort((a, b) => a.time - b.time) }
+    : { transform };
+}
+
+/** The share of a media waveform that a clip actually plays, as peak indices. */
+export function waveformRange(clip: Clip, mediaDuration: number, peaks: number): [number, number] {
+  // Stored peaks cover the whole source file (media.rs).
+  const covered = mediaDuration > 0 ? mediaDuration : clip.sourceIn + clip.duration * clip.speed;
+  const from = Math.max(0, Math.min(peaks, Math.floor((clip.sourceIn / covered) * peaks)));
+  const to = Math.max(from, Math.min(peaks, Math.ceil(((clip.sourceIn + clip.duration * clip.speed) / covered) * peaks)));
+  return [from, to];
+}
+
+/** At most `limit` bars, each the loudest peak of its share, so long clips stay cheap to draw. */
+export function waveformBars(peaks: number[], limit = 240): number[] {
+  if (peaks.length <= limit) return peaks;
+  return Array.from({ length: limit }, (_, index) =>
+    Math.max(...peaks.slice(Math.floor((index * peaks.length) / limit), Math.floor(((index + 1) * peaks.length) / limit))));
+}

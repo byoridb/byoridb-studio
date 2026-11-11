@@ -17,6 +17,8 @@ import {
   SlidersHorizontal,
   Sparkles,
   Sticker,
+  Trash2,
+  TriangleAlert,
   Type,
   WandSparkles,
   X,
@@ -65,79 +67,122 @@ const textDefaults = {
   align: "center",
   background: "transparent",
 };
+// Ids and values mirror the editor's built-in filter presets; the editor owns
+// the applied values, these copies only drive thumbnails and hover previews.
 const filters = [
   {
-    id: "original",
+    id: "none",
     name: "원본",
     color: { brightness: 0, contrast: 1, saturation: 1, temperature: 0 },
   },
   {
-    id: "cinema",
+    id: "cinematic",
     name: "시네마",
-    color: {
-      brightness: -0.03,
-      contrast: 1.18,
-      saturation: 0.82,
-      temperature: -0.08,
-    },
+    color: { brightness: -0.02, contrast: 1.15, saturation: 0.85, temperature: 0 },
   },
   {
     id: "warm",
     name: "따뜻한 오후",
-    color: {
-      brightness: 0.04,
-      contrast: 1.05,
-      saturation: 1.12,
-      temperature: 0.28,
-    },
+    color: { brightness: 0.02, contrast: 1.03, saturation: 1.05, temperature: 0.5 },
   },
   {
     id: "cool",
     name: "쿨 블루",
-    color: {
-      brightness: 0.02,
-      contrast: 1.1,
-      saturation: 0.9,
-      temperature: -0.3,
-    },
+    color: { brightness: 0, contrast: 1.05, saturation: 0.95, temperature: -0.5 },
   },
   {
     id: "mono",
     name: "모노",
-    color: { brightness: 0, contrast: 1.12, saturation: 0, temperature: 0 },
-  },
-  {
-    id: "vivid",
-    name: "선명하게",
-    color: {
-      brightness: 0.02,
-      contrast: 1.12,
-      saturation: 1.45,
-      temperature: 0,
-    },
-  },
-  {
-    id: "soft",
-    name: "소프트",
-    color: {
-      brightness: 0.06,
-      contrast: 0.88,
-      saturation: 0.86,
-      temperature: 0.06,
-    },
+    color: { brightness: 0, contrast: 1.1, saturation: 0, temperature: 0 },
   },
   {
     id: "vintage",
     name: "빈티지",
-    color: {
-      brightness: 0.03,
-      contrast: 0.92,
-      saturation: 0.65,
-      temperature: 0.2,
-    },
+    color: { brightness: 0.03, contrast: 0.9, saturation: 0.75, temperature: 0.3 },
   },
 ];
-
+const textPresets = [
+  {
+    label: "제목을 입력하세요",
+    name: "타이틀",
+    style: { fontSize: 92, bold: true },
+  },
+  {
+    label: "작은 순간, 오래 남는 기억",
+    name: "시네마",
+    style: { fontSize: 46, fontFamily: "Georgia" },
+  },
+  {
+    label: "오늘의 기록",
+    name: "하이라이트",
+    style: { fontSize: 66, bold: true, color: "#ffe76a" },
+  },
+  {
+    label: "여기에 자막을 입력하세요",
+    name: "자막",
+    style: { fontSize: 40, background: "#18191de6" },
+  },
+  {
+    label: "CHAPTER 01",
+    name: "챕터",
+    style: { fontSize: 44, bold: true },
+  },
+  {
+    label: "이야기가 시작되는 곳",
+    name: "미니멀",
+    style: { fontSize: 38 },
+  },
+];
+const badgePresets = [
+  { label: "NEW", color: "#191b20", background: "#d5fb72" },
+  { label: "REC", color: "#ffffff", background: "#dd4a51" },
+  { label: "LIVE", color: "#ffffff", background: "#7956d8" },
+  { label: "01", color: "#ffffff", background: "#305b8f" },
+  { label: "TIP", color: "#161a1d", background: "#40d3c6" },
+  { label: "DAY 1", color: "#1b1b1b", background: "#f0cf91" },
+];
+const fadePresets = [
+  { name: "없음", in: 0, out: 0 },
+  { name: "페이드 인", in: 0.5, out: 0 },
+  { name: "페이드 아웃", in: 0, out: 0.5 },
+  { name: "인 + 아웃", in: 0.5, out: 0.5 },
+];
+const motionPresets = [
+  { name: "천천히 확대", label: "108%", start: 1, end: 1.08 },
+  { name: "천천히 축소", label: "100%", start: 1.08, end: 1 },
+  { name: "가까이", label: "120%", start: 1, end: 1.2 },
+  { name: "모션 초기화", label: "—", start: 1, end: 1 },
+];
+const maskPresets = [
+  {
+    name: "원형 프레임",
+    type: "circle",
+    width: 0.85,
+    height: 0.85,
+    feather: 0,
+  },
+  {
+    name: "소프트 원형",
+    type: "circle",
+    width: 0.95,
+    height: 0.95,
+    feather: 0.25,
+  },
+  {
+    name: "사각 프레임",
+    type: "rectangle",
+    width: 0.85,
+    height: 0.85,
+    feather: 0,
+  },
+  {
+    name: "마스크 해제",
+    type: "none",
+    width: 1,
+    height: 1,
+    feather: 0,
+  },
+];
 function durationLabel(value: number) {
   const seconds = Math.max(0, Math.floor(value));
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
@@ -195,6 +240,20 @@ export function Library({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [captionPath, setCaptionPath] = useState("");
+  const [brokenThumbs, setBrokenThumbs] = useState<string[]>([]);
+  const query = search.trim().toLowerCase();
+  const matches = (name: string) => name.toLowerCase().includes(query);
+  const builtInMatches =
+    tab === "text"
+      ? textPresets.filter((p) => matches(p.name)).length
+      : tab === "stickers"
+        ? badgePresets.filter((p) => matches(p.label)).length
+        : tab === "filters"
+          ? filters.filter((p) => matches(p.name)).length
+          : tab === "transitions"
+            ? fadePresets.filter((p) => matches(p.name)).length
+            : [...motionPresets, ...maskPresets].filter((p) => matches(p.name))
+                .length;
   const pathInput = useRef<HTMLInputElement>(null);
   const assets = useMemo(
     () =>
@@ -202,7 +261,7 @@ export function Library({
         (m) =>
           (tab !== "audio" || m.kind === "audio" || m.hasAudio) &&
           (mediaFilter === "all" || m.kind === mediaFilter) &&
-          m.name.toLowerCase().includes(search.toLowerCase()),
+          m.name.toLowerCase().includes(search.trim().toLowerCase()),
       ),
     [project.media, tab, mediaFilter, search],
   );
@@ -268,6 +327,36 @@ export function Library({
         mediaId: media.id, start: playhead,
         ...(targetTrack?.kind === (media.kind === "audio" ? "audio" : "video") ? { trackId: targetTrack.id } : {}),
       });
+  };
+  const removeMedia = (media: Media) => {
+    if (project.clips.some((clip) => clip.mediaId === media.id)) {
+      setError("");
+      setNotice(
+        `‘${media.name}’은(는) 타임라인에서 사용 중입니다. 해당 클립을 먼저 삭제해 주세요.`,
+      );
+      return;
+    }
+    void run(`remove-${media.id}`, "media.remove", {
+      id: media.id,
+      expectedRevision: project.revision,
+    });
+  };
+  const relinkMedia = async (media: Media) => {
+    try {
+      const files = await pickFiles();
+      if (files?.[0])
+        await run(`relink-${media.id}`, "media.relink", {
+          id: media.id,
+          path: files[0],
+          expectedRevision: project.revision,
+        });
+      else if (files === null)
+        setNotice(
+          "브라우저에서는 CLI의 media.relink 명령으로 원본 경로를 다시 지정할 수 있습니다.",
+        );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
   const addText = (label: string, style: Record<string, unknown> = {}) =>
     run(label, "edit.add", {
@@ -398,6 +487,22 @@ export function Library({
           </div>
         </aside>
         <div className="library-content">
+          {tab !== "captions" && (
+            <label className="panel-search">
+              <Search size={14} />
+              <input
+                aria-label="소재 검색"
+                placeholder={`${tabs.find((t) => t.id === tab)!.label} 검색`}
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              {search && (
+                <button aria-label="검색 지우기" onClick={() => setSearch("")}>
+                  <X size={13} />
+                </button>
+              )}
+            </label>
+          )}
           {(tab === "media" || tab === "audio") && (
             <>
               <div className="library-actions">
@@ -415,30 +520,13 @@ export function Library({
                   expectedRevision: project.revision,
                 })}
               ><AudioLines size={14} />오디오 분류 다시 확인 ({audioToRecheck.length})</button>}
-              <label className="panel-search">
-                <Search size={14} />
-                <input
-                  aria-label="소재 검색"
-                  placeholder="소재 검색"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                />
-                {search && (
-                  <button
-                    aria-label="검색 지우기"
-                    onClick={() => setSearch("")}
-                  >
-                    <X size={13} />
-                  </button>
-                )}
-              </label>
               {assets.length > 0 ? (
                 <div className="media-grid">
                   {assets.map((media) => (
                     <article
                       className="media-tile"
                       key={media.id}
-                      draggable
+                      draggable={!media.missing}
                       onDragStart={(e) => {
                         e.dataTransfer.setData(
                           "application/x-studio-media",
@@ -450,19 +538,50 @@ export function Library({
                     >
                       <div
                         className="media-thumb"
-                        onDoubleClick={() => void addMedia(media)}
+                        onDoubleClick={() =>
+                          !media.missing && void addMedia(media)
+                        }
                       >
                         {media.kind === "audio" ? (
                           <div className="audio-asset-art">
                             <AudioLines size={34} />
+                          </div>
+                        ) : media.missing ||
+                          brokenThumbs.includes(`${media.id}:${media.path}`) ? (
+                          <div className="audio-asset-art">
+                            {media.kind === "video" ? (
+                              <Film size={30} />
+                            ) : (
+                              <Image size={30} />
+                            )}
                           </div>
                         ) : (
                           <img
                             src={assetUrl(media.id, true)}
                             alt=""
                             draggable={false}
+                            onError={() =>
+                              setBrokenThumbs((keys) => [
+                                ...keys,
+                                `${media.id}:${media.path}`,
+                              ])
+                            }
                           />
                         )}
+                        {media.missing && (
+                          <span className="media-missing">
+                            <TriangleAlert size={11} /> 원본 없음
+                          </span>
+                        )}
+                        <button
+                          className="remove-media"
+                          title="프로젝트에서 소재 삭제"
+                          aria-label={`${media.name} 소재 삭제`}
+                          disabled={pending !== null}
+                          onClick={() => removeMedia(media)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
                         <span className="media-kind">
                           {media.kind === "video" ? (
                             <Film size={11} />
@@ -481,7 +600,7 @@ export function Library({
                           className="add-media"
                           title="타임라인에 추가"
                           aria-label={`${media.name} 타임라인에 추가`}
-                          disabled={pending !== null}
+                          disabled={pending !== null || media.missing}
                           onClick={() => void addMedia(media)}
                         >
                           {pending === media.id ? (
@@ -492,6 +611,16 @@ export function Library({
                         </button>
                       </div>
                       <p title={media.name}>{media.name}</p>
+                      {media.missing && (
+                        <button
+                          className="relink-media"
+                          disabled={pending !== null}
+                          aria-label={`${media.name} 원본 다시 연결`}
+                          onClick={() => void relinkMedia(media)}
+                        >
+                          다시 연결
+                        </button>
+                      )}
                     </article>
                   ))}
                 </div>
@@ -579,41 +708,10 @@ export function Library({
                 <Plus size={16} />
               </button>
               {targetTrack?.kind === "text" && <p className="panel-help">추가할 트랙: {targetTrack.name}</p>}
-              <FontLibrary project={project} selected={selected} onCommand={onCommand} />
+              <FontLibrary project={project} selected={selected} onCommand={onCommand} query={query} />
               <h3 className="library-section-title">텍스트 프리셋</h3>
               <div className="text-preset-grid">
-                {[
-                  {
-                    label: "제목을 입력하세요",
-                    name: "타이틀",
-                    style: { fontSize: 92, bold: true },
-                  },
-                  {
-                    label: "작은 순간, 오래 남는 기억",
-                    name: "시네마",
-                    style: { fontSize: 46, fontFamily: "Georgia" },
-                  },
-                  {
-                    label: "오늘의 기록",
-                    name: "하이라이트",
-                    style: { fontSize: 66, bold: true, color: "#ffe76a" },
-                  },
-                  {
-                    label: "여기에 자막을 입력하세요",
-                    name: "자막",
-                    style: { fontSize: 40, background: "#18191de6" },
-                  },
-                  {
-                    label: "CHAPTER 01",
-                    name: "챕터",
-                    style: { fontSize: 44, bold: true },
-                  },
-                  {
-                    label: "이야기가 시작되는 곳",
-                    name: "미니멀",
-                    style: { fontSize: 38 },
-                  },
-                ].map((item, i) => (
+                {textPresets.map((item, i) => matches(item.name) && (
                   <button
                     className={`text-preset text-preset-${i}`}
                     disabled={pending !== null}
@@ -643,14 +741,7 @@ export function Library({
             <>
               <h3 className="library-section-title">텍스트 배지</h3>
               <div className="badge-preset-grid">
-                {[
-                  { label: "NEW", color: "#191b20", background: "#d5fb72" },
-                  { label: "REC", color: "#ffffff", background: "#dd4a51" },
-                  { label: "LIVE", color: "#ffffff", background: "#7956d8" },
-                  { label: "01", color: "#ffffff", background: "#305b8f" },
-                  { label: "TIP", color: "#161a1d", background: "#40d3c6" },
-                  { label: "DAY 1", color: "#1b1b1b", background: "#f0cf91" },
-                ].map((b) => (
+                {badgePresets.map((b) => matches(b.label) && (
                   <button
                     key={b.label}
                     disabled={pending !== null}
@@ -679,9 +770,9 @@ export function Library({
           )}
           {tab === "filters" && (
             <>
-              <PresetLibrary kind="filter" project={project} selected={selected} onCommand={onCommand} />
+              <PresetLibrary kind="filter" project={project} selected={selected} onCommand={onCommand} query={query} />
               <h3 className="library-section-title">
-                컬러 프리셋 <span>{filters.length}</span>
+                컬러 프리셋 <span>{builtInMatches}</span>
               </h3>
               {!selected && (
                 <p className="panel-hint">
@@ -689,7 +780,7 @@ export function Library({
                 </p>
               )}
               <div className="filter-grid">
-                {filters.map((filter) => (
+                {filters.map((filter) => matches(filter.name) && (
                   <button
                     key={filter.id}
                     className={`filter-preset ${selected?.filter === filter.id ? "active" : ""}`}
@@ -704,10 +795,7 @@ export function Library({
                     onFocus={() => selected && preview(selected.id, { color: filter.color, filter: filter.id })}
                     onBlur={() => selected && preview(selected.id, null)}
                     onClick={() =>
-                      void patchSelected(filter.id, {
-                        color: filter.color,
-                        filter: filter.id,
-                      })
+                      void patchSelected(filter.id, { filter: filter.id })
                     }
                   >
                     <div className="filter-preview">
@@ -739,12 +827,7 @@ export function Library({
                 선택한 클립의 시작과 끝을 부드럽게 연결합니다.
               </p>
               <div className="effect-preset-grid">
-                {[
-                  { name: "없음", in: 0, out: 0 },
-                  { name: "페이드 인", in: 0.5, out: 0 },
-                  { name: "페이드 아웃", in: 0, out: 0.5 },
-                  { name: "인 + 아웃", in: 0.5, out: 0.5 },
-                ].map((effect, i) => (
+                {fadePresets.map((effect, i) => matches(effect.name) && (
                   <button
                     key={effect.name}
                     disabled={!selected || pending !== null}
@@ -775,18 +858,13 @@ export function Library({
           )}
           {tab === "effects" && (
             <>
-              <PresetLibrary kind="effect" project={project} selected={selected} onCommand={onCommand} />
+              <PresetLibrary kind="effect" project={project} selected={selected} onCommand={onCommand} query={query} />
               <h3 className="library-section-title">모션 프리셋</h3>
               <p className="panel-hint">
                 선택한 클립에 편집 가능한 키프레임을 추가합니다.
               </p>
               <div className="effect-preset-grid">
-                {[
-                  { name: "천천히 확대", label: "108%", start: 1, end: 1.08 },
-                  { name: "천천히 축소", label: "100%", start: 1.08, end: 1 },
-                  { name: "가까이", label: "120%", start: 1, end: 1.2 },
-                  { name: "모션 초기화", label: "—", start: 1, end: 1 },
-                ].map((effect) => (
+                {motionPresets.map((effect) => matches(effect.name) && (
                   <button
                     key={effect.name}
                     disabled={
@@ -826,36 +904,7 @@ export function Library({
                 프레임 마스크
               </h3>
               <div className="effect-preset-grid">
-                {[
-                  {
-                    name: "원형 프레임",
-                    type: "circle",
-                    width: 0.85,
-                    height: 0.85,
-                    feather: 0,
-                  },
-                  {
-                    name: "소프트 원형",
-                    type: "circle",
-                    width: 0.95,
-                    height: 0.95,
-                    feather: 0.25,
-                  },
-                  {
-                    name: "사각 프레임",
-                    type: "rectangle",
-                    width: 0.85,
-                    height: 0.85,
-                    feather: 0,
-                  },
-                  {
-                    name: "마스크 해제",
-                    type: "none",
-                    width: 1,
-                    height: 1,
-                    feather: 0,
-                  },
-                ].map((effect) => (
+                {maskPresets.map((effect) => matches(effect.name) && (
                   <button
                     key={effect.name}
                     disabled={
@@ -948,7 +997,8 @@ export function Library({
                       const result = await run(
                         "caption-export",
                         "captions.export",
-                        { path },
+                        // The native save dialog already confirmed replacing a file.
+                        { path, overwrite: true },
                       );
                       if (result) setNotice(`자막을 저장했습니다: ${path}`);
                     } else {
@@ -965,6 +1015,13 @@ export function Library({
               </button>
             </>
           )}
+          {query &&
+            builtInMatches === 0 &&
+            !["media", "audio", "captions"].includes(tab) && (
+              <p className="panel-hint" role="status">
+                기본 소재에 검색 결과가 없습니다.
+              </p>
+            )}
           <SpeechPanel
             mode={tab === "audio" ? "synthesize" : "transcribe"}
             visible={tab === "audio" || tab === "captions"}

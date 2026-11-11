@@ -11,23 +11,8 @@ import sys
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-PROJECT_METHODS = ['project.get', 'project.list', 'project.save', 'history.status']
-EDIT_METHODS = ['edit.add', 'edit.update', 'edit.delete', 'edit.split', 'edit.trim', 'edit.duplicate',
-                'edit.track', 'edit.marker', 'edit.batch', 'history.undo', 'history.redo',
-                'project.update', 'media.import', 'media.importAndAdd', 'media.reprobe', 'captions.import', 'captions.export',
-                'color.importLut', 'edit.group', 'edit.ungroup']
-EXPORT_METHODS = ['export.start', 'export.status', 'export.cancel', 'preview.frame', 'preview.start']
-MEMORY_METHODS = ['memory.search', 'memory.record']
-SPEECH_METHODS = ['speech.status', 'speech.transcribe', 'speech.synthesize', 'speech.job', 'speech.cancel']
-ASSET_METHODS = ['assets.list', 'fonts.import', 'fonts.remove', 'fonts.apply', 'presets.save', 'presets.import', 'presets.export', 'presets.remove', 'presets.apply']
-TOOLS = [
-    {'name': 'studio_project', 'description': 'Read the open video project, its media/tracks/clips/concept, list saved projects, save the current project, or inspect undo history. All times are seconds. Read project.get before editing.', 'methods': PROJECT_METHODS},
-    {'name': 'studio_edit', 'description': 'Apply real edits to Studio and its visible timeline. Methods: edit.add {mediaId,trackId,start,duration,text}; edit.update {id,patch,expectedRevision}; edit.split {id,time:absolute,expectedRevision?}; edit.trim {id,start?:absolute,end?:absolute,expectedRevision?} (retain absolute timeline range, omit unchanged boundary, minimum one frame, source-bounded extension allowed); edit.delete {ids,ripple}; edit.duplicate {ids}; edit.group/ungroup {ids}; color.importLut {id,path,expectedRevision}; edit.track {id,patch} or {kind,name?,clipIds?} (create a compatible layer and optionally move clips, one undo); edit.marker {time,label}; edit.batch {commands:[{method,params}],expectedRevision} (atomic, one undo); history.undo/redo; project.update {patch}; media.import {paths}; media.reprobe {ids,expectedRevision} (refresh metadata and repair album-art MP3 clips without changing timing, one undo); media.importAndAdd {paths,start?,trackId?,expectedRevision?}; captions.import/export {path}. Use exact IDs from project.get. Never report unsupported edits as completed.', 'methods': EDIT_METHODS},
-    {'name': 'studio_export', 'description': 'Render actual output or inspect a composited preview frame. export.start {path,width?,height?,fps?,format?,start?,end?} returns job id. export.status {id} reports progress and success/failure. export.cancel {id}. preview.frame {time,width?} returns the rendered frame as an image.', 'methods': EXPORT_METHODS},
-    {'name': 'studio_memory', 'description': 'Use ByoriDB creative memory. memory.search {text?,limit?} recalls concepts, edits and feedback across projects. memory.record {body,kind?,clipId?} records intent or feedback for the current project. Distinguish user-confirmed feedback from your own hypothesis; do not invent observations.', 'methods': MEMORY_METHODS},
-    {'name': 'studio_speech', 'description': 'Local speech processing. speech.status lists available voices and Whisper. speech.transcribe {language:ko|en|auto,model:tiny|base|small,translate?:bool} transcribes the current timeline and inserts captions. speech.synthesize {text,voice?,rate?,start?} creates narration and inserts audio. Both return job id; poll speech.job {id}, cancel with speech.cancel {id}. First transcription downloads the model. Changed projects are not overwritten.', 'methods': SPEECH_METHODS},
-    {'name': 'studio_assets', 'description': 'Manage reusable local fonts and filter/effect presets. assets.list {}; fonts.import {path,name?} accepts TTF/OTF; fonts.apply {id,clipId,expectedRevision}; presets.save {clipId,name,kind:filter|effect}; presets.import/export {path,id?} uses Studio JSON; presets.apply {id,clipId,expectedRevision}. fonts.remove/presets.remove {id} remove catalog entries. Applying uses the same validated undoable editor commands. Never describe arbitrary executable plugins as supported.', 'methods': ASSET_METHODS},
-]
+# One definition of the agent-facing tools, shared with the service's server-side allowlist.
+TOOLS = json.loads(Path(__file__).with_name('studio-tools.json').read_text(encoding='utf-8'))['tools']
 
 
 def connection_path():

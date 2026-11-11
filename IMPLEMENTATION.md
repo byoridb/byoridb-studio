@@ -1,6 +1,6 @@
 # Studio implementation contract
 
-This describes the implemented local API as of 2026-11-01. Product direction lives in PRODUCT.md and ROADMAP.md; this document describes actual requests and responses rather than future scope.
+This describes the implemented local API as of 2026-11-11. Product direction lives in PRODUCT.md and ROADMAP.md; this document describes actual requests and responses rather than future scope.
 
 ## Service and transport
 
@@ -21,7 +21,7 @@ Content-Type: application/json
 - Successful mutations increment revision and atomically persist `current.json` and `projects/<id>.json`. Undo/redo also increment revision. Undo history and job registries are in memory for the service lifetime.
 - `project.get` polling updates the UI. There is **no `/events` endpoint**.
 
-The private connection file is `{url,token}` in `connection.json` with mode `0600`; the data root has mode `0700`. `GET /session` returns that connection only to Origin `http://localhost:1420` or `http://127.0.0.1:1420`; missing Origin is rejected. Other authenticated endpoints accept these development origins plus `tauri://localhost`, `http://tauri.localhost`, and `https://tauri.localhost`. Local nonbrowser clients may omit Origin.
+The private connection file is `{url,token}` in `connection.json` with mode `0600`; the data root has mode `0700`. `GET /session` exists only in the development service (`studio-service`) and returns that connection only to Origin `http://localhost:<BYORI_STUDIO_DEV_PORT>` or `http://127.0.0.1:<BYORI_STUDIO_DEV_PORT>` (default 1420); missing Origin is rejected. The browser UI reaches the service on `VITE_STUDIO_PORT` (default 43123). Other authenticated endpoints accept these development origins plus `tauri://localhost`, `http://tauri.localhost`, and `https://tauri.localhost`. Local nonbrowser clients may omit Origin.
 
 `GET /assets/<assetId>` and `/assets/<assetId>/thumbnail` accept `?token=...` or the bearer header and support byte ranges. IDs resolve only to current-project media or registered generated previews. There is no arbitrary-path file-serving endpoint.
 
@@ -132,16 +132,17 @@ All Editor methods accept optional `expectedRevision` as described above. Mutati
 
 | Method | Parameters | Result / behavior |
 | --- | --- | --- |
-| `project.get` | `{}` | Project |
+| `project.get` | `{ifProjectId?,ifRevision?}` | Project, or `{unchanged:true,id,revision,missing:string[]}` when both match and no `Media.missing` flag changed in this call; `missing` lists the ids of media whose file is absent |
 | `project.list` | `{}` | `[{id,name,updatedAt}]` |
 | `project.new` | `{name?,width?,height?,fps?}` | New Project; resets session undo history |
 | `project.open` | `{id? ,path?}` | Opens saved Project; resets undo history |
-| `project.save` | `{path?}` | `{path,project}` |
+| `project.save` | `{path?,overwrite?}` | `{path,project}`; agent tokens may not pass `path` |
 | `project.update` | `{patch}` | Permitted project metadata, dimensions, concept, notes, markers |
 | `project.demo` | `{}` | Creates explicit sample project using real bundled media |
 | `media.import` | `{paths:string[]}` | Probes and imports 1..100 files |
 | `media.importAndAdd` | `{paths,start?,trackId?,duration?}` | Imports and places sequential clips in one undoable commit; selects a suitable unlocked track if omitted |
 | `media.reprobe` | `{ids:string[],expectedRevision?}` | Reprobes 1..100 distinct existing media IDs; repairs misclassified audio clips and returns Project in one undoable commit |
+| `media.relink` | `{id,path,expectedRevision?}` | Points an existing media ID at another file and refreshes its metadata in one undoable commit; rejects a file of a different kind or one already in the project |
 | `media.remove` | `{id}` | Rejects media still used by clips |
 | `edit.add` | `{mediaId?,trackId?,start?,duration?,text?}` | Adds media or text; text may be string or text object |
 | `edit.update` | `{id,patch}` | Deep-merges permitted clip fields; rejects locked target track |
@@ -158,7 +159,7 @@ All Editor methods accept optional `expectedRevision` as described above. Mutati
 | `history.undo` / `history.redo` | `{}` | Updated Project |
 | `history.status` | `{}` | `{canUndo,canRedo}` |
 | `captions.import` | `{path}` | Parses SRT and adds editable text clips |
-| `captions.export` | `{path}` | `{path}` containing exported SRT |
+| `captions.export` | `{path,overwrite?}` | `{path}` containing exported SRT |
 
 Selection is frontend state; groupId persists in Project. Multi-clip move uses an atomic batch of `edit.update`. Callers must send all intended selected IDs; one `edit.update` does not implicitly update every member of a group.
 
@@ -166,7 +167,7 @@ Clip editing uses the same `edit.trim` contract from handles, Q/W shortcuts and 
 
 The selected target track is also frontend state. The library uses it for compatible media/text additions. The timeline supports explicit video/audio/text track creation, inline rename, existing-track moves, and new-track separation. Vertical dragging accepts only compatible unlocked destinations; horizontal dragging preserves the original tracks of a multi-layer selection. Creating a track with `clipIds` preserves clip identity, timing, settings and group membership, and is one undo entry. A stale revision, locked source or incompatible clip kind rejects the operation without a partial track or move.
 
-Later entries in `Project.tracks` composite above earlier visual entries. New tracks are inserted after the last of their kind; new video tracks are additionally kept before the first text track, preserving captions above new footage. There is no track reorder control in the current UI.
+Later entries in `Project.tracks` composite above earlier visual entries. New tracks are inserted after the last of their kind; new video tracks are additionally kept before the first text track, preserving captions above new footage. `edit.trackMove` and the track header's up/down buttons reorder tracks; `edit.trackDelete` removes an unlocked track with its clips.
 
 Media probing ignores attached album artwork and timed thumbnails when deciding whether a file has playable video. An MP3 with only audio plus cover art is an audio asset. `media.reprobe` refreshes metadata without replacing the existing media ID, name or source path. If a former video asset proves to be audio, its video clips become audio clips on new audio tracks associated with their original layers; source-track mute/visibility and clip timing, source offset, volume and other settings are retained. Video stabilization is disabled on those repaired audio clips. Reimporting an existing source path uses the same repair without creating a duplicate asset. Locked referenced tracks, unknown/duplicate IDs or revision conflicts reject the whole project change. This is an explicit repair, not an automatic rewrite when opening a project.
 
@@ -192,7 +193,7 @@ Catalog data lives in `catalog/index.json`; changes to this application-wide cat
 
 ### Rendering and previews
 
-- `export.start {path?,width?,height?,fps?,format?,crf?,start?,end?}` → `{id}`. Formats are `mp4|mov|webm|mp3|wav`; the extension must match. MP3/WAV render the timeline audio mix. Range is absolute seconds. Output may not overwrite current source media or a path used by a running export.
+- `export.start {path?,width?,height?,fps?,format?,crf?,start?,end?,overwrite?}` → `{id}`. Formats are `mp4|mov|webm|mp3|wav`; the extension must match. MP3/WAV render the timeline audio mix. Range is absolute seconds. Output may not overwrite current source media or a path used by a running export.
 - `export.status {id}` → `{id,state,progress,path,projectRevision,error?}`. `progress` is 0..1; states are `queued|running|completed|failed|cancelled`. Exports render a captured Project snapshot, not later edits.
 - `export.cancel {id}` → `{id,state:"cancelling"}` for an active job, otherwise its current status. Poll until terminal.
 - `preview.frame {time,width?,expectedRevision?}` → `{path,assetId,width,height,time,revision,projectId,cacheHit}`. Actual PNG composed by the render pipeline. Width defaults to 640, clamped to 64..1920 and even pixels.
@@ -235,7 +236,8 @@ An installed CLI is not proof of authentication. Status uses the provider's avai
 - `runtime.install {tag}` → `{id,state:"running"}`. Validates a stable semantic version and platform asset, prevents downgrade, downloads/validates the release, preserves existing data and credentials, and replaces the binary with rollback on failure. Existing known Byori installations are reused. Live unmanaged external DB processes are not replaced.
 - `runtime.installStatus {id}` → `{id,kind:"install",state,progress,logs:[{at,stream,text}],tag,error?}`. Installation does not currently offer mid-transaction cancellation.
 - `runtime.start {}` → RuntimeStatus after attempting to start the detected local DB.
-- `agent.start {provider:"claude"|"codex"|"gemini",prompt}` → `{id}`. Uses the locally installed CLI, a per-job working directory and MCP configuration, and a connection file bound to the original project ID. Prompts are nonempty and limited to 64 KB.
+- `agent.list {}` → up to 50 recent jobs `[{id,provider,state,projectId,startedAt,finishedAt?}]`, newest first.
+- `agent.start {provider:"claude"|"codex"|"gemini",prompt,clipId?}` → `{id}`. The job gets its own token; the service limits that token to the methods in `scripts/studio-tools.json` (403 otherwise), to the project open at start (409 after a switch) and to the job's lifetime (401 afterwards). Agent file output is new files only, in `<data root>/exports` or the user's Movies/Videos/Documents/Desktop/Downloads/Music folders. Uses the locally installed CLI, a per-job working directory and MCP configuration, and a connection file bound to the original project ID. Prompts are nonempty and limited to 64 KB.
 - `agent.status {id}` → `{id,provider,state,projectId,startedAt,finishedAt?,logs:[{at,stream,text}],result?:string,error?,authRequired?}`. States are `running|cancelling|completed|failed|cancelled`; completion describes the CLI session, and actual edits must be confirmed by tool results/Project state.
 - `agent.cancel {id}` → current job; requests process-group termination. Agent runtime is limited to 15 minutes. `runtime.cancel` is an alias for this job-cancellation handler; an install without a cancellation channel is unchanged.
 - `memory.search {text?,limit?}` → `{items:MemoryNote[],source:"byoridb"}`. Defaults: empty search and limit 30, clamped 1..100. Searches persisted creative records across projects.
@@ -259,8 +261,38 @@ References: [Higgsfield connection guide](https://higgsfield.ai/creator-hub/help
 
 ## MCP / direct CLI
 
-`scripts/studio-mcp.py` is a dependency-free Python stdio MCP server. `scripts/studio-cli.py` calls the same authenticated RPC methods. Both default to `~/.byori-studio/connection.json`; `--connection <path>` selects a connection file. MCP also honors `BYORI_STUDIO_HOME`. Per-agent files include `projectId`, which the bridge forwards as the top-level RPC field.
+`scripts/studio-mcp.py` is a dependency-free Python stdio MCP server. `scripts/studio-cli.py` calls the same authenticated RPC methods. Both default to `~/.byori-studio/connection.json` and honor `BYORI_STUDIO_HOME`; `--connection <path>` selects a connection file. The agent-facing methods are defined once in `scripts/studio-tools.json`, which the MCP server, the CLI and the service's server-side agent allowlist all read. Per-agent files include `projectId`, which the bridge forwards as the top-level RPC field.
 
 Six tools expose explicit allowlists: `studio_project`, `studio_edit`, `studio_export`, `studio_memory`, `studio_speech`, `studio_assets`. They accept `{method,params?}`. The assets tool exposes the font/preset catalog and validated application commands. The editing tool includes group/ungroup, multi-duplicate, managed LUT import and atomic media import/place. The export tool includes both preview methods; `preview.frame` additionally returns a PNG image block when its generated file is below 10 MB. Unsupported methods and backend errors produce `isError:true`.
 
-The allowlists are narrower than the full service: they do not expose runtime software installation, spawning other agents, or arbitrary shell execution. See `scripts/studio-mcp.py` for the authoritative enum. Each CLI receives workspace-local Studio configuration rather than a mutation of the user's global CLI settings.
+The allowlists are narrower than the full service: they do not expose runtime software installation, spawning other agents, or arbitrary shell execution. See `scripts/studio-tools.json` for the authoritative lists. Each CLI receives workspace-local Studio configuration rather than a mutation of the user's global CLI settings.
+
+## Schema version 2 additions
+
+Projects carry `schemaVersion` (currently 2); older files are migrated when opened and newer ones are refused. An unreadable `current.json` is kept as `current.json.corrupt-<ms>` and the most recent valid project (or an empty one) is opened; `project.notice {}` → `{notice}` reports it and `project.noticeDismiss {}` clears it.
+
+- `project.delete {id}` → list (the open project is refused), `project.duplicate {id}` → `{id,name,updatedAt}` (not opened), `project.rename {id,name}` → list.
+- `Media.missing` is `true` while the source file is absent (refreshed without a revision bump); `media.relink {id,path,expectedRevision?}` → Project.
+- `edit.trackDelete {id}`, `edit.trackMove {id,index}`, `edit.markerUpdate {id,time?,label?}`, `edit.markerDelete {id}`, `edit.paste {clips,at}` → Project; all accept `expectedRevision` and undo in one step.
+- Filter ids are `none|cinematic|warm|cool|mono|vintage`; setting only `filter` merges brightness/contrast/saturation/temperature and keeps hsl/curves/lut/hue. `transitionIn/Out` is `null` or `{type:"fade",duration}`.
+- `export.start`, `project.save {path}`, `captions.export` and (with `overwrite:false`) `presets.export` fail with `FILE_EXISTS` when the target exists unless `overwrite:true`. `project.save`/`captions.export` never write into the data root except its `exports` folder.
+- `preview.frame`: a newer UI request for different content ends older UI requests with `PREVIEW_CANCELLED`. Agent requests neither cancel nor are cancelled.
+- `Media.waveform` holds 128–1024 peaks (by duration) spanning the whole file, decoded from 8 kHz mono audio. Audio shorter than the container, or anything not decoded within 15 seconds, stays zero rather than stretching. Probing (FFprobe, thumbnail, waveform) runs inside the import/reprobe/relink command under the editor lock.
+- Text clips name themselves after at most the first 1000 bytes of their content. `presets.apply`/`presets.import` accept old filter ids (`cinema` → `cinematic`, unknown → `none`).
+- A successfully applied transcription removes its work folder, so its `speech.job` has no `output`.
+
+### Windowed rendering
+
+Frames, preview ranges and export ranges use the same filter graph as a full export. For a window that starts inside a forward video/audio clip, FFmpeg seeks the input to 0.5 s of source before the window, decodes 0.5 s past its end, restores full-timeline timestamps with `setpts` (compensating the seek's rounding to stream ticks) and trims to the window, so a windowed frame equals the same frame of the full render. Reversed clips decode only their window and are re-timed from zero. A slow-motion or low-fps clip holds its last source frame to the clip end.
+
+### Agent tokens
+
+`agent.start` issues a token for that job only. The service accepts it only for methods listed in `scripts/studio-tools.json` (HTTP 403 otherwise), only while the project open at start is still open (409) and only while the job runs (401). With it, `project.save` takes no `path`, and export/caption/preset output must be a new file in `<data root>/exports` or the user's Movies/Videos/Documents/Desktop/Downloads/Music folders. The UI token in `connection.json` is unrestricted.
+
+### Process lifetime
+
+Agents, speech tools, MCP probes and a Studio-started ByoriDB run in their own process groups, which are terminated and then killed on cancel and on shutdown. At exit the app and `studio-service` also kill their remaining direct children (a running FFmpeg export) and delete the `.<name>.<id>.partial.<ext>` files of unfinished exports. `previews/` and `renders/` are emptied at the next start. `studio-service` refuses to start while the desktop app's service owns the port; the app attaches to a compatible running `studio-service` and refuses a second app instance.
+
+### Removed
+
+The earlier database-explorer UI (`src/components/` and its stylesheets) and `src-tauri/src/client.rs` are deleted. ByoriDB is reached only through `runtime.rs`.

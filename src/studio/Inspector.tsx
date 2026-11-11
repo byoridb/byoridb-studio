@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlignCenter,
   AlignLeft,
@@ -146,6 +146,85 @@ function NumberField({
   );
 }
 
+/**
+ * Previews while the picker is open and commits once when it closes. The picker
+ * only speaks lowercase #rrggbb, so a stored value is compared in that form and
+ * its alpha suffix is carried through: focusing or closing the picker without
+ * choosing anything never commits.
+ */
+function ColorField({
+  label,
+  name,
+  value,
+  onCommit,
+  onPreview,
+  showCode = true,
+}: {
+  label: string;
+  name: string;
+  value: string;
+  onCommit: (value: string) => unknown;
+  onPreview?: (value: string | null) => void;
+  showCode?: boolean;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const base = value.slice(0, 7).toLowerCase();
+  const alpha = value.slice(7);
+  const latest = useRef({ base, alpha, onCommit, onPreview, sent: "" });
+  latest.current = { ...latest.current, base, alpha, onCommit, onPreview };
+  useEffect(() => {
+    setDraft(null);
+    latest.current.sent = "";
+  }, [value]);
+  useEffect(() => {
+    const element = input.current!;
+    // React's onChange fires on every picker movement; the native change and
+    // blur events fire once when the choice is final.
+    const commit = () => {
+      const state = latest.current;
+      const next = element.value;
+      if (next === state.sent) return;
+      if (next === state.base) {
+        setDraft(null);
+        state.onPreview?.(null);
+        return;
+      }
+      state.sent = next;
+      // A rejected commit leaves `value` unchanged, so drop the draft and the
+      // guard once it settles: the field shows the stored color again and the
+      // same color can be chosen again.
+      void Promise.resolve(state.onCommit(next + state.alpha)).finally(() => {
+        if (latest.current.sent !== next) return;
+        latest.current.sent = "";
+        setDraft(null);
+      });
+    };
+    element.addEventListener("change", commit);
+    element.addEventListener("blur", commit);
+    return () => {
+      element.removeEventListener("change", commit);
+      element.removeEventListener("blur", commit);
+    };
+  }, []);
+  return (
+    <label className="inspector-color-field">
+      <span>{label}</span>
+      <input
+        ref={input}
+        aria-label={name}
+        type="color"
+        value={draft ?? base}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          onPreview?.(e.target.value + alpha);
+        }}
+      />
+      {showCode && <code>{draft ? draft + alpha : value}</code>}
+    </label>
+  );
+}
+
 function TextField({
   label,
   value,
@@ -256,7 +335,7 @@ export function Inspector({
   };
   const patch = (changes: Record<string, unknown>) =>
     selected &&
-    void run("edit.update", {
+    run("edit.update", {
       id: selected.id,
       patch: changes,
       expectedRevision: project.revision,
@@ -531,20 +610,14 @@ export function Inspector({
                   ))}
                 </select>
               </label>
-              <label className="inspector-color-field">
-                <span>배경</span>
-                <input
-                  aria-label="프로젝트 배경 색상"
-                  type="color"
-                  value={project.background || "#000000"}
-                  onChange={(e) =>
-                    void run("project.update", {
-                      patch: { background: e.target.value },
-                    })
-                  }
-                />
-                <code>{project.background}</code>
-              </label>
+              <ColorField
+                label="배경"
+                name="프로젝트 배경 색상"
+                value={project.background || "#000000"}
+                onCommit={(value) =>
+                  run("project.update", { patch: { background: value } })
+                }
+              />
             </Section>
             <div className="inspector-empty-hint">
               <Film size={25} />
@@ -642,16 +715,15 @@ export function Inspector({
                         </button>
                       ))}
                     </div>
-                    <label className="inspector-color-field">
-                      <span>텍스트 색상</span>
-                      <input
-                        aria-label="텍스트 색상"
-                        type="color"
-                        value={text.color}
-                        onChange={(e) => patchText("color", e.target.value)}
-                      />
-                      <code>{text.color}</code>
-                    </label>
+                    <ColorField
+                      label="텍스트 색상"
+                      name="텍스트 색상"
+                      value={text.color}
+                      onCommit={(value) => patchText("color", value)}
+                      onPreview={(value) =>
+                        value === null ? clearDraft() : draftText("color", value)
+                      }
+                    />
                     <label className="inspector-check">
                       <input
                         type="checkbox"
@@ -666,17 +738,18 @@ export function Inspector({
                       <span>배경 표시</span>
                     </label>
                     {text.background !== "transparent" && (
-                      <label className="inspector-color-field">
-                        <span>텍스트 배경</span>
-                        <input
-                          aria-label="텍스트 배경 색상"
-                          type="color"
-                          value={text.background.slice(0, 7)}
-                          onChange={(e) =>
-                            patchText("background", e.target.value)
-                          }
-                        />
-                      </label>
+                      <ColorField
+                        label="텍스트 배경"
+                        name="텍스트 배경 색상"
+                        showCode={false}
+                        value={text.background}
+                        onCommit={(value) => patchText("background", value)}
+                        onPreview={(value) =>
+                          value === null
+                            ? clearDraft()
+                            : draftText("background", value)
+                        }
+                      />
                     )}
                   </Section>
                 )}
@@ -978,18 +1051,17 @@ export function Inspector({
                     </label>
                     {chromaKey.enabled && (
                       <>
-                        <label className="inspector-color-field">
-                          <span>제거할 색상</span>
-                          <input
-                            aria-label="크로마키 색상"
-                            type="color"
-                            value={chromaKey.color}
-                            onChange={(e) =>
-                              patchChroma("color", e.target.value)
-                            }
-                          />
-                          <code>{chromaKey.color}</code>
-                        </label>
+                        <ColorField
+                          label="제거할 색상"
+                          name="크로마키 색상"
+                          value={chromaKey.color}
+                          onCommit={(value) => patchChroma("color", value)}
+                          onPreview={(value) =>
+                            value === null
+                              ? clearDraft()
+                              : draft({ chromaKey: { ...chromaKey, color: value } })
+                          }
+                        />
                         <div className="chroma-colors">
                           <button
                             aria-label="그린 스크린 색상 선택"
@@ -1314,7 +1386,7 @@ export function Inspector({
                         temperature: 0,
                         hue: 0,
                       },
-                      filter: "original",
+                      filter: "none",
                     })
                   }
                 >

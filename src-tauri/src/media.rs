@@ -1,7 +1,14 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::{io::AsyncReadExt, process::Command};
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(30);
+/// media.import probes while the editor is locked, so decoding is cut off early; the
+/// part of a very long or slow file decoded by then is kept.
+const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(15);
+const WAVEFORM_RATE: usize = 8000;
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -56,6 +63,107 @@ fn playable_video(stream: &Value) -> bool {
             })
 }
 
+/// Runs a helper process to completion, killing it when it exceeds `limit`.
+async fn output_within(
+    command: &mut Command,
+    limit: Duration,
+) -> std::io::Result<std::process::Output> {
+    command.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(limit, command.output()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{}초 안에 응답하지 않았습니다", limit.as_secs_f64()),
+        )),
+    }
+}
+
+/// Peak buckets cover the whole file: 8 per second, between 128 and 1024.
+fn waveform_buckets(duration: f64) -> usize {
+    ((duration * 8.0).ceil() as usize).clamp(128, 1024)
+}
+
+/// Reads 16-bit mono samples until EOF or `limit` and keeps one peak per bucket, so
+/// memory stays bounded regardless of the file length. Returns the peaks read so far
+/// and whether the stream ended in time.
+async fn read_peaks<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    duration: f64,
+    limit: Duration,
+) -> (Vec<u16>, bool) {
+    let buckets = waveform_buckets(duration);
+    let per_bucket = ((duration * WAVEFORM_RATE as f64 / buckets as f64).ceil() as usize).max(1);
+    let mut peaks = Vec::with_capacity(buckets);
+    let (mut peak, mut count) = (0u16, 0usize);
+    let read = async {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut pending: Option<u8> = None;
+        loop {
+            let n = match reader.read(&mut buffer).await {
+                Ok(0) => return true,
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            let mut bytes = buffer[..n].iter().copied();
+            while let Some(low) = pending.take().or_else(|| bytes.next()) {
+                let Some(high) = bytes.next() else {
+                    pending = Some(low);
+                    break;
+                };
+                peak = peak.max(i16::from_le_bytes([low, high]).unsigned_abs());
+                count += 1;
+                if count == per_bucket && peaks.len() < buckets {
+                    peaks.push(peak);
+                    (peak, count) = (0, 0);
+                }
+            }
+        }
+    };
+    let complete = tokio::time::timeout(limit, read).await.unwrap_or(false);
+    // A trailing partial bucket is kept unless it is negligible rounding residue.
+    if peaks.len() < buckets && count * 2 >= per_bucket {
+        peaks.push(peak);
+    }
+    (peaks, complete)
+}
+
+/// Decodes the audio stream at 8 kHz mono into exactly `waveform_buckets(duration)`
+/// peaks spanning the media duration. Audio shorter than the container, or decoding
+/// stopped by the time limit, leaves the remaining buckets at zero so peaks never
+/// stretch along the timeline.
+async fn waveform(path: &Path, duration: f64) -> Option<Vec<f32>> {
+    let mut child = Command::new(executable("ffmpeg"))
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-vn", "-sn", "-dn", "-ac", "1", "-ar", &WAVEFORM_RATE.to_string()])
+        .args(["-f", "s16le", "pipe:1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (mut peaks, complete) = read_peaks(stdout, duration, WAVEFORM_TIMEOUT).await;
+    if complete {
+        if !child.wait().await.ok()?.success() {
+            return None;
+        }
+    } else {
+        let _ = child.kill().await;
+        if peaks.is_empty() {
+            return None;
+        }
+    }
+    peaks.resize(waveform_buckets(duration), 0);
+    Some(
+        peaks
+            .into_iter()
+            .map(|p| ((p as f32 / 32768.0).min(1.0) * 1000.0).round() / 1000.0)
+            .collect(),
+    )
+}
+
 pub async fn probe(path: &Path, root: &Path) -> Result<Value, String> {
     let path = path
         .canonicalize()
@@ -63,19 +171,27 @@ pub async fn probe(path: &Path, root: &Path) -> Result<Value, String> {
     if !path.is_file() {
         return Err("미디어 파일을 선택해 주세요.".into());
     }
-    let output = Command::new(executable("ffprobe"))
-        .args([
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-        ])
-        .arg(&path)
-        .output()
-        .await
-        .map_err(|e| format!("FFprobe를 실행할 수 없습니다. FFmpeg 설치를 확인해 주세요: {e}"))?;
+    let output = output_within(
+        Command::new(executable("ffprobe"))
+            .args([
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+            ])
+            .arg(&path),
+        PROBE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            format!("미디어 정보를 읽는 데 시간이 너무 오래 걸립니다: {e}")
+        } else {
+            format!("FFprobe를 실행할 수 없습니다. FFmpeg 설치를 확인해 주세요: {e}")
+        }
+    })?;
     if !output.status.success() {
         return Err(format!(
             "지원하지 않거나 손상된 미디어입니다: {}",
@@ -125,56 +241,27 @@ pub async fn probe(path: &Path, root: &Path) -> Result<Value, String> {
     let thumbnail = root.join("thumbnails").join(format!("{media_id}.jpg"));
     std::fs::create_dir_all(thumbnail.parent().unwrap()).map_err(|e| e.to_string())?;
     let mut thumbnail_path = None;
-    if video.is_some() {
+    if let Some(video) = video {
         let mut cmd = Command::new(executable("ffmpeg"));
         cmd.args(["-y", "-v", "error"]);
         if !is_image {
             cmd.args(["-ss", &format!("{}", (duration * 0.1).min(1.0))]);
         }
-        let result = cmd
-            .arg("-i")
+        cmd.arg("-i")
             .arg(&path)
-            .args(["-map", &format!("0:{}", video.unwrap()["index"])])
+            .args(["-map", &format!("0:{}", video["index"])])
             .args(["-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "3"])
-            .arg(&thumbnail)
-            .output()
-            .await;
+            .arg(&thumbnail);
+        let result = output_within(&mut cmd, THUMBNAIL_TIMEOUT).await;
         if matches!(result, Ok(ref o) if o.status.success()) {
             thumbnail_path = Some(thumbnail.to_string_lossy().to_string());
         }
     }
-    let mut waveform: Vec<f32> = Vec::new();
-    if has_audio {
-        let output = Command::new(executable("ffmpeg"))
-            .args(["-v", "error", "-i"])
-            .arg(&path)
-            .args([
-                "-t", "600", "-vn", "-ac", "1", "-ar", "100", "-f", "f32le", "pipe:1",
-            ])
-            .output()
-            .await;
-        if let Ok(output) = output {
-            if output.status.success() {
-                let samples: Vec<f32> = output
-                    .stdout
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
-                    .collect();
-                let bucket = (samples.len() / 128).max(1);
-                waveform = samples
-                    .chunks(bucket)
-                    .take(128)
-                    .map(|c| {
-                        c.iter()
-                            .copied()
-                            .filter(|x| x.is_finite())
-                            .fold(0.0, f32::max)
-                            .min(1.0)
-                    })
-                    .collect();
-            }
-        }
-    }
+    let waveform = if has_audio {
+        waveform(&path, duration).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(
         json!({"id":media_id,"name":path.file_name().unwrap_or_default().to_string_lossy(),"path":path,
         "kind":kind,"duration":duration,"width":video.map(|s|numeric(s.get("width")) as u32).unwrap_or(0),
@@ -385,5 +472,132 @@ mod tests {
         assert_eq!(video["height"], 64);
         assert!(Path::new(video["thumbnail"].as_str().unwrap()).is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn waveform_reports_real_levels_over_the_whole_file() {
+        let root = std::env::temp_dir().join(id("studio-waveform-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let wav = root.join("tone-then-silence.wav");
+        // 2 s of a 440 Hz sine at amplitude 0.5, then 2 s of silence.
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=0.5*sin(2*PI*440*t)*lt(t\\,2):s=44100:d=4",
+                "-c:a",
+                "pcm_s16le",
+            ],
+            &wav,
+        )
+        .await;
+        let asset = probe(&wav, &root).await.unwrap();
+        let peaks: Vec<f64> = asset["waveform"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        assert_eq!(peaks.len(), 128);
+        let (tone, silence) = peaks.split_at(peaks.len() / 2);
+        assert!(
+            tone[2..62].iter().all(|p| (0.42..=0.56).contains(p)),
+            "tone peaks must follow the real amplitude: {tone:?}"
+        );
+        assert!(
+            silence[2..].iter().all(|p| *p < 0.01),
+            "silence must stay flat: {silence:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn waveform_covers_audio_beyond_ten_minutes() {
+        let root = std::env::temp_dir().join(id("studio-long-waveform-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let wav = root.join("long.wav");
+        // Silent for 11 minutes, then a tone in the last minute.
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=0.8*sin(2*PI*300*t)*gte(t\\,660):s=8000:d=720",
+                "-c:a",
+                "pcm_s16le",
+            ],
+            &wav,
+        )
+        .await;
+        let asset = probe(&wav, &root).await.unwrap();
+        let peaks = asset["waveform"].as_array().unwrap();
+        assert_eq!(peaks.len(), 1024);
+        let at = |seconds: f64| peaks[(seconds / 720.0 * 1024.0) as usize].as_f64().unwrap();
+        assert!(at(300.0) < 0.01 && at(650.0) < 0.01);
+        assert!(at(670.0) > 0.7 && at(715.0) > 0.7);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn audio_shorter_than_the_container_is_padded_not_stretched() {
+        let root = std::env::temp_dir().join(id("studio-short-audio-test"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mp4 = root.join("short-audio.mp4");
+        // 4 s of video with a tone in the first 2 s only.
+        ffmpeg(
+            &[
+                "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=4",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            ],
+            &mp4,
+        )
+        .await;
+        let asset = probe(&mp4, &root).await.unwrap();
+        let peaks: Vec<f64> = asset["waveform"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        assert_eq!(peaks.len(), waveform_buckets(asset["duration"].as_f64().unwrap()));
+        assert!(peaks[4..60].iter().all(|p| *p > 0.05), "tone expected: {peaks:?}");
+        assert!(peaks[70..].iter().all(|p| *p == 0.0), "silence expected: {peaks:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_waveform_decode_stops_at_the_limit_and_keeps_what_it_read() {
+        use tokio::io::AsyncWriteExt;
+        // 16 s of media: 128 buckets of 1000 samples. 8 s arrive, then the decoder stalls.
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let sample = 16384i16.to_le_bytes();
+        writer.write_all(&sample.repeat(64_000)).await.unwrap();
+        let started = std::time::Instant::now();
+        let (peaks, complete) = read_peaks(reader, 16.0, Duration::from_millis(200)).await;
+        assert!(!complete);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(peaks, vec![16384u16; 64]);
+        drop(writer);
+        assert!(WAVEFORM_TIMEOUT <= Duration::from_secs(20));
+    }
+
+    #[test]
+    fn waveform_resolution_scales_with_duration_and_is_bounded() {
+        assert_eq!(waveform_buckets(1.0), 128);
+        assert_eq!(waveform_buckets(60.0), 480);
+        assert_eq!(waveform_buckets(36_000.0), 1024);
+    }
+
+    #[tokio::test]
+    async fn unresponsive_helper_process_is_stopped_by_the_timeout() {
+        let started = std::time::Instant::now();
+        let error = output_within(Command::new("sleep").arg("30"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

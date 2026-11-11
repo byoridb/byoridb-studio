@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use byoridb_studio::service::{Connection, StudioService};
+use byori_studio::service::{Connection, Host, StudioService};
 use tauri::Manager;
 
 #[tauri::command]
@@ -33,13 +33,32 @@ async fn studio_save_file(name: String, extension: Option<String>) -> Option<Str
         .map(|f| f.path().to_string_lossy().to_string())
 }
 
+/// Startup problems are shown to the user instead of crashing silently.
+fn fail(message: &str) -> ! {
+    tracing::error!("{message}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Byori Studio를 시작할 수 없습니다")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(1);
+}
+
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter("byoridb_studio=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "byori_studio=info".into()),
+        )
         .init();
-    let service = tauri::async_runtime::block_on(StudioService::start(None))
-        .expect("Studio 편집 서비스를 시작할 수 없습니다");
-    tauri::Builder::default()
+    // An app opened from Finder has no shell PATH; FFmpeg and the CLIs must still be found.
+    byori_studio::runtime::extend_process_path();
+    let service = match tauri::async_runtime::block_on(StudioService::start(None, Host::App)) {
+        Ok(service) => service,
+        Err(error) => fail(&error),
+    };
+    let app = tauri::Builder::default()
         .setup(|app| {
             let demo = app.path().resource_dir()?.join("demo");
             if demo.is_dir() {
@@ -54,6 +73,17 @@ fn main() {
             studio_open_files,
             studio_save_file
         ])
-        .run(tauri::generate_context!())
-        .expect("Studio 실행 오류");
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => app.run(|handle, event| {
+            // Agents, speech tools and a Studio-started database must not outlive the window.
+            if let tauri::RunEvent::Exit = event {
+                handle.state::<StudioService>().shutdown();
+                // A running FFmpeg export is a plain child that nothing drops at exit.
+                byori_studio::runtime::kill_children_of(std::process::id());
+                byori_studio::render::remove_partial_outputs();
+            }
+        }),
+        Err(error) => fail(&format!("Byori Studio 창을 열 수 없습니다: {error}")),
+    }
 }

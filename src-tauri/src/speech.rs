@@ -2,7 +2,7 @@
 //! system voices -> imported audio. A job commits only to its original revision.
 use crate::{
     editor::Editor,
-    runtime::{find_executable, now_ms},
+    runtime::{find_executable, now_ms, prune_finished, signal_group, stop_child, ProcessGroups},
 };
 use serde_json::{json, Value};
 use std::{
@@ -29,13 +29,15 @@ pub struct Speech {
     root: PathBuf,
     editor: Arc<Mutex<Editor>>,
     jobs: Jobs,
+    children: ProcessGroups,
 }
 impl Speech {
-    pub fn new(root: PathBuf, editor: Arc<Mutex<Editor>>) -> Self {
+    pub fn new(root: PathBuf, editor: Arc<Mutex<Editor>>, children: ProcessGroups) -> Self {
         Self {
             root,
             editor,
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            children,
         }
     }
     pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -56,9 +58,12 @@ impl Speech {
             }
             "speech.cancel" => {
                 let id = params["id"].as_str().ok_or("작업 ID가 필요합니다")?;
-                let all = self.jobs.lock().await;
-                let job = all.get(id).ok_or("음성 작업을 찾을 수 없습니다")?;
-                let _ = job.cancel.send(true);
+                let mut all = self.jobs.lock().await;
+                let job = all.get_mut(id).ok_or("음성 작업을 찾을 수 없습니다")?;
+                if job.value["state"] == "running" {
+                    let _ = job.cancel.send(true);
+                    job.value["state"] = json!("cancelling");
+                }
                 Ok(job.value.clone())
             }
             _ => Err(format!("지원하지 않는 음성 명령: {method}")),
@@ -115,6 +120,7 @@ impl Speech {
         let root = self.root.clone();
         let jobs = self.jobs.clone();
         let editor = self.editor.clone();
+        let children = self.children.clone();
         let run_id = id.clone();
         tokio::spawn(async move {
             let result = if synthesize {
@@ -126,6 +132,7 @@ impl Speech {
                     params,
                     &project,
                     receiver.clone(),
+                    &children,
                 )
                 .await
             } else {
@@ -137,11 +144,24 @@ impl Speech {
                     params,
                     &project,
                     receiver.clone(),
+                    &children,
                 )
                 .await
             };
+            // The rendered timeline audio is only an input to recognition. Applied
+            // captions live in the project, so a finished transcription keeps nothing;
+            // an unapplied result (failure or changed project) keeps its SRT.
+            let directory = root.join("speech").join(&run_id);
+            let _ = tokio::fs::remove_file(directory.join("timeline.wav")).await;
+            let applied = !synthesize && result.is_ok();
+            if applied {
+                let _ = tokio::fs::remove_dir_all(&directory).await;
+            }
             let mut all = jobs.lock().await;
             if let Some(job) = all.get_mut(&run_id) {
+                if applied {
+                    forget_output(&mut job.value);
+                }
                 match result {
                     Ok(value) => {
                         job.value["state"] = json!("completed");
@@ -158,6 +178,13 @@ impl Speech {
                     }
                 }
                 job.value["finishedAt"] = json!(now_ms());
+            }
+            let finished = all
+                .iter()
+                .filter_map(|(id, job)| Some((id.clone(), job.value["finishedAt"].as_u64()?)))
+                .collect();
+            for id in prune_finished(finished) {
+                all.remove(&id);
             }
         });
         Ok(json!({"id":id,"state":"running"}))
@@ -201,6 +228,12 @@ async fn update(jobs: &Jobs, id: &str, progress: f64, message: &str) {
             .push(json!({"at":now_ms(),"text":message}));
     }
 }
+/// A job must not point at a result file that has been removed.
+fn forget_output(job: &mut Value) {
+    if let Some(job) = job.as_object_mut() {
+        job.remove("output");
+    }
+}
 async fn save_output(jobs: &Jobs, id: &str, path: &Path) {
     let mut all = jobs.lock().await;
     if let Some(j) = all.get_mut(id) {
@@ -221,6 +254,7 @@ fn check_project(current: &Value, original: &Value) -> Result<(), String> {
         Ok(())
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn transcribe_audio(
     root: &Path,
     editor: &Arc<Mutex<Editor>>,
@@ -229,6 +263,7 @@ async fn transcribe_audio(
     params: Value,
     project: &Value,
     cancel: watch::Receiver<bool>,
+    children: &ProcessGroups,
 ) -> Result<Value, String> {
     let directory = root.join("speech").join(id);
     tokio::fs::create_dir_all(&directory)
@@ -324,7 +359,7 @@ async fn transcribe_audio(
     if let Some(language) = params["language"].as_str().filter(|v| *v != "auto") {
         command.args(["--language", language]);
     }
-    run(command, jobs, id, cancel.clone()).await?;
+    run(command, jobs, id, cancel.clone(), children).await?;
     let srt = directory.join("timeline.srt");
     save_output(jobs, id, &srt).await;
     let text = tokio::fs::read_to_string(&srt)
@@ -347,6 +382,7 @@ async fn transcribe_audio(
         )
         .await
 }
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_audio(
     root: &Path,
     editor: &Arc<Mutex<Editor>>,
@@ -355,6 +391,7 @@ async fn synthesize_audio(
     params: Value,
     project: &Value,
     cancel: watch::Receiver<bool>,
+    children: &ProcessGroups,
 ) -> Result<Value, String> {
     let directory = root.join("speech").join(id);
     tokio::fs::create_dir_all(&directory)
@@ -384,7 +421,7 @@ async fn synthesize_audio(
     if let Some(voice) = params["voice"].as_str().filter(|v| !v.is_empty()) {
         command.arg("-v").arg(voice);
     }
-    run(command, jobs, id, cancel.clone()).await?;
+    run(command, jobs, id, cancel.clone(), children).await?;
     save_output(jobs, id, &path).await;
     check_cancel(&cancel)?;
     update(jobs, id, 0.9, "내레이션을 오디오 트랙에 추가하고 있습니다").await;
@@ -407,6 +444,7 @@ async fn run(
     jobs: &Jobs,
     id: &str,
     mut cancel: watch::Receiver<bool>,
+    children: &ProcessGroups,
 ) -> Result<(), String> {
     check_cancel(&cancel)?;
     command
@@ -415,6 +453,10 @@ async fn run(
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .env("PYTHONUNBUFFERED", "1");
+    // Whisper shells out to ffmpeg, which a Finder-launched app would not find.
+    if let Ok(path) = std::env::join_paths(crate::runtime::search_paths()) {
+        command.env("PATH", path);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -422,6 +464,7 @@ async fn run(
     }
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let pid = child.id();
+    children.add(pid);
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let jobs = jobs.clone();
@@ -439,9 +482,11 @@ async fn run(
     }
     let result = tokio::select! {
         status=child.wait()=>match status{Ok(s) if s.success()=>Ok(()),Ok(s)=>Err(format!("음성 처리 도구가 종료했습니다 ({:?}). 작업 로그를 확인해주세요.",s.code())),Err(e)=>Err(e.to_string())},
-        _=cancel.changed()=>{#[cfg(unix)]if let Some(pid)=pid{let _=Command::new("kill").args(["-TERM","--",&format!("-{pid}")]).status().await;}let _=child.kill().await;Err("작업을 취소했습니다".into())},
-        _=tokio::time::sleep(Duration::from_secs(3600))=>{let _=child.kill().await;Err("음성 처리 제한 시간(1시간)을 초과했습니다".into())}
+        _=cancel.changed()=>{stop_child(&mut child).await;Err("작업을 취소했습니다".into())},
+        _=tokio::time::sleep(Duration::from_secs(3600))=>{stop_child(&mut child).await;Err("음성 처리 제한 시간(1시간)을 초과했습니다".into())}
     };
+    signal_group(pid, "-KILL").await; // whatever the tool left running in its group
+    children.remove(pid);
     for reader in readers {
         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
     }
@@ -470,12 +515,50 @@ mod tests {
         assert!(check_project(&json!({"id":"a","revision":6}), &a).is_err());
         assert!(check_project(&json!({"id":"b","revision":5}), &a).is_err());
     }
+    #[test]
+    fn applied_transcription_does_not_report_its_removed_file() {
+        let mut job = json!({"id":"a","output":"/gone/timeline.srt","state":"running"});
+        forget_output(&mut job);
+        assert_eq!(job, json!({"id":"a","state":"running"}));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_tool_leaves_nothing_running_in_its_group() {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let (_tx, rx) = watch::channel(false);
+        let pid_file = std::env::temp_dir().join(format!("studio-speech-{}", Uuid::new_v4()));
+        let mut command = Command::new("/bin/sh");
+        // The tool exits at once but leaves a helper behind.
+        command.args(["-c", &format!("sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'", pid_file.display())]);
+        run(command, &jobs, "id", rx, &ProcessGroups::default()).await.unwrap();
+        let helper = std::fs::read_to_string(&pid_file).unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(crate::runtime::exits_soon(helper.trim()).await, "helper survived");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_running_tool_stops_its_process_group() {
+        let (tx, rx) = watch::channel(false);
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let children = ProcessGroups::default();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(true).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let error = run(command, &jobs, "id", rx, &children).await.unwrap_err();
+        assert!(error.contains("취소"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        children.kill_all(); // nothing left to stop
+    }
     #[tokio::test]
     async fn cancelled_jobs_do_not_spawn() {
         let (tx, rx) = watch::channel(false);
         tx.send(true).unwrap();
         let jobs = Arc::new(Mutex::new(HashMap::new()));
-        assert!(run(Command::new("does-not-exist"), &jobs, "id", rx)
+        assert!(run(Command::new("does-not-exist"), &jobs, "id", rx, &ProcessGroups::default())
             .await
             .unwrap_err()
             .contains("취소"));

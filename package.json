@@ -10,6 +10,7 @@
     "test:core": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "verify": "vitest run && cargo test --manifest-path src-tauri/Cargo.toml --lib && python3 -m unittest discover -s scripts -p \"test_*.py\" && npm run build",
     "coverage": "vitest run --coverage",
     "preview": "vite preview",
     "tauri": "tauri"

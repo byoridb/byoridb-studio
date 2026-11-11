@@ -6,9 +6,9 @@ import { usePreviewDraft } from "./previewDraft";
 import type { Clip, Command, Project } from "./types";
 import "./custom-assets.css";
 
-interface Props { project: Project; selected: Clip | null; onCommand: Command }
+interface Props { project: Project; selected: Clip | null; onCommand: Command; query?: string }
 
-export function FontLibrary({ project, selected, onCommand }: Props) {
+export function FontLibrary({ project, selected, onCommand, query = "" }: Props) {
   const { catalog, error: catalogError } = useAssetCatalog();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
@@ -39,7 +39,7 @@ export function FontLibrary({ project, selected, onCommand }: Props) {
         <button disabled={busy || !path.trim()} aria-label="경로의 글꼴 추가"><Plus size={14} /></button>
       </form>
     </details>
-    {catalog.fonts.map((font) => <div className="custom-asset-row" key={font.id}>
+    {catalog.fonts.filter((font) => font.name.toLowerCase().includes(query)).map((font) => <div className="custom-asset-row" key={font.id}>
       <button className="custom-asset-apply font-sample" style={{ fontFamily: font.family }}
         aria-label={`${font.name} 글꼴 적용`}
         disabled={busy || selected?.kind !== "text"} title="선택한 텍스트에 적용"
@@ -54,7 +54,7 @@ export function FontLibrary({ project, selected, onCommand }: Props) {
   </section>;
 }
 
-export function PresetLibrary({ kind, project, selected, onCommand }: Props & { kind: "filter" | "effect" }) {
+export function PresetLibrary({ kind, project, selected, onCommand, query = "" }: Props & { kind: "filter" | "effect" }) {
   const { catalog, error: catalogError } = useAssetCatalog();
   const preview = usePreviewDraft();
   const [name, setName] = useState("");
@@ -102,7 +102,7 @@ export function PresetLibrary({ kind, project, selected, onCommand }: Props & { 
         <button disabled={busy || !path.trim()} aria-label={`경로의 ${label} 가져오기`}><FilePlus2 size={14} /></button>
       </form>
     </details>
-    {presets.map((preset) => <div className="custom-asset-row" key={preset.id}>
+    {presets.filter((preset) => preset.name.toLowerCase().includes(query)).map((preset) => <div className="custom-asset-row" key={preset.id}>
       <button className="custom-asset-apply" disabled={busy || !applicable || (preset.target === "audio") !== (selected?.kind === "audio")}
         onMouseEnter={() => applicable && kind === "filter" && preview(selected!.id, preset.patch)} onMouseLeave={() => selected && preview(selected.id, null)}
         onFocus={() => applicable && kind === "filter" && preview(selected!.id, preset.patch)} onBlur={() => selected && preview(selected.id, null)}

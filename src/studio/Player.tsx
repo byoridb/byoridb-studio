@@ -17,6 +17,14 @@ import "./preview.css";
 import { useProjectFonts } from "./assetCatalog";
 import SelectionOverlay, { type LiveTransform } from "./SelectionOverlay";
 import { MediaPlayback, primePreviewPlayback } from "./mediaPlayback";
+import { canvasTransformPatch } from "./clipEditing";
+
+const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+/** The real frame ratio, e.g. 1920×1080 → 16:9, 1440×1080 → 4:3. */
+export const aspectLabel = (width: number, height: number) => {
+  const divisor = gcd(Math.round(width), Math.round(height)) || 1;
+  return `${Math.round(width) / divisor}:${Math.round(height) / divisor}`;
+};
 
 export function animatedValue(
   clip: Clip,
@@ -145,6 +153,7 @@ export default function Player({
     originY: number;
     dx: number;
     dy: number;
+    revision: number;
   } | null>(null);
   const [playbackError, setPlaybackError] = useState("");
   const playbackFailed = (message: string) => { setPlaybackError(message); onPlaying(false); };
@@ -320,10 +329,11 @@ export default function Player({
                     id: clip.id,
                     x: e.clientX,
                     y: e.clientY,
-                    originX: t.x,
-                    originY: t.y,
+                    originX: animatedValue(clip, "x", local, t.x),
+                    originY: animatedValue(clip, "y", local, t.y),
                     dx: 0,
                     dy: 0,
+                    revision: project.revision,
                   });
                 }}
                 onPointerMove={(e) => {
@@ -341,16 +351,20 @@ export default function Player({
                   )
                     void onCommand("edit.update", {
                       id: clip.id,
-                      patch: {
-                        transform: {
-                          ...t,
+                      expectedRevision: drag.revision,
+                      patch: canvasTransformPatch(
+                        original,
+                        {
                           x: Math.round(drag.originX + drag.dx),
                           y: Math.round(drag.originY + drag.dy),
                         },
-                      },
+                        time,
+                        project.fps,
+                      ),
                     });
                   setDrag(null);
                 }}
+                onPointerCancel={() => setDrag(null)}
               >
                 {clip.kind === "text" ? (
                   <div
@@ -445,6 +459,8 @@ export default function Player({
                     ),
                   }
                 }
+                time={time}
+                fps={project.fps}
                 onPreview={setLiveTransform}
                 onCommand={onCommand}
               />
@@ -508,11 +524,7 @@ export default function Player({
             {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
           </button>
           <span className="ratio-label">
-            {project.width === project.height
-              ? "1:1"
-              : project.width > project.height
-                ? "16:9"
-                : "9:16"}
+            {aspectLabel(project.width, project.height)}
           </span>
           <button
             title="미리보기 전체 화면"

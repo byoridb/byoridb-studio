@@ -6,7 +6,7 @@ use fontdue::Font;
 use image::{Rgba, RgbaImage};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,14 +14,70 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
 };
+
+const MAX_JOBS: usize = 64;
+const MAX_PREVIEW_VIDEOS: usize = 2;
+const STDERR_TAIL: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct RenderJobs {
     states: Arc<Mutex<HashMap<String, Value>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    preview_videos: Mutex<VecDeque<PathBuf>>,
+}
+
+fn partial_outputs() -> &'static Mutex<HashSet<PathBuf>> {
+    static PARTIAL: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    PARTIAL.get_or_init(Default::default)
+}
+
+/// Deletes the unfinished files of exports still running. Call at process exit,
+/// after their FFmpeg processes were killed.
+pub fn remove_partial_outputs() {
+    for path in partial_outputs().lock().unwrap().drain() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `previews/` and `renders/` only hold scratch files of the running process, so
+/// whatever an earlier run left behind is removed before this one creates its own.
+fn clean_stale_once(root: &Path) {
+    static CLEANED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    if !CLEANED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf())
+    {
+        return;
+    }
+    for name in ["previews", "renders"] {
+        for entry in std::fs::read_dir(root.join(name)).into_iter().flatten().flatten() {
+            let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(entry.path())
+            } else {
+                std::fs::remove_file(entry.path())
+            };
+        }
+    }
+}
+
+/// Makes room for one more job by forgetting the oldest finished ones.
+fn prune_finished(states: &mut HashMap<String, Value>) {
+    while states.len() >= MAX_JOBS {
+        let oldest = states
+            .values()
+            .filter(|job| !["queued", "running"].contains(&string(job, "state", "")))
+            .min_by_key(|job| job["startedAt"].as_u64().unwrap_or(0))
+            .map(|job| string(job, "id", "").to_string());
+        match oldest {
+            Some(id) => states.remove(&id),
+            None => break,
+        };
+    }
 }
 
 impl RenderJobs {
@@ -32,6 +88,7 @@ impl RenderJobs {
         root: PathBuf,
     ) -> Result<Value, String> {
         validate_project(&project)?;
+        clean_stale_once(&root);
         if project["clips"].as_array().unwrap().is_empty() {
             return Err("타임라인에 클립을 추가한 뒤 내보내 주세요.".into());
         }
@@ -74,6 +131,12 @@ impl RenderJobs {
         }) {
             return Err("원본 미디어 파일을 덮어쓸 수 없습니다.".into());
         }
+        if params["overwrite"] != true && output.exists() {
+            return Err(format!(
+                "같은 이름의 파일이 이미 있습니다: {} (FILE_EXISTS)",
+                output.display()
+            ));
+        }
         for job in self.states.lock().unwrap().values() {
             if job["path"] == output.to_string_lossy().as_ref()
                 && ["queued", "running"].contains(&string(job, "state", ""))
@@ -106,11 +169,31 @@ impl RenderJobs {
         }
         let id = media::id("export");
         let cancel = Arc::new(AtomicBool::new(false));
-        self.states.lock().unwrap().insert(id.clone(),json!({"id":id,"state":"queued","progress":0.0,"path":output,"projectRevision":project["revision"]}));
+        {
+            let mut states = self.states.lock().unwrap();
+            prune_finished(&mut states);
+            states.insert(id.clone(),json!({"id":id,"state":"queued","progress":0.0,"path":output,"projectRevision":project["revision"],"startedAt":media::now()}));
+        }
         self.cancels
             .lock()
             .unwrap()
             .insert(id.clone(), cancel.clone());
+        // Only the most recent precise-playback videos are kept on disk.
+        if params["preview"] == true && output.starts_with(root.join("previews")) {
+            let mut videos = self.preview_videos.lock().unwrap();
+            videos.push_back(output.clone());
+            while videos.len() > MAX_PREVIEW_VIDEOS {
+                let old = videos.pop_front().unwrap();
+                for job in self.states.lock().unwrap().values() {
+                    if job["path"] == old.to_string_lossy().as_ref() {
+                        if let Some(cancel) = self.cancels.lock().unwrap().get(string(job, "id", "")) {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(old);
+            }
+        }
         let states = self.states.clone();
         let cancels = self.cancels.clone();
         let job_id = id.clone();
@@ -182,7 +265,18 @@ pub fn project_duration(p: &Value) -> f64 {
 }
 
 pub async fn preview_frame(project: &Value, params: &Value, root: &Path) -> Result<Value, String> {
+    preview_frame_cancellable(project, params, root, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Renders one exact frame; setting `cancel` stops the running FFmpeg process.
+pub async fn preview_frame_cancellable(
+    project: &Value,
+    params: &Value,
+    root: &Path,
+    cancel: Arc<AtomicBool>,
+) -> Result<Value, String> {
     validate_project(project)?;
+    clean_stale_once(root);
     let duration = project_duration(project);
     let requested_time = number(params, "time", 0.0);
     if duration <= 0.0
@@ -214,10 +308,13 @@ pub async fn preview_frame(project: &Value, params: &Value, root: &Path) -> Resu
         &temp,
         &id,
         Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(AtomicBool::new(false)),
+        cancel,
     )
     .await;
     let _ = std::fs::remove_dir_all(temp);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&output);
+    }
     result?;
     Ok(
         json!({"path":output,"width":width,"height":height,"time":time,"revision":project["revision"]}),
@@ -281,6 +378,86 @@ fn tempo_chain(mut speed: f64) -> String {
     chain.join(",")
 }
 
+/// Source seconds decoded ahead of a render window. Covers sources down to about 3 fps;
+/// slower or variable frame rate material can still differ from the full render there.
+const SEEK_MARGIN: f64 = 0.5;
+
+/// The part of a clip that a render window needs, in clip-local seconds.
+#[derive(Debug, PartialEq)]
+struct ClipWindow {
+    /// Where decoding starts: the clip frame at or before `skip`, or 0 with pre-roll.
+    from: f64,
+    /// Where the visible part starts and how long it lasts.
+    skip: f64,
+    len: f64,
+}
+
+/// A time as FFmpeg stores seek points: rounded to the microsecond.
+fn micros(seconds: f64) -> String {
+    format!("{seconds:.6}")
+}
+
+/// Returns `None` when the clip lies outside `[start, end)`. Filters with memory
+/// (stabilisation, loudness, denoise) need `preroll` so they see the clip from its start.
+fn clip_window(
+    position: f64,
+    length: f64,
+    start: f64,
+    end: f64,
+    fps: f64,
+    preroll: bool,
+) -> Option<ClipWindow> {
+    let from = position.max(start);
+    let to = (position + length).min(end);
+    if to <= from {
+        return None;
+    }
+    let skip = from - position;
+    Some(ClipWindow {
+        from: if preroll {
+            0.0
+        } else {
+            (skip * fps + 1e-6).floor() / fps
+        },
+        skip,
+        len: to - from,
+    })
+}
+
+/// Fits the composition into the output size, letterboxing instead of stretching
+/// when the aspect ratios differ by more than even-size rounding.
+fn fit_filter(pw: f64, ph: f64, width: u32, height: u32) -> String {
+    let scale = (width as f64 / pw).min(height as f64 / ph);
+    let inner = |size: f64, limit: u32| (((size * scale / 2.0).round() as u32) * 2).clamp(2, limit);
+    let (iw, ih) = (inner(pw, width), inner(ph, height));
+    if width - iw <= 2 && height - ih <= 2 {
+        format!("scale={width}:{height}")
+    } else {
+        format!("scale={iw}:{ih},pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
+    }
+}
+
+/// Drains the stream to its end (so the writer never blocks) and keeps the last bytes,
+/// where FFmpeg reports the error that actually stopped it.
+async fn read_tail<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> String {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while let Ok(n) = reader.read(&mut buffer).await {
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buffer[..n]);
+        if tail.len() > limit * 2 {
+            tail.drain(..tail.len() - limit);
+        }
+    }
+    if tail.len() > limit {
+        tail.drain(..tail.len() - limit);
+    }
+    String::from_utf8_lossy(&tail).to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
     project: Value,
     params: Value,
@@ -301,6 +478,7 @@ async fn run(
         id,
         format
     ));
+    partial_outputs().lock().unwrap().insert(temp_output.clone());
     let result = run_process(
         &project,
         &params,
@@ -312,6 +490,7 @@ async fn run(
         cancel,
     )
     .await;
+    partial_outputs().lock().unwrap().remove(&temp_output);
     match result {
         Ok(()) => {
             std::fs::rename(&temp_output, output).map_err(|e| e.to_string())?;
@@ -326,6 +505,7 @@ async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_process(
     p: &Value,
     params: &Value,
@@ -339,6 +519,7 @@ async fn run_process(
     let duration = project_duration(p);
     let start = number(params, "start", 0.0);
     let end = number(params, "end", duration);
+    let span = end - start;
     let pw = number(p, "width", 1920.0);
     let ph = number(p, "height", 1080.0);
     let width = (number(params, "width", pw) as u32 / 2) * 2;
@@ -357,15 +538,22 @@ async fn run_process(
         "-filter_complex_threads",
         "1",
     ]);
-    let mut graph = vec![
-        format!(
-            "color=c={}:s={}x{}:r={fps}:d={duration}[base]",
+    // The graph covers only the requested window: its time 0 is `start`, and each clip
+    // is decoded from where the window first needs it instead of from the timeline start.
+    let mut graph = vec![];
+    if !audio_only {
+        graph.push(format!(
+            "color=c={}:s={}x{}:r={fps}:d={span}[base]",
             string(p, "background", "#111111").replace('#', "0x"),
             pw as u32,
             ph as u32
-        ),
-        format!("anullsrc=r=48000:cl=stereo,atrim=duration={duration}[silence]"),
-    ];
+        ));
+    }
+    if !still {
+        graph.push(format!(
+            "anullsrc=r=48000:cl=stereo,atrim=duration={span}[silence]"
+        ));
+    }
     let mut video_label = "base".to_string();
     let mut audio_labels = vec!["silence".to_string()];
     let mut input_index = 0;
@@ -390,7 +578,8 @@ async fn run_process(
             let speed = number(clip, "speed", 1.0);
             let visible = track["hidden"] != true && kind != "audio" && !audio_only;
             let asset = assets.iter().find(|m| m["id"] == clip["mediaId"]);
-            let audible = track["muted"] != true
+            let audible = !still
+                && track["muted"] != true
                 && kind != "text"
                 && kind != "image"
                 && asset.is_some_and(|a| a["hasAudio"] == true)
@@ -398,6 +587,26 @@ async fn run_process(
             if !visible && !audible {
                 continue;
             }
+            let preroll = (visible && clip["stabilize"]["enabled"] == true)
+                || (audible
+                    && (clip["audio"]["normalize"] == true || clip["audio"]["denoise"] == true));
+            let Some(window) = clip_window(position, length, start, end, fps, preroll) else {
+                continue;
+            };
+            let (from, until) = (window.from, window.skip + window.len);
+            // `from` lies on the clip's frame grid. trim rounds its start to that grid, so
+            // a quarter frame of margin keeps the frame at `from` despite float error,
+            // while half a frame would be a tie that may keep the frame before it.
+            let cut = (from - 0.25 / fps).max(0.0);
+            let reversed = clip["reverse"] == true && matches!(kind, "video" | "audio");
+            // Decoding starts `SEEK_MARGIN` of source before the window, so the frame
+            // shown at `from` is the one the full render repeats there (the last source
+            // frame at or before it), not the first one after the seek point.
+            let lead = if reversed || matches!(kind, "image" | "text") {
+                from
+            } else {
+                (from - SEEK_MARGIN / speed - 1.0 / fps).max(0.0)
+            };
             let path = if kind == "text" {
                 let path = temp.join(format!("text-{input_index}.png"));
                 rasterize_text(clip, pw as u32, &path)?;
@@ -422,27 +631,56 @@ async fn run_process(
                     "-framerate",
                     &fps.to_string(),
                     "-t",
-                    &length.to_string(),
+                    &((until - from) * speed).to_string(),
                 ]);
             } else {
+                // A reversed clip plays its source backwards, so the window maps to the
+                // mirrored source range.
+                let offset = if reversed { length - until } else { lead };
+                // Reading a little past the window supplies the source frame after its
+                // last output frame; without it the fps filter stops repeating a slow or
+                // low-rate frame early. The trim at `until` drops the excess.
+                let tail = if reversed { 0.0 } else { SEEK_MARGIN };
                 command.args([
                     "-ss",
-                    &source.to_string(),
+                    &micros(source + offset.max(0.0) * speed),
                     "-t",
-                    &(length * speed).to_string(),
+                    &((until - lead) * speed + tail).to_string(),
                 ]);
             }
             command.arg("-i").arg(&path);
             let idx = input_index;
             input_index += 1;
             if visible {
-                let rev = if clip["reverse"] == true && kind == "video" {
+                let rev = if reversed && kind == "video" {
                     "reverse,"
                 } else {
                     ""
                 };
-                let mut filters =
-                    format!("[{idx}:v]{rev}setpts=(PTS-STARTPTS)/{speed},fps={fps},format=rgba");
+                let mut filters = if reversed || matches!(kind, "image" | "text") {
+                    format!(
+                        "[{idx}:v]{rev}setpts=(PTS-STARTPTS)/{speed}+{from}/TB,fps={fps},format=rgba"
+                    )
+                } else {
+                    // Input timestamps are relative to the seek point, so every source
+                    // frame keeps the same clip time whatever the window; the fps filter
+                    // then picks the same frames as the full render. The margin frames are
+                    // dropped before the expensive filters.
+                    let pad = if lead > 0.0 {
+                        format!(",trim=start={cut}")
+                    } else {
+                        ":start_time=0".to_string()
+                    };
+                    // FFmpeg subtracts the seek point rounded to a stream tick. Undoing
+                    // that rounding and applying the one of the clip's own source start
+                    // reproduces the full render's timestamps to the tick, so frames that
+                    // fall exactly between two output frames round the same way.
+                    format!(
+                        "[{idx}:v]setpts=(PTS+round({}/TB)-round({}/TB))/{speed},fps={fps}{pad},format=rgba",
+                        micros(source + lead * speed),
+                        micros(source)
+                    )
+                };
                 if clip["stabilize"]["enabled"] == true {
                     let radius = match clip["stabilize"]["strength"].as_u64().unwrap_or(1) {
                         1 => 16,
@@ -535,32 +773,20 @@ async fn run_process(
                     ));
                 }
                 filters.push_str(&format!(
-                    ",trim=duration={length},setpts=PTS-STARTPTS+{position}/TB[v{idx}]"
+                    ",trim=start={cut}:end={until},setpts=PTS-STARTPTS+({})/TB[v{idx}]",
+                    position + from - start
                 ));
                 graph.push(filters);
-                let x = expression(
-                    clip,
-                    "x",
-                    number(transform, "x", 0.0),
-                    &format!("t-{position}"),
-                );
-                let y = expression(
-                    clip,
-                    "y",
-                    number(transform, "y", 0.0),
-                    &format!("t-{position}"),
-                );
-                graph.push(format!("[{video_label}][v{idx}]overlay=x='(W-w)/2+({x})':y='(H-h)/2+({y})':eof_action=pass:repeatlast=0:enable='gte(t,{position})*lt(t,{})'[mix{idx}]",position+length));
+                let local = format!("t-({})", position - start);
+                let x = expression(clip, "x", number(transform, "x", 0.0), &local);
+                let y = expression(clip, "y", number(transform, "y", 0.0), &local);
+                graph.push(format!("[{video_label}][v{idx}]overlay=x='(W-w)/2+({x})':y='(H-h)/2+({y})':eof_action=pass:repeatlast=0:enable='gte(t,{})*lt(t,{})'[mix{idx}]",position-start,position+length-start));
                 video_label = format!("mix{idx}");
             }
             if audible {
-                let reverse = if clip["reverse"] == true {
-                    "areverse,"
-                } else {
-                    ""
-                };
+                let reverse = if reversed { "areverse," } else { "" };
                 let volume = expression(clip, "volume", number(clip, "volume", 1.0), "t");
-                let mut a=format!("[{idx}:a]{reverse}asetpts=PTS-STARTPTS,{},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume='{volume}':eval=frame",tempo_chain(speed));
+                let mut a=format!("[{idx}:a]{reverse}asetpts=PTS-STARTPTS,{},asetpts=PTS+{lead}/TB,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume='{volume}':eval=frame",tempo_chain(speed));
                 if clip["audio"]["normalize"] == true {
                     a.push_str(",loudnorm=I=-16:TP=-1.5:LRA=11");
                 }
@@ -587,20 +813,24 @@ async fn run_process(
                     a.push_str(&format!(",afade=t=out:st={}:d={fo}", length - fo));
                 }
                 a.push_str(&format!(
-                    ",atrim=duration={length},adelay=delays={}:all=1[a{idx}]",
-                    (position * 1000.0).round() as u64
+                    ",atrim=start={}:end={until},asetpts=PTS-STARTPTS,adelay=delays={}:all=1[a{idx}]",
+                    window.skip,
+                    ((position + window.skip - start) * 1000.0).round() as u64
                 ));
                 graph.push(a);
                 audio_labels.push(format!("a{idx}"));
             }
         }
     }
-    if audio_only {
-        graph.push(format!("[{video_label}]nullsink"));
-    } else {
-        graph.push(format!("[{video_label}]trim=start={start}:end={end},setpts=PTS-STARTPTS,scale={width}:{height},setsar=1,format=yuv420p[vout]"));
+    if !audio_only {
+        graph.push(format!(
+            "[{video_label}]{},setsar=1,format=yuv420p[vout]",
+            fit_filter(pw, ph, width, height)
+        ));
     }
-    graph.push(format!("{}amix=inputs={}:normalize=0:dropout_transition=0,alimiter=limit=0.98:latency=1,atrim=start={start}:end={end},asetpts=PTS-STARTPTS{}",audio_labels.iter().map(|s|format!("[{s}]")).collect::<String>(),audio_labels.len(),if still{",anullsink"}else{"[aout]"}));
+    if !still {
+        graph.push(format!("{}amix=inputs={}:normalize=0:dropout_transition=0,alimiter=limit=0.98:latency=1,atrim=duration={span}[aout]",audio_labels.iter().map(|s|format!("[{s}]")).collect::<String>(),audio_labels.len()));
+    }
     // Retain the graph for diagnostics, and pass it as one argv (never through a shell).
     let script = temp.join("filters.ffgraph");
     std::fs::write(&script, graph.join(";\n")).map_err(|e| e.to_string())?;
@@ -662,7 +892,7 @@ async fn run_process(
     command
         .args([
             "-t",
-            &(end - start).to_string(),
+            &span.to_string(),
             "-progress",
             "pipe:1",
             "-nostats",
@@ -683,18 +913,14 @@ async fn run_process(
         .stderr
         .take()
         .ok_or("FFmpeg 오류를 읽을 수 없습니다.")?;
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = vec![];
-        let _ = stderr.take(65536).read_to_end(&mut bytes).await;
-        String::from_utf8_lossy(&bytes).to_string()
-    });
+    let stderr_task = tokio::spawn(read_tail(stderr, STDERR_TAIL));
     let mut lines = BufReader::new(stdout).lines();
     let mut reading = true;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
     let status = loop {
         tokio::select! {
             status=child.wait()=>break status.map_err(|e|e.to_string())?,
-            line=lines.next_line(),if reading=>match line {Ok(Some(line))=>{if let Some(n)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()){update(&states,id,"running",(n/1_000_000.0/(end-start)).clamp(0.0,0.99),None);}},_=>reading=false},
+            line=lines.next_line(),if reading=>match line {Ok(Some(line))=>{if let Some(n)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()){update(&states,id,"running",(n/1_000_000.0/span).clamp(0.0,0.99),None);}},_=>reading=false},
             _=interval.tick()=>{if cancel.load(Ordering::Relaxed){let _=child.kill().await;let _=child.wait().await;let _=stderr_task.await;return Err("내보내기를 취소했습니다.".into());}}
         }
     };
@@ -803,7 +1029,7 @@ fn rgba(s: &str, default: [u8; 4]) -> [u8; 4] {
         return default;
     }
     let mut c = [0, 0, 0, 255];
-    for (i, part) in s[1..].as_bytes().chunks(2).enumerate() {
+    for (i, part) in s.as_bytes()[1..].chunks(2).enumerate() {
         if i < 4 {
             c[i] = u8::from_str_radix(std::str::from_utf8(part).unwrap_or("ff"), 16).unwrap_or(255);
         }
@@ -1639,6 +1865,516 @@ mod tests {
             .unwrap();
         wait_for_job(&mut e, &job).await;
         assert_preview_matches_export(&stable, &output).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clip_window_keeps_only_the_overlap_and_snaps_decoding_to_the_clip_frame_grid() {
+        // Clips entirely before or after the window are not rendered at all.
+        assert_eq!(clip_window(0.0, 5.0, 5.0, 6.0, 24.0, false), None);
+        assert_eq!(clip_window(6.0, 5.0, 5.0, 6.0, 24.0, false), None);
+        let inside = clip_window(10.0, 5.0, 12.0, 13.0, 24.0, false).unwrap();
+        assert_eq!((inside.from, inside.skip, inside.len), (2.0, 2.0, 1.0));
+        // A clip that is not frame aligned decodes from its own frame at or before the window.
+        let unaligned = clip_window(0.26, 5.0, 1.0, 1.5, 24.0, false).unwrap();
+        assert!((unaligned.skip - 0.74).abs() < 1e-9);
+        assert!((unaligned.from - 17.0 / 24.0).abs() < 1e-9);
+        // Stateful filters start at the clip start; the output is still clipped to the window.
+        let preroll = clip_window(10.0, 5.0, 12.0, 20.0, 24.0, true).unwrap();
+        assert_eq!((preroll.from, preroll.skip, preroll.len), (0.0, 2.0, 3.0));
+        let whole = clip_window(1.0, 2.0, 0.0, 10.0, 24.0, false).unwrap();
+        assert_eq!((whole.from, whole.skip, whole.len), (0.0, 0.0, 2.0));
+    }
+    #[test]
+    fn output_with_a_different_aspect_is_letterboxed_not_stretched() {
+        assert_eq!(fit_filter(1920.0, 1080.0, 1280, 720), "scale=1280:720");
+        // Even-size rounding of a matching aspect must not add a one pixel bar.
+        assert_eq!(fit_filter(1080.0, 1920.0, 640, 1136), "scale=640:1136");
+        assert_eq!(
+            fit_filter(1920.0, 1080.0, 1080, 1080),
+            "scale=1080:608,pad=1080:1080:(ow-iw)/2:(oh-ih)/2:color=black"
+        );
+        assert_eq!(
+            fit_filter(1080.0, 1920.0, 1920, 1080),
+            "scale=608:1080,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
+        );
+    }
+    #[tokio::test]
+    async fn stderr_reader_drains_everything_and_keeps_the_final_error() {
+        let mut noise = "decode warning\n".repeat(40_000).into_bytes();
+        noise.extend_from_slice(b"Error opening output file: the real cause");
+        assert!(noise.len() > STDERR_TAIL * 4);
+        let tail = read_tail(noise.as_slice(), STDERR_TAIL).await;
+        assert_eq!(tail.len(), STDERR_TAIL);
+        assert!(tail.ends_with("the real cause"));
+        assert_eq!(read_tail(&b"short"[..], STDERR_TAIL).await, "short");
+    }
+    #[test]
+    fn finished_job_states_are_bounded_and_active_jobs_are_never_forgotten() {
+        let mut states = HashMap::new();
+        for i in 0..MAX_JOBS as u64 {
+            let state = if i < 3 { "running" } else { "completed" };
+            states.insert(
+                format!("job-{i}"),
+                json!({"id":format!("job-{i}"),"state":state,"startedAt":i}),
+            );
+        }
+        prune_finished(&mut states);
+        assert_eq!(states.len(), MAX_JOBS - 1);
+        assert!(states.contains_key("job-0") && !states.contains_key("job-3"));
+        let mut active: HashMap<String, Value> = (0..MAX_JOBS + 5)
+            .map(|i| (i.to_string(), json!({"id":i.to_string(),"state":"running"})))
+            .collect();
+        prune_finished(&mut active);
+        assert_eq!(active.len(), MAX_JOBS + 5);
+    }
+    #[test]
+    fn stale_scratch_files_are_removed_once_and_user_files_are_left_alone() {
+        let root = std::env::temp_dir().join(media::id("studio-clean-test"));
+        for dir in ["previews/preview-old", "renders/export-old", "thumbnails", "imports"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let stale = [
+            "previews/preview-old.png",
+            "previews/preview-video-old.mp4",
+            "previews/preview-old/text-0.png",
+            "renders/export-old/filters.ffgraph",
+        ];
+        let kept = ["thumbnails/media-1.jpg", "imports/clip.mp4", "current.json"];
+        for file in stale.iter().chain(&kept) {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        clean_stale_once(&root);
+        assert!(stale.iter().all(|file| !root.join(file).exists()));
+        assert!(!root.join("previews/preview-old").exists());
+        assert!(kept.iter().all(|file| root.join(file).is_file()));
+        // Files this process creates afterwards are in use and must survive later calls.
+        std::fs::write(root.join("previews/current.png"), b"x").unwrap();
+        clean_stale_once(&root);
+        assert!(root.join("previews/current.png").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    async fn finish(jobs: &RenderJobs, job: &Value) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let status = jobs.status(job["id"].as_str().unwrap()).unwrap();
+            if !["queued", "running"].contains(&string(&status, "state", "")) {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    }
+    async fn frame_at(path: &Path, time: f64) -> Vec<u8> {
+        let decoded = Command::new(media::executable("ffmpeg"))
+            .args(["-v", "error", "-ss", &(time - 0.01).max(0.0).to_string(), "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .output()
+            .await
+            .unwrap();
+        assert!(decoded.status.success());
+        decoded.stdout
+    }
+    fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (*a as f64 - *b as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    }
+    /// A project of three clips cut from one source whose colour changes every frame,
+    /// so a frame that is off by one is far outside the comparison tolerance.
+    async fn windowed_project(dir: &Path) -> Value {
+        let input = dir.join("ramp.mp4");
+        let generated = Command::new(media::executable("ffmpeg"))
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("nullsrc=s=320x180:r=24:d=3,format=gbrp,geq=r='255*N/72':g='mod(N*20,256)':b=128")
+            .args(["-f", "lavfi", "-i"])
+            .arg("aevalsrc=0.5*sin(2*PI*440*t)*lt(t\\,1.5):s=48000:d=3")
+            .args(["-c:v", "libx264", "-crf", "8", "-pix_fmt", "yuv420p"])
+            .args(["-c:a", "aac", "-b:a", "192k"])
+            .arg(&input)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":24,"background":"#000000"}}),
+        )
+        .await
+        .unwrap();
+        let mut p = e
+            .dispatch("media.import", json!({"paths":[input]}))
+            .await
+            .unwrap();
+        let media_id = p["media"][0]["id"].clone();
+        for start in [0.0, 1.0, 2.0] {
+            p = e
+                .dispatch(
+                    "edit.add",
+                    json!({"mediaId":media_id,"start":start,"duration":1.0}),
+                )
+                .await
+                .unwrap();
+        }
+        let mut clips = p["clips"].as_array().unwrap().clone();
+        clips.sort_by(|a, b| number(a, "start", 0.0).total_cmp(&number(b, "start", 0.0)));
+        assert_eq!(clips.len(), 3);
+        clips[0]["sourceIn"] = json!(0.5);
+        clips[0]["fadeOut"] = json!(0.25);
+        clips[0]["keyframes"] = json!([
+            {"property":"x","time":0,"value":0},{"property":"x","time":1,"value":100},
+            {"property":"volume","time":0,"value":1},{"property":"volume","time":1,"value":0.5}
+        ]);
+        clips[1]["sourceIn"] = json!(0.0);
+        clips[1]["speed"] = json!(2.0);
+        clips[2]["sourceIn"] = json!(1.0);
+        clips[2]["reverse"] = json!(true);
+        clips[2]["keyframes"] = json!([
+            {"property":"scale","time":0,"value":1},{"property":"scale","time":1,"value":0.5},
+            {"property":"opacity","time":0,"value":1},{"property":"opacity","time":1,"value":0.4}
+        ]);
+        p["clips"] = json!(clips);
+        validate_project(&p).unwrap();
+        p
+    }
+    #[tokio::test]
+    async fn windowed_frames_and_ranges_match_the_full_timeline_render() {
+        let dir = std::env::temp_dir().join(media::id("studio-window-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = windowed_project(&dir).await;
+        let root = dir.join("state");
+        let jobs = RenderJobs::default();
+        let full = dir.join("full.mp4");
+        let job = jobs
+            .start(
+                project.clone(),
+                json!({"path":full,"format":"mp4","crf":8}),
+                root.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        // Normal, faded and moving, double speed, reversed with keyframes, last frame.
+        for time in [0.25, 0.875, 1.5, 2.5, 71.0 / 24.0] {
+            let frame = preview_frame(&project, &json!({"time":time,"width":320}), &root)
+                .await
+                .unwrap();
+            let preview = image::open(frame["path"].as_str().unwrap())
+                .unwrap()
+                .to_rgb8();
+            let error = mean_difference(preview.as_raw(), &frame_at(&full, time).await);
+            assert!(error < 2.5, "frame at {time}s differs from the export: {error}");
+        }
+        let range = dir.join("range.mp4");
+        let job = jobs
+            .start(
+                project.clone(),
+                json!({"path":range,"format":"mp4","crf":8,"start":1.25,"end":2.75}),
+                root.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        let exported = media::probe(&range, &dir).await.unwrap();
+        assert!((number(&exported, "duration", 0.0) - 1.5).abs() < 0.1);
+        for offset in [0.0, 0.5, 1.25, 35.0 / 24.0] {
+            let error = mean_difference(
+                &frame_at(&range, offset).await,
+                &frame_at(&full, 1.25 + offset).await,
+            );
+            assert!(error < 2.5, "range frame at +{offset}s differs: {error}");
+        }
+        // The source tone ends 1.5 s into the source: clip 2 (double speed) plays it until
+        // 1.75 s, and the reversed clip 3 (source 2.0→1.0 s) reaches it again at 2.5 s.
+        let audio = dir.join("range.wav");
+        let job = jobs
+            .start(
+                project.clone(),
+                json!({"path":audio,"format":"wav","start":1.25,"end":2.75}),
+                root.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        let exported = media::probe(&audio, &dir).await.unwrap();
+        assert!((number(&exported, "duration", 0.0) - 1.5).abs() < 0.05);
+        let peaks: Vec<f64> = exported["waveform"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let at = |seconds: f64| peaks[(seconds / 1.5 * peaks.len() as f64) as usize];
+        assert!(at(0.1) > 0.3 && at(0.4) > 0.3, "tone expected: {peaks:?}");
+        assert!(at(0.6) < 0.02 && at(1.15) < 0.02, "silence expected: {peaks:?}");
+        assert!(at(1.35) > 0.3 && at(1.45) > 0.3, "reversed tone expected: {peaks:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Slow motion and a source frame rate other than the project's put window starts
+    /// between source frames, where the full render repeats the previous frame.
+    #[tokio::test]
+    async fn windows_between_source_frames_match_the_full_timeline_render() {
+        let dir = std::env::temp_dir().join(media::id("studio-window-fps-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut inputs = vec![];
+        for rate in [25, 24] {
+            let input = dir.join(format!("ramp{rate}.mp4"));
+            let generated = Command::new(media::executable("ffmpeg"))
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("nullsrc=s=320x180:r={rate}:d=3,format=gbrp,geq=r='255*N/75':g='mod(N*40,256)':b=128"))
+                .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-shortest"])
+                .args(["-c:v", "libx264", "-crf", "8", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+                .arg(&input)
+                .output()
+                .await
+                .unwrap();
+            assert!(generated.status.success());
+            inputs.push(input);
+        }
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":30,"background":"#000000"}}),
+        )
+        .await
+        .unwrap();
+        let mut p = e
+            .dispatch("media.import", json!({"paths":inputs}))
+            .await
+            .unwrap();
+        let media = p["media"].clone();
+        // 25 and 24 fps in a 30 fps project, quarter and half speed, cuts between frames.
+        let cuts = [
+            (0, 0.0, 1.0, 0.0),
+            (1, 1.0, 0.25, 0.0),
+            (1, 2.0, 0.5, 0.31),
+            (0, 3.0, 1.0, 0.33),
+            (1, 4.0, 1.0, 0.0),
+        ];
+        for (index, start, ..) in cuts {
+            p = e
+                .dispatch(
+                    "edit.add",
+                    json!({"mediaId":media[index]["id"],"start":start,"duration":1.0}),
+                )
+                .await
+                .unwrap();
+        }
+        for (_, start, speed, source_in) in cuts {
+            let clip = p["clips"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|c| number(c, "start", -1.0) == start)
+                .unwrap();
+            clip["speed"] = json!(speed);
+            clip["sourceIn"] = json!(source_in);
+        }
+        assert_eq!(p["clips"].as_array().unwrap().iter().filter(|c| c["speed"] != 1.0).count(), 2);
+        validate_project(&p).unwrap();
+        let root = dir.join("state");
+        let jobs = RenderJobs::default();
+        let full = dir.join("full.mp4");
+        let job = jobs
+            .start(p.clone(), json!({"path":full,"format":"mp4","crf":8}), root.clone())
+            .await
+            .unwrap();
+        assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        for frame in (2..150).step_by(3).chain([4, 10, 34, 35, 36, 37, 61, 63, 65, 94, 100, 137]) {
+            let time = frame as f64 / 30.0;
+            let still = preview_frame(&p, &json!({"time":time,"width":320}), &root)
+                .await
+                .unwrap();
+            let preview = image::open(still["path"].as_str().unwrap())
+                .unwrap()
+                .to_rgb8();
+            let error = mean_difference(preview.as_raw(), &frame_at(&full, time).await);
+            assert!(error < 2.5, "frame {frame} differs from the export: {error}");
+        }
+        for start in [35, 63, 100, 130] {
+            let range = dir.join(format!("range{start}.mp4"));
+            let from = start as f64 / 30.0;
+            let job = jobs
+                .start(
+                    p.clone(),
+                    json!({"path":range,"format":"mp4","crf":8,"start":from,"end":from + 0.5}),
+                    root.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(finish(&jobs, &job).await["state"], "completed");
+            for offset in 0..12 {
+                let offset = offset as f64 / 30.0;
+                let error = mean_difference(
+                    &frame_at(&range, offset).await,
+                    &frame_at(&full, from + offset).await,
+                );
+                assert!(error < 2.5, "range {start} frame at +{offset}s differs: {error}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn a_late_frame_reads_only_the_clips_under_it() {
+        let dir = std::env::temp_dir().join(media::id("studio-late-frame-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = vec![];
+        for (name, color) in [("early.png", [255, 0, 0, 255]), ("late.png", [0, 0, 255, 255])] {
+            let path = dir.join(name);
+            RgbaImage::from_pixel(320, 180, Rgba(color)).save(&path).unwrap();
+            paths.push(path);
+        }
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":24}}),
+        )
+        .await
+        .unwrap();
+        let p = e
+            .dispatch("media.import", json!({"paths":paths}))
+            .await
+            .unwrap();
+        let mut project = Value::Null;
+        for (index, start) in [(0, 0.0), (1, 600.0)] {
+            project = e
+                .dispatch(
+                    "edit.add",
+                    json!({"mediaId":p["media"][index]["id"],"start":start,"duration":5.0}),
+                )
+                .await
+                .unwrap();
+        }
+        // The earlier clip's file is gone: a frame ten minutes later must not need it.
+        std::fs::remove_file(&paths[0]).unwrap();
+        let root = dir.join("state");
+        let frame = preview_frame(&project, &json!({"time":602.5,"width":320}), &root)
+            .await
+            .unwrap();
+        let png = image::open(frame["path"].as_str().unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert!(png.get_pixel(160, 90)[2] > 220 && png.get_pixel(160, 90)[0] < 30);
+        let error = preview_frame(&project, &json!({"time":2.5,"width":320}), &root)
+            .await
+            .unwrap_err();
+        assert!(error.contains("원본 미디어를 찾을 수 없습니다"), "{error}");
+        // A cancelled frame render stops and leaves nothing behind.
+        let before = std::fs::read_dir(root.join("previews")).unwrap().count();
+        let cancelled = preview_frame_cancellable(
+            &project,
+            &json!({"time":601.0,"width":320}),
+            &root,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(
+            std::fs::read_dir(root.join("previews")).unwrap().count(),
+            before
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn existing_output_needs_overwrite_and_other_aspect_is_letterboxed() {
+        let dir = std::env::temp_dir().join(media::id("studio-overwrite-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("red.png");
+        RgbaImage::from_pixel(320, 180, Rgba([255, 0, 0, 255]))
+            .save(&input)
+            .unwrap();
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":24,"background":"#00ff00"}}),
+        )
+        .await
+        .unwrap();
+        let project = e
+            .dispatch("media.importAndAdd", json!({"paths":[input],"duration":0.5}))
+            .await
+            .unwrap();
+        let root = dir.join("state");
+        let jobs = RenderJobs::default();
+        let output = dir.join("square.mp4");
+        std::fs::write(&output, b"someone else's video").unwrap();
+        let params = json!({"path":output,"format":"mp4","width":180,"height":180,"crf":12});
+        let refused = jobs
+            .start(project.clone(), params.clone(), root.clone())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("FILE_EXISTS"), "{refused}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"someone else's video");
+        let mut allowed = params.clone();
+        allowed["overwrite"] = json!(true);
+        let job = jobs.start(project.clone(), allowed, root.clone()).await.unwrap();
+        assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        let exported = media::probe(&output, &dir).await.unwrap();
+        assert_eq!((exported["width"].as_u64(), exported["height"].as_u64()), (Some(180), Some(180)));
+        let pixels = frame_at(&output, 0.25).await;
+        let pixel = |x: usize, y: usize| &pixels[(y * 180 + x) * 3..(y * 180 + x) * 3 + 3];
+        // 320x180 fits as 180x102 in the middle, with black bars above and below.
+        assert!(pixel(90, 90)[0] > 200 && pixel(90, 90)[1] < 60);
+        assert!(pixel(4, 90)[0] > 200, "the picture must span the full width");
+        for y in [4, 30, 150, 175] {
+            assert!(pixel(90, y).iter().all(|v| *v < 30), "bar at y={y}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn only_recent_precise_playback_videos_stay_on_disk() {
+        let dir = std::env::temp_dir().join(media::id("studio-proxy-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("red.png");
+        RgbaImage::from_pixel(64, 64, Rgba([255, 0, 0, 255]))
+            .save(&input)
+            .unwrap();
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        let project = e
+            .dispatch("media.importAndAdd", json!({"paths":[input],"duration":0.2}))
+            .await
+            .unwrap();
+        let root = dir.join("state");
+        let jobs = RenderJobs::default();
+        let mut videos = vec![];
+        for index in 0..=MAX_PREVIEW_VIDEOS {
+            let path = root.join("previews").join(format!("preview-video-{index}.mp4"));
+            let job = jobs
+                .start(
+                    project.clone(),
+                    json!({"path":path,"format":"mp4","width":64,"height":36,"preview":true}),
+                    root.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(finish(&jobs, &job).await["state"], "completed");
+            videos.push(path);
+        }
+        assert!(!videos[0].exists());
+        assert!(videos[1..].iter().all(|path| path.is_file()));
+        // The preview flag never makes a user's export disposable.
+        let user = dir.join("mine.mp4");
+        for _ in 0..=MAX_PREVIEW_VIDEOS {
+            let job = jobs
+                .start(
+                    project.clone(),
+                    json!({"path":user,"format":"mp4","width":64,"height":36,"preview":true,"overwrite":true}),
+                    root.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(finish(&jobs, &job).await["state"], "completed");
+        }
+        assert!(user.is_file() && videos[1..].iter().all(|path| path.is_file()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

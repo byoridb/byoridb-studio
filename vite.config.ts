@@ -2,6 +2,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+declare const process: { env: Record<string, string | undefined> };
+// The service allows this dev origin; scripts/dev.mjs passes the same port to both.
+const devPort = Number(process.env.BYORI_STUDIO_DEV_PORT) || 1420;
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
@@ -19,7 +23,7 @@ export default defineConfig({
   // Vite options tailored for Tauri development
   clearScreen: false,
   server: {
-    port: 1420,
+    port: devPort,
     strictPort: true,
     watch: {
       ignored: ["**/src-tauri/**"],

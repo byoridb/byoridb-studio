@@ -1,24 +1,21 @@
 [package]
-name = "byoridb-studio"
+name = "byori-studio"
 version = "0.1.0"
 description = "Byori Studio - Video editing with creative memory and CLI agents"
-authors = ["ByoriDB Team"]
+authors = ["Byori Team"]
 license = "Apache-2.0"
-repository = ""
 edition = "2021"
 rust-version = "1.85"
-default-run = "byoridb-studio"
+default-run = "byori-studio"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }

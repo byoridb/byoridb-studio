@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clipEditCommands, trimClipPreview } from "./clipEditing";
+import { canvasTransformPatch, clipEditCommands, trimClipPreview, waveformBars, waveformRange } from "./clipEditing";
 import type { Clip, Project } from "./types";
 
 const clip: Clip = { id: "clip", mediaId: "media", trackId: "video", name: "Clip", kind: "video", start: 3, duration: 4, sourceIn: 2, speed: 2, reverse: false, volume: 1, fadeIn: 0, fadeOut: 0, transform: { x: 0, y: 0, scale: 1, rotation: 0, opacity: 1 }, color: { brightness: 0, contrast: 1, saturation: 1, temperature: 0 }, keyframes: [] };
@@ -54,5 +54,42 @@ describe("clip boundary editing", () => {
     }
     expect(trimClipPreview(project, clip, "end", 7)).toBeNull();
     expect(trimClipPreview(project, clip, "end", 0)?.duration).toBeCloseTo(1 / 30);
+  });
+});
+
+describe("canvas edits on animated clips", () => {
+  it("writes static properties to the transform and leaves keyframes alone", () => {
+    expect(canvasTransformPatch(clip, { x: 40, y: -10 }, 5, 30)).toEqual({ transform: { ...clip.transform, x: 40, y: -10 } });
+  });
+  it("updates the keyframe at the playhead, or adds one, for an animated property", () => {
+    const animated: Clip = { ...clip, keyframes: [
+      { property: "x", time: 0, value: 0 },
+      { property: "transform.x", time: 2, value: 100 },
+      { property: "opacity", time: 2, value: 0.5 },
+    ] };
+    // Project time 5 is local time 2: the existing x keyframe is replaced, y stays static.
+    expect(canvasTransformPatch(animated, { x: 250, y: 30 }, 5.01, 30)).toEqual({
+      transform: { ...clip.transform, y: 30 },
+      keyframes: [
+        { property: "x", time: 0, value: 0 },
+        { property: "opacity", time: 2, value: 0.5 },
+        { property: "x", time: expect.closeTo(2.01, 10), value: 250 },
+      ],
+    });
+    const added = canvasTransformPatch(animated, { x: 50 }, 4, 30).keyframes!;
+    expect(added.filter((key) => key.property.endsWith("x")).map((key) => [key.time, key.value])).toEqual([[0, 0], [1, 50], [2, 100]]);
+    expect(canvasTransformPatch(animated, { scale: 2 }, 4, 30)).toEqual({ transform: { ...clip.transform, scale: 2 } });
+  });
+});
+describe("clip waveform range", () => {
+  it("maps sourceIn, duration and speed onto the stored peaks", () => {
+    expect(waveformRange({ ...clip, sourceIn: 0, duration: 6, speed: 1 }, 12, 120)).toEqual([0, 60]);
+    expect(waveformRange(clip, 12, 120)).toEqual([20, 100]);
+    expect(waveformRange({ ...clip, sourceIn: 11, duration: 4, speed: 1 }, 12, 120)).toEqual([110, 120]);
+    // Peaks describe the whole source, however long it is.
+    expect(waveformRange({ ...clip, sourceIn: 300, duration: 150, speed: 1 }, 3600, 1024)).toEqual([85, 128]);
+    expect(waveformRange({ ...clip, sourceIn: 3590, duration: 10, speed: 1 }, 3600, 1024)).toEqual([1021, 1024]);
+    expect(waveformBars([0.1, 0.9, 0.2, 0.3, 0.5, 0.4], 3)).toEqual([0.9, 0.3, 0.5]);
+    expect(waveformBars([0.1, 0.2], 3)).toEqual([0.1, 0.2]);
   });
 });

@@ -10,6 +10,19 @@ import {
 import { rpc } from "./api";
 import type { Job, RuntimeStatus } from "./types";
 import McpSettings from "./McpSettings";
+import { useModal } from "./useModal";
+import { usePoll } from "./usePoll";
+import "./panels.css";
+
+interface Release {
+  installedVersion: string;
+  latestVersion: string;
+  tag: string;
+  url: string;
+  updateAvailable: boolean;
+}
+/** Outlives the modal so a reopened dialog can show the running installation. */
+let installJobId: string | null = null;
 
 export default function Settings({
   onClose,
@@ -19,13 +32,8 @@ export default function Settings({
   onUpdate: (s: RuntimeStatus) => void;
 }) {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
-  const [release, setRelease] = useState<{
-    installedVersion: string;
-    latestVersion: string;
-    tag: string;
-    url: string;
-    updateAvailable: boolean;
-  } | null>(null);
+  const [release, setRelease] = useState<Release | null>(null);
+  const dialog = useModal<HTMLElement>(onClose);
   const [job, setJob] = useState<Job | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -42,27 +50,47 @@ export default function Settings({
       setBusy(false);
     }
   };
+  const showJob = (next: Job) => {
+    setJob(next);
+    if (!["queued", "running"].includes(next.state)) installJobId = null;
+    if (next.state === "completed") void refresh();
+  };
   useEffect(() => {
     void refresh();
+    const id = installJobId;
+    if (id)
+      void rpc<Job>("runtime.installStatus", { id })
+        .then(showJob)
+        .catch(() => {
+          if (installJobId === id) installJobId = null;
+        });
   }, []);
-  const active = job && ["queued", "running"].includes(job.state);
-  useEffect(() => {
-    if (!active || !job) return;
-    const t = setInterval(() => {
-      void rpc<Job>("runtime.installStatus", { id: job.id })
-        .then((j) => {
-          setJob(j);
-          if (j.state === "completed") void refresh();
-        })
-        .catch((e) => setError(String(e)));
-    }, 1000);
-    return () => clearInterval(t);
-  }, [active, job?.id]);
+  const active = !!job && ["queued", "running"].includes(job.state);
+  const poll = usePoll(
+    active ? job.id : null,
+    async () => showJob(await rpc<Job>("runtime.installStatus", { id: job!.id })),
+    1000,
+  );
   const check = async () => {
     setBusy(true);
     setError("");
     try {
-      setRelease(await rpc("runtime.checkUpdate"));
+      setRelease(await rpc<Release>("runtime.checkUpdate"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const install = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const target = release ?? (await rpc<Release>("runtime.checkUpdate"));
+      setRelease(target);
+      const started = await rpc<Job>("runtime.install", { tag: target.tag });
+      installJobId = started.id;
+      setJob({ ...started, state: started.state || "running" });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -81,6 +109,8 @@ export default function Settings({
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-heading"
+        tabIndex={-1}
+        ref={dialog}
       >
         <header>
           <div>
@@ -140,7 +170,7 @@ export default function Settings({
               )}
               <button
                 className="secondary-button"
-                disabled={busy || !!active}
+                disabled={busy || active}
                 onClick={() => void check()}
               >
                 {busy ? (
@@ -150,21 +180,16 @@ export default function Settings({
                 )}{" "}
                 최신 버전 확인
               </button>
-              {release &&
-                (!status?.byoridb.installed || release.updateAvailable) && (
+              {status &&
+                (!status.byoridb.installed || release?.updateAvailable) && (
                   <button
                     className="primary-button"
-                    disabled={!!active}
-                    onClick={() => {
-                      setError("");
-                      void rpc<Job>("runtime.install", { tag: release.tag })
-                        .then(setJob)
-                        .catch((e) => setError(String(e)));
-                    }}
+                    disabled={busy || active}
+                    onClick={() => void install()}
                   >
                     <Download size={14} />
-                    {status?.byoridb.installed ? "업데이트" : "설치"}{" "}
-                    {release.latestVersion}
+                    {status.byoridb.installed ? "업데이트" : "ByoriDB 설치"}{" "}
+                    {release?.latestVersion}
                   </button>
                 )}
               {release &&
@@ -202,6 +227,12 @@ export default function Settings({
                     .join("\n")}
                 </pre>
                 {job.error && <p className="inline-error">{job.error}</p>}
+                {poll.stalled && (
+                  <p className="inline-error" role="alert">
+                    설치 상태를 확인하지 못했습니다. {poll.error}{" "}
+                    <button onClick={poll.retry}>다시 시도</button>
+                  </p>
+                )}
               </div>
             )}
           </section>

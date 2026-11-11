@@ -10,6 +10,7 @@ export interface Media {
   hasAudio: boolean;
   thumbnail?: string;
   waveform?: number[];
+  missing?: boolean;
 }
 export interface Track {
   id: string;
@@ -85,8 +86,8 @@ export interface Clip {
     background: string;
   };
   filter?: string;
-  transitionIn?: string;
-  transitionOut?: string;
+  transitionIn?: { type: "fade"; duration: number } | null;
+  transitionOut?: { type: "fade"; duration: number } | null;
   keyframes: Keyframe[];
   crop?: { x: number; y: number; width: number; height: number };
   mask?: {
@@ -124,6 +125,7 @@ export interface Project {
   id: string;
   name: string;
   revision: number;
+  schemaVersion?: number;
   width: number;
   height: number;
   fps: number;
@@ -153,6 +155,15 @@ export interface Job {
   logs?: { at: string; stream: string; text: string }[] | string[];
   result?: string;
   error?: string;
+  provider?: string;
+}
+export interface AgentSummary {
+  id: string;
+  provider: string;
+  state: string;
+  projectId: string;
+  startedAt: number | string;
+  finishedAt?: number | string;
 }
 export interface RuntimeStatus {
   ffmpeg: { available: boolean; path?: string; version?: string };

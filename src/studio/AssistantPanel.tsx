@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   BookOpen,
@@ -14,51 +14,124 @@ import {
   Square,
   X,
 } from "lucide-react";
-import type { Clip, Command, Job, Note, Project, RuntimeStatus } from "./types";
+import type {
+  AgentSummary,
+  Clip,
+  Command,
+  Job,
+  Note,
+  Project,
+  RuntimeStatus,
+} from "./types";
 import { rpc } from "./api";
+import { usePoll } from "./usePoll";
+import "./panels.css";
 
-export default function AssistantPanel({
-  project,
-  selected,
-  onCommand,
-  onClose,
-  onSettings,
-  runtime,
-}: {
+interface Props {
   project: Project;
   selected: Clip | null;
   onCommand: Command;
   onClose: () => void;
   onSettings: () => void;
   runtime: RuntimeStatus | null;
-}) {
+}
+const activeStates = ["queued", "running", "cancelling"];
+type ConceptKey = keyof Project["concept"];
+/** The job last shown, so a reopened panel can show how it ended. */
+let lastJob: { projectId: string; id: string } | null = null;
+
+export default function AssistantPanel(props: Props) {
+  return <Panel key={props.project.id} {...props} />;
+}
+
+function Panel({
+  project,
+  selected,
+  onCommand,
+  onClose,
+  onSettings,
+  runtime: runtimeProp,
+}: Props) {
   const [tab, setTab] = useState("assistant");
   const [prompt, setPrompt] = useState("");
-  const [provider, setProvider] = useState("claude");
+  const [chosen, setChosen] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
+  const [jobProvider, setJobProvider] = useState("");
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [notes, setNotes] = useState<Note[]>([]);
   const [search, setSearch] = useState("");
   const [note, setNote] = useState("");
-  const [concept, setConcept] = useState(project.concept);
+  const [draft, setDraft] = useState<Partial<Project["concept"]>>({});
+  const [ownRuntime, setOwnRuntime] = useState<RuntimeStatus | null>(null);
+  const [runtimeFailed, setRuntimeFailed] = useState(false);
   const feed = useRef<HTMLDivElement>(null);
-  useEffect(() => setConcept(project.concept), [project.concept]);
-  const active = job && ["queued", "running"].includes(job.state);
+  const runtime = runtimeProp ?? ownRuntime;
+  const loadRuntime = useCallback(() => {
+    setRuntimeFailed(false);
+    void rpc<RuntimeStatus>("runtime.status")
+      .then(setOwnRuntime)
+      .catch(() => setRuntimeFailed(true));
+  }, []);
   useEffect(() => {
-    if (!active || !job) return;
-    const timer = setInterval(() => {
-      void rpc<Job>("agent.status", { id: job.id })
-        .then(setJob)
-        .catch((e) => setError(String(e)));
-    }, 800);
-    return () => clearInterval(timer);
-  }, [active, job?.id]);
+    if (!runtimeProp) loadRuntime();
+  }, [!runtimeProp, loadRuntime]);
+  const providers = runtime?.providers ?? [];
+  const provider =
+    (chosen && providers.some((p) => p.id === chosen && p.available)
+      ? chosen
+      : (
+          providers.find((p) => p.available && p.authStatus !== "missing") ??
+          providers.find((p) => p.available)
+        )?.id) ?? "";
+  const current = providers.find((p) => p.id === provider);
+  const providerName = (id: string) =>
+    providers.find((p) => p.id === id)?.name ?? id;
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const list = await rpc<AgentSummary[]>("agent.list");
+        const mine = Array.isArray(list)
+          ? list.filter((j) => j.projectId === project.id)
+          : [];
+        const target =
+          mine.find((j) => activeStates.includes(j.state)) ??
+          mine.find(
+            (j) => lastJob?.projectId === project.id && j.id === lastJob.id,
+          );
+        if (!target) return;
+        const full = await rpc<Job>("agent.status", { id: target.id });
+        if (!live) return;
+        setJob((existing) => existing ?? full);
+        setJobProvider((existing) => existing || target.provider);
+      } catch {
+        // Reattaching is best effort; a new request still works without it.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [project.id]);
+  const active = !!job && activeStates.includes(job.state);
+  const poll = usePoll(
+    active ? job.id : null,
+    async () => {
+      const id = job!.id;
+      const next = await rpc<Job>("agent.status", { id });
+      setJob((existing) => (existing?.id === id ? next : existing));
+    },
+    800,
+  );
+  useEffect(() => {
+    if (!active) setCancelling(false);
+  }, [active]);
   useEffect(() => {
     if (feed.current) feed.current.scrollTop = feed.current.scrollHeight;
   }, [job?.logs?.length]);
   const start = async () => {
-    if (!prompt.trim()) return;
+    if (!prompt.trim() || !provider) return;
     setBusy(true);
     setError("");
     try {
@@ -69,6 +142,8 @@ export default function AssistantPanel({
         clipId: selected?.id,
       });
       setJob({ id: result.id, state: "running", logs: [] });
+      setJobProvider(provider);
+      lastJob = { projectId: project.id, id: result.id };
       setPrompt("");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -110,11 +185,33 @@ export default function AssistantPanel({
       setBusy(false);
     }
   };
-  const providers = runtime?.providers || [
-    { id: "claude", name: "Claude Code", available: true },
-    { id: "codex", name: "Codex", available: true },
-    { id: "gemini", name: "Gemini CLI", available: true },
-  ];
+  const cancel = () => {
+    setCancelling(true);
+    void rpc<Job>("agent.cancel", { id: job!.id })
+      .then((next) => {
+        if (next?.state) setJob(next);
+      })
+      .catch((e) => {
+        setCancelling(false);
+        setError(e instanceof Error ? e.message : String(e));
+      });
+  };
+  const saveConcept = (key: ConceptKey) => {
+    const value = draft[key];
+    const settle = () =>
+      setDraft((d) => {
+        if (d[key] !== value) return d;
+        const { [key]: _saved, ...rest } = d;
+        return rest;
+      });
+    if (value === undefined) return;
+    if (value === project.concept[key]) return settle();
+    void onCommand("project.update", {
+      patch: { concept: { ...project.concept, [key]: value } },
+    })
+      .then(settle)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
   return (
     <aside className="assistant-panel" aria-label="편집 어시스턴트">
       <div className="panel-heading">
@@ -197,7 +294,9 @@ export default function AssistantPanel({
                     <Circle size={14} />
                   )}
                   <strong>
-                    {active
+                    {cancelling && active
+                      ? "작업을 중단하는 중"
+                      : active
                       ? "편집 작업 진행 중"
                       : job.state === "completed"
                         ? "작업 완료"
@@ -205,7 +304,7 @@ export default function AssistantPanel({
                           ? "작업 중단"
                           : "작업 결과"}
                   </strong>
-                  <span>{provider}</span>
+                  <span>{providerName(jobProvider || job.provider || "")}</span>
                 </div>
                 <div className="agent-logs">
                   {job.logs?.map((log, i) => (
@@ -214,10 +313,20 @@ export default function AssistantPanel({
                 </div>
                 {job.result && <p className="agent-result">{job.result}</p>}
                 {job.error && <div className="inline-error">{job.error}</div>}
+                {poll.stalled && (
+                  <div className="inline-error" role="alert">
+                    작업 상태를 확인하지 못했습니다. {poll.error}
+                    <button onClick={poll.retry}>다시 시도</button>
+                  </div>
+                )}
                 {!active && (
                   <button
                     className="subtle-button"
-                    onClick={() => setJob(null)}
+                    onClick={() => {
+                      lastJob = null;
+                      setJob(null);
+                      setJobProvider("");
+                    }}
                   >
                     <Plus size={14} /> 새 작업
                   </button>
@@ -244,19 +353,47 @@ export default function AssistantPanel({
                 }
               }}
             />
+            {!runtime && (
+              <p className="assistant-provider-note" role="status">
+                {runtimeFailed
+                  ? "에이전트 상태를 확인하지 못했습니다."
+                  : "에이전트 상태를 확인하는 중…"}
+                {runtimeFailed && (
+                  <button onClick={loadRuntime}>다시 확인</button>
+                )}
+              </p>
+            )}
+            {runtime && !provider && (
+              <p className="assistant-provider-note" role="status">
+                사용할 수 있는 편집 에이전트 CLI가 없습니다.
+                <button onClick={onSettings}>설정</button>
+              </p>
+            )}
+            {current?.authStatus === "missing" && (
+              <p className="assistant-provider-note" role="status">
+                {current.name} 로그인이 필요합니다. CLI에서 로그인한 뒤 상태를
+                새로고침하세요.
+                <button onClick={onSettings}>설정</button>
+              </p>
+            )}
             <div className="compose-toolbar">
               <label className="provider-select">
                 <span className="provider-dot" />
                 <select
                   aria-label="편집 에이전트"
                   value={provider}
-                  onChange={(e) => setProvider(e.target.value)}
-                  disabled={!!active}
+                  onChange={(e) => setChosen(e.target.value)}
+                  disabled={active || !providers.length}
                 >
+                  {!provider && <option value="">사용 불가</option>}
                   {providers.map((p) => (
                     <option key={p.id} value={p.id} disabled={!p.available}>
                       {p.name}
-                      {!p.available ? " · 미설치" : ""}
+                      {!p.available
+                        ? " · 미설치"
+                        : p.authStatus === "missing"
+                          ? " · 로그인 필요"
+                          : ""}
                     </option>
                   ))}
                 </select>
@@ -266,11 +403,8 @@ export default function AssistantPanel({
                 <button
                   className="send-button stop"
                   title="작업 중단"
-                  onClick={() =>
-                    void rpc<Job>("agent.cancel", { id: job!.id })
-                      .then(setJob)
-                      .catch((e) => setError(String(e)))
-                  }
+                  disabled={cancelling}
+                  onClick={cancel}
                 >
                   <Square size={14} fill="currentColor" />
                 </button>
@@ -278,7 +412,7 @@ export default function AssistantPanel({
                 <button
                   className="send-button"
                   title="편집 요청 보내기 (⌘Enter)"
-                  disabled={!prompt.trim() || busy}
+                  disabled={!prompt.trim() || busy || !provider}
                   onClick={() => void start()}
                 >
                   {busy ? (
@@ -310,17 +444,10 @@ export default function AssistantPanel({
             <label key={key}>
               {label}
               <textarea
-                value={concept[key]}
+                value={draft[key] ?? project.concept[key]}
                 placeholder={placeholder}
-                onChange={(e) =>
-                  setConcept({ ...concept, [key]: e.target.value })
-                }
-                onBlur={() => {
-                  if (concept[key] !== project.concept[key])
-                    void onCommand("project.update", {
-                      patch: { concept },
-                    }).catch((e) => setError(String(e)));
-                }}
+                onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+                onBlur={() => saveConcept(key)}
               />
             </label>
           ))}

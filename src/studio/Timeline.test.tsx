@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import Timeline from "./Timeline";
 import {
   clipGroup,
@@ -503,5 +503,231 @@ describe("selection movement rules", () => {
         (command) => command.params.patch.start,
       ),
     ).toEqual([0, 3]);
+  });
+});
+
+describe("timeline basics", () => {
+  const mount = (overrides: Partial<React.ComponentProps<typeof Timeline>> = {}) => {
+    const props = {
+      project: fixture(),
+      time: 0,
+      onTime: vi.fn(),
+      selectedId: null,
+      selectedIds: [] as string[],
+      onSelection: vi.fn(),
+      onCommand: vi.fn().mockResolvedValue(undefined) as Command,
+      history: { canUndo: false, canRedo: false },
+      ...overrides,
+    };
+    return { props, ...render(<Timeline {...props} />) };
+  };
+  const audioProject = (extra: Partial<Clip> = {}) => {
+    const project = fixture();
+    project.media.push({ id: "sound", name: "sound", kind: "audio", duration: 10, width: 0, height: 0, path: "/tmp/sound.wav", hasAudio: true, waveform: Array.from({ length: 100 }, (_, index) => index / 100) });
+    project.tracks.push({ id: "a1", name: "오디오 1", kind: "audio", muted: false, hidden: false, locked: false });
+    project.clips = [clip("s", 0, { kind: "audio", mediaId: "sound", trackId: "a1", duration: 2, ...extra })];
+    return project;
+  };
+
+  it("lets Space reach the editor after a clip is clicked while Enter still selects", () => {
+    const { props } = mount();
+    fireEvent.pointerDown(item("a"), { clientX: 10 });
+    fireEvent.pointerUp(item("a"));
+    expect(item("a")).toHaveFocus();
+    const windowKey = vi.fn();
+    window.addEventListener("keydown", windowKey);
+    try {
+      expect(fireEvent.keyDown(item("a"), { key: " ", code: "Space" })).toBe(true);
+      expect(windowKey).toHaveBeenCalledOnce();
+      vi.mocked(props.onSelection).mockClear();
+      fireEvent.keyDown(item("b"), { key: "Enter" });
+      expect(props.onSelection).toHaveBeenCalledWith(["b"], "b");
+      expect(windowKey).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("keydown", windowKey);
+    }
+  });
+
+  it("scrubs while the ruler or the playhead handle is dragged, and stops on release", () => {
+    const { props, container } = mount();
+    const ruler = container.querySelector(".timeline-ruler")!;
+    fireEvent.pointerDown(ruler, { clientX: 68 });
+    fireEvent.pointerMove(ruler, { clientX: 136 });
+    fireEvent.pointerUp(ruler);
+    fireEvent.pointerMove(ruler, { clientX: 204 });
+    expect(vi.mocked(props.onTime).mock.calls).toEqual([[1], [2]]);
+    const handle = container.querySelector(".playhead-handle")!;
+    fireEvent.pointerDown(handle, { clientX: 340 });
+    fireEvent.pointerMove(handle, { clientX: 408 });
+    fireEvent.pointerUp(handle);
+    expect(vi.mocked(props.onTime).mock.calls.slice(2)).toEqual([[5], [6]]);
+  });
+
+  it("renames and deletes a marker with the current revision", () => {
+    const project = fixture();
+    project.markers = [{ id: "m1", time: 3, label: "도입" }];
+    const { props } = mount({ project });
+    const marker = screen.getByRole("button", { name: "마커 도입" });
+    fireEvent.click(marker);
+    expect(props.onTime).toHaveBeenCalledWith(3);
+    // A click only seeks: nothing takes focus away from the global shortcuts.
+    expect(screen.queryByRole("textbox", { name: "마커 이름" })).not.toBeInTheDocument();
+    fireEvent.doubleClick(marker);
+    const input = screen.getByRole("textbox", { name: "마커 이름" });
+    fireEvent.change(input, { target: { value: "본론" } });
+    fireEvent.blur(input);
+    expect(props.onCommand).toHaveBeenCalledWith("edit.markerUpdate", { id: "m1", label: "본론", expectedRevision: 7 });
+    expect(screen.queryByRole("textbox", { name: "마커 이름" })).not.toBeInTheDocument();
+  });
+
+  it("deletes a marker being renamed without sending the rename first", () => {
+    const project = fixture();
+    project.markers = [{ id: "m1", time: 3, label: "도입" }];
+    const { props } = mount({ project });
+    fireEvent.doubleClick(screen.getByRole("button", { name: "마커 도입" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "마커 이름" }), { target: { value: "본론" } });
+    const remove = screen.getByRole("button", { name: "마커 삭제" });
+    // The press must not move focus, so the input never blurs into a rename.
+    expect(fireEvent.mouseDown(remove)).toBe(false);
+    fireEvent.click(remove);
+    expect(vi.mocked(props.onCommand).mock.calls).toEqual([["edit.markerDelete", { id: "m1", expectedRevision: 7 }]]);
+    expect(screen.queryByRole("textbox", { name: "마커 이름" })).not.toBeInTheDocument();
+  });
+
+  it("deletes and reorders tracks, and protects a locked track", () => {
+    const project = fixture();
+    project.tracks[1].locked = true;
+    const { props } = mount({ project });
+    expect(screen.getByRole("button", { name: "영상 1 위로 이동" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "영상 2 아래로 이동" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "영상 2 삭제" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "영상 1 아래로 이동" }));
+    fireEvent.click(screen.getByRole("button", { name: "영상 2 위로 이동" }));
+    fireEvent.click(screen.getByRole("button", { name: "영상 1 삭제" }));
+    expect(vi.mocked(props.onCommand).mock.calls).toEqual([
+      ["edit.trackMove", { id: "v1", index: 1, expectedRevision: 7 }],
+      ["edit.trackMove", { id: "v2", index: 0, expectedRevision: 7 }],
+      ["edit.trackDelete", { id: "v1", expectedRevision: 7 }],
+    ]);
+  });
+
+  it("snaps the dragged clip's end to a marker and its start to the playhead", () => {
+    const project = fixture();
+    project.clips = [clip("a", 1)];
+    project.markers = [{ id: "m1", time: 5.02, label: "마커" }];
+    const { props, rerender } = mount({ project, selectedIds: ["a"], selectedId: "a" });
+    // +2.0s puts the end at 5.0, within reach of the marker at 5.02.
+    fireEvent.pointerDown(item("a"), { clientX: 100 });
+    fireEvent.pointerMove(item("a"), { clientX: 236 });
+    fireEvent.pointerUp(item("a"));
+    const moved = vi.mocked(props.onCommand).mock.calls[0][1] as { commands: { params: { patch: { start: number } } }[] };
+    expect(moved.commands[0].params.patch.start).toBeCloseTo(3.02, 10);
+    vi.mocked(props.onCommand).mockClear();
+    rerender(<Timeline {...props} time={7.03} />);
+    fireEvent.pointerDown(item("a"), { clientX: 100 });
+    fireEvent.pointerMove(item("a"), { clientX: 100 + 6 * 68 });
+    fireEvent.pointerUp(item("a"));
+    const next = vi.mocked(props.onCommand).mock.calls[0][1] as typeof moved;
+    expect(next.commands[0].params.patch.start).toBe(7.03);
+  });
+
+  it("zooms with ⌘/Ctrl + wheel only, and fits the whole project", () => {
+    const { container } = mount();
+    const workspace = container.querySelector(".timeline-workspace")!;
+    const width = () => parseFloat(container.querySelector<HTMLElement>(".timeline-clip")!.style.width);
+    expect(width()).toBe(136);
+    expect(fireEvent.wheel(workspace, { deltaY: -100 })).toBe(true);
+    expect(width()).toBe(136);
+    expect(fireEvent.wheel(workspace, { deltaY: -100, ctrlKey: true })).toBe(false);
+    expect(width()).toBeGreaterThan(136);
+    Object.defineProperty(workspace, "clientWidth", { configurable: true, value: 524 });
+    fireEvent.click(screen.getByRole("button", { name: "타임라인 전체 맞춤" }));
+    // 500px of track area for a 10s project: 50px per second.
+    expect(width()).toBe(100);
+  });
+
+  it("draws only the part of the waveform that the clip plays", () => {
+    const { container, rerender, props } = mount({ project: audioProject({ sourceIn: 2, duration: 3 }) });
+    const bars = () => Array.from(container.querySelectorAll<HTMLElement>(".clip-waveform > i")).map((bar) => bar.style.height);
+    expect(bars()).toHaveLength(30);
+    expect(bars()[0]).toBe("20%");
+    expect(bars()[29]).toBe("49%");
+    rerender(<Timeline {...props} project={audioProject({ sourceIn: 2, duration: 3, speed: 2 })} />);
+    expect(bars()).toHaveLength(60);
+    rerender(<Timeline {...props} project={audioProject({ sourceIn: 2, duration: 3, reverse: true })} />);
+    expect(bars()[0]).toBe("49%");
+  });
+
+  it("follows the playhead during playback but not while paused", () => {
+    const { container, rerender, props } = mount();
+    const workspace = container.querySelector<HTMLElement>(".timeline-workspace")!;
+    Object.defineProperty(workspace, "clientWidth", { configurable: true, value: 400 });
+    rerender(<Timeline {...props} time={9} />);
+    expect(workspace.scrollLeft).toBe(0);
+    rerender(<Timeline {...props} time={9} playing />);
+    expect(workspace.scrollLeft).toBe(9 * 68 - 24);
+  });
+
+  it("scrolls when a drag is held at the edge and keeps the clip under the pointer", () => {
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((callback) => { frame = callback; return 1; });
+    const project = fixture();
+    project.clips = [clip("a", 1)];
+    const { container, props } = mount({ project, selectedIds: ["a"], selectedId: "a" });
+    try {
+      const workspace = container.querySelector<HTMLElement>(".timeline-workspace")!;
+      vi.spyOn(workspace, "getBoundingClientRect").mockReturnValue({ left: 0, right: 500, top: 0, bottom: 300, width: 500, height: 300, x: 0, y: 0, toJSON: () => ({}) });
+      fireEvent.pointerDown(item("a"), { clientX: 400 });
+      fireEvent.pointerMove(item("a"), { clientX: 498 });
+      act(() => frame?.(0));
+      expect(workspace.scrollLeft).toBeGreaterThan(0);
+      const scrolled = workspace.scrollLeft;
+      fireEvent.pointerUp(item("a"));
+      const moved = vi.mocked(props.onCommand).mock.calls[0][1] as { commands: { params: { patch: { start: number } } }[] };
+      expect(moved.commands[0].params.patch.start).toBeCloseTo(Math.round((1 + (98 + scrolled) / 68) * 30) / 30, 10);
+      frame = undefined;
+      act(() => raf.mock.calls[raf.mock.calls.length - 1][0](0));
+      expect(frame).toBeUndefined();
+    } finally {
+      raf.mockRestore();
+    }
+  });
+
+  it("does not scroll, move or trim on a plain click at the edge", () => {
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((callback) => { frame = callback; return 1; });
+    const project = fixture();
+    project.clips = [clip("a", 1)];
+    const { container, props } = mount({ project, selectedIds: ["a"], selectedId: "a" });
+    try {
+      const workspace = container.querySelector<HTMLElement>(".timeline-workspace")!;
+      vi.spyOn(workspace, "getBoundingClientRect").mockReturnValue({ left: 0, right: 500, top: 0, bottom: 300, width: 500, height: 300, x: 0, y: 0, toJSON: () => ({}) });
+      const held = (target: Element) => {
+        fireEvent.pointerDown(target, { clientX: 498, clientY: 10 });
+        fireEvent.pointerMove(target, { clientX: 500, clientY: 11 });
+        act(() => frame?.(0));
+        act(() => frame?.(0));
+        fireEvent.pointerUp(target);
+      };
+      held(item("a"));
+      held(screen.getByRole("button", { name: "a 시작점 트림" }));
+      vi.mocked(props.onTime).mockClear();
+      const ruler = container.querySelector(".timeline-ruler")!;
+      fireEvent.pointerDown(ruler, { clientX: 498 });
+      act(() => frame?.(0));
+      fireEvent.pointerUp(ruler);
+      expect(workspace.scrollLeft).toBe(0);
+      expect(props.onCommand).not.toHaveBeenCalled();
+      expect(props.onTime).toHaveBeenCalledTimes(1);
+    } finally {
+      raf.mockRestore();
+    }
+  });
+
+  it("marks clips whose source file is missing", () => {
+    const project = fixture();
+    project.media[0].missing = true;
+    const { container } = mount({ project });
+    expect(container.querySelectorAll(".timeline-clip.missing")).toHaveLength(3);
   });
 });

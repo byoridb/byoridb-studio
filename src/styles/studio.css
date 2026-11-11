@@ -146,6 +146,35 @@
 .project-title > span svg {
   color: #75bca5;
 }
+.project-title > span.save-error,
+.project-title > span.save-error svg {
+  color: #ffccd2;
+}
+.studio-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 6px 6px;
+  padding: 7px 12px;
+  border: 1px solid #82505c;
+  border-radius: 5px;
+  background: #442b31;
+  color: #ffccd2;
+  font-size: 11px;
+}
+.studio-banner > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.studio-app .studio-banner > button {
+  flex: none;
+  min-height: 24px;
+  padding: 2px 10px;
+  border: 1px solid #82505c;
+  color: inherit;
+}
 .topbar-actions {
   display: flex;
   align-items: center;
@@ -317,16 +346,6 @@
   pointer-events: auto;
   cursor: grab;
   overflow-wrap: anywhere;
-}
-.composition-layer.layer-selected::after {
-  content: "";
-  position: absolute;
-  inset: 1px;
-  border: 1px solid #dbf6f3;
-  pointer-events: none;
-}
-.composition-layer.layer-selected.text-layer::after {
-  border-color: #dbf6f34d;
 }
 .composition:fullscreen {
   width: 100vw !important;

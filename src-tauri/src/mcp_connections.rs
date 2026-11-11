@@ -1,7 +1,7 @@
 //! Studio-owned remote MCP connection. The bridge owns OAuth; no tokens enter RPCs,
 //! project files, agent arguments, or Studio logs.
 use crate::{
-    runtime::{find_executable, now_ms},
+    runtime::{find_executable, now_ms, stop_child, ProcessGroups},
     service::private_write,
 };
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,7 @@ pub struct McpConnections {
     root: PathBuf,
     state: Arc<Mutex<State>>,
     active_agents: Arc<AtomicUsize>,
+    children: ProcessGroups,
 }
 
 struct AgentLease(Arc<AtomicUsize>);
@@ -104,7 +105,7 @@ fn private_dir(path: &Path) -> Result<(), String> {
 }
 
 impl McpConnections {
-    pub fn new(root: &Path) -> Result<Self, String> {
+    pub fn new(root: &Path, children: ProcessGroups) -> Result<Self, String> {
         let root = root.join("mcp/higgsfield");
         let path = root.join("connection.json");
         let config = if path.is_file() {
@@ -117,6 +118,7 @@ impl McpConnections {
         };
         Ok(Self {
             root,
+            children,
             active_agents: Arc::new(AtomicUsize::new(0)),
             state: Arc::new(Mutex::new(State {
                 config,
@@ -191,8 +193,7 @@ impl McpConnections {
         private_dir(&self.root)?;
         private_dir(&self.root.join("auth"))?;
         private_dir(&self.root.join("npm-cache"))?;
-        let mut path: Vec<PathBuf> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        let mut path = crate::runtime::search_paths();
         if let Some(parent) = node.parent() {
             path.insert(0, parent.to_owned());
         }
@@ -241,8 +242,9 @@ impl McpConnections {
         state.cancel = Some(cancel);
         drop(state);
         let all = self.state.clone();
+        let children = self.children.clone();
         tokio::spawn(async move {
-            let result = probe(bridge.process(), &mut rx).await;
+            let result = probe(bridge.process(), &mut rx, &children).await;
             let mut state = all.lock().await;
             state.cancel = None;
             state.checked_at = Some(now_ms());
@@ -266,11 +268,16 @@ impl McpConnections {
     }
 }
 
-async fn probe(mut command: Command, cancel: &mut watch::Receiver<bool>) -> Result<usize, String> {
+async fn probe(
+    mut command: Command,
+    cancel: &mut watch::Receiver<bool>,
+    children: &ProcessGroups,
+) -> Result<usize, String> {
     let mut child = command
         .spawn()
         .map_err(|_| "연결 프로그램을 실행하지 못했습니다. Node.js 설치 상태를 확인해주세요.")?;
     let pid = child.id();
+    children.add(pid); // so quitting the app also stops a probe waiting for sign-in
     let mut input = child.stdin.take().ok_or("연결 입력을 열 수 없습니다")?;
     let output = child.stdout.take().ok_or("연결 출력을 열 수 없습니다")?;
     let mut reader = BufReader::new(output);
@@ -301,17 +308,9 @@ async fn probe(mut command: Command, cancel: &mut watch::Receiver<bool>) -> Resu
         _=cancel.changed()=>Err("연결 확인을 취소했습니다".into()),
         _=tokio::time::sleep(Duration::from_secs(240))=>Err("연결 시간이 초과되었습니다. 브라우저 로그인을 완료한 뒤 다시 시도해주세요.".into()),
     };
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
+    stop_child(&mut child).await;
     let _ = child.wait().await;
+    children.remove(pid);
     result
 }
 async fn send(writer: &mut tokio::process::ChildStdin, message: Value) -> Result<(), String> {
@@ -364,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn configuration_is_private_removable_and_disabled_is_not_forwarded() {
         let root = std::env::temp_dir().join(format!("studio-mcp-{}", uuid::Uuid::new_v4()));
-        let m = McpConnections::new(&root).unwrap();
+        let m = McpConnections::new(&root, ProcessGroups::default()).unwrap();
         assert_eq!(m.status().await["added"], false);
         m.dispatch("runtime.mcpSave", json!({"enabled":true}))
             .await
@@ -386,7 +385,7 @@ mod tests {
             .await
             .unwrap();
         assert!(m.agent_bridge().await.unwrap().is_none());
-        let reread = McpConnections::new(&root).unwrap();
+        let reread = McpConnections::new(&root, ProcessGroups::default()).unwrap();
         assert_eq!(reread.status().await["enabled"], false);
         m.dispatch("runtime.mcpRemove", json!({})).await.unwrap();
         assert!(!m.root.exists());
@@ -402,20 +401,20 @@ mod tests {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let (_tx, mut rx) = watch::channel(false);
-        assert_eq!(probe(good, &mut rx).await.unwrap(), 1);
+        assert_eq!(probe(good, &mut rx, &ProcessGroups::default()).await.unwrap(), 1);
         let mut bad = Command::new(python);
         bad.args(["-u","-c","print('{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"private-token-do-not-leak\"}}')"]);
         bad.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let error = probe(bad, &mut rx).await.unwrap_err();
+        let error = probe(bad, &mut rx, &ProcessGroups::default()).await.unwrap_err();
         assert!(!error.contains("private-token"));
     }
     #[tokio::test]
     async fn connection_removal_waits_for_leased_agent_and_filters_paid_tools() {
         let root = std::env::temp_dir().join(format!("studio-mcp-lease-{}", uuid::Uuid::new_v4()));
-        let m = McpConnections::new(&root).unwrap();
+        let m = McpConnections::new(&root, ProcessGroups::default()).unwrap();
         m.dispatch("runtime.mcpSave", json!({"enabled":true}))
             .await
             .unwrap();

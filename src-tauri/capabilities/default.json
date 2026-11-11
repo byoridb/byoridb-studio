@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The editor window may fetch its local service connection and open the native file dialogs. Nothing else: no shell, filesystem, or remote-origin access.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-studio-connection",
+    "allow-studio-open-files",
+    "allow-studio-save-file"
+  ]
+}

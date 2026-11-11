@@ -3,11 +3,21 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const children = [];
+// One port contract for both processes: the service allows the dev origin and
+// the browser UI connects to the service port.
+const servicePort = process.env.BYORI_STUDIO_PORT || "43123";
+const devPort = process.env.BYORI_STUDIO_DEV_PORT || "1420";
+const env = {
+  ...process.env,
+  BYORI_STUDIO_PORT: servicePort,
+  BYORI_STUDIO_DEV_PORT: devPort,
+  VITE_STUDIO_PORT: servicePort,
+};
 function launch(command, args) {
   const child = spawn(command, args, {
     cwd: root,
     stdio: "inherit",
-    env: process.env,
+    env,
     detached: process.platform !== "win32",
   });
   children.push(child);
@@ -42,4 +52,11 @@ launch("cargo", [
   "--bin",
   "studio-service",
 ]);
-launch(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "dev"]);
+launch(process.platform === "win32" ? "npm.cmd" : "npm", [
+  "run",
+  "dev",
+  "--",
+  "--port",
+  devPort,
+  "--strictPort",
+]);

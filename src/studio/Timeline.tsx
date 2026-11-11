@@ -1,6 +1,9 @@
-import { memo, useEffect, useId, useRef, useState } from "react";
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   Copy,
+  MoveHorizontal,
   Eye,
   EyeOff,
   Flag,
@@ -27,7 +30,7 @@ import {
 import type { Clip, Command, Project, Track } from "./types";
 import { durationOf, timecode } from "./types";
 import { assetUrl } from "./api";
-import { clipEditCommands, trimClipPreview, type ClipEditAction } from "./clipEditing";
+import { clipEditCommands, trimClipPreview, waveformBars, waveformRange, type ClipEditAction } from "./clipEditing";
 import {
   canEditSelection,
   clipGroup,
@@ -47,6 +50,7 @@ interface Drag {
   origin: Clip;
   clips: Clip[];
   revision: number;
+  scroll: number;
   previews: Record<string, Partial<Clip>>;
   targetTrack?: string;
 }
@@ -54,20 +58,25 @@ const trackNames: Record<Track["kind"], string> = { video: "영상", audio: "오
 
 // These visuals do not change as the playhead moves. Keep their DOM work out
 // of the playback clock while leaving all editing handlers on the live parent.
-const ClipVisual = memo(function ClipVisual({ kind, thumbnail, waveform, text }: {
+const ClipVisual = memo(function ClipVisual({ kind, thumbnail, waveform, from = 0, to, reverse, text }: {
   kind: Clip["kind"];
   thumbnail?: string;
   waveform?: number[];
+  from?: number;
+  to?: number;
+  reverse?: boolean;
   text?: string;
 }) {
   if (kind === "video" || kind === "image")
     return <div className="clip-thumbnails" style={{ backgroundImage: `url("${thumbnail}")` }} />;
-  if (kind === "audio")
+  if (kind === "audio") {
+    const bars = waveformBars(waveform?.slice(from, to) ?? []);
     return <div className="clip-waveform" aria-hidden="true">
-      {waveform?.map((peak, index) => (
+      {(reverse ? [...bars].reverse() : bars).map((peak, index) => (
         <i key={index} style={{ height: `${Math.max(2, peak * 100)}%`, flex: 1 }} />
       ))}
     </div>;
+  }
   return <div className="clip-text-preview">{text}</div>;
 });
 
@@ -113,7 +122,14 @@ interface TimelineProps {
   onSelection: (ids: string[], primary?: string | null) => void;
   onCommand: Command;
   history: { canUndo: boolean; canRedo: boolean };
+  playing?: boolean;
 }
+const MIN_ZOOM = 0.1, MAX_ZOOM = 180;
+const clampZoom = (value: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
+const sliderOf = (zoom: number) => Math.round(Math.log(zoom) * 100);
+const RULER_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800];
+const EDGE = 36;
+const DRAG_THRESHOLD = 4;
 export default function Timeline({
   project,
   time,
@@ -125,8 +141,17 @@ export default function Timeline({
   onSelection,
   onCommand,
   history,
+  playing = false,
 }: TimelineProps) {
   const [zoom, setZoom] = useState(68);
+  const [markerEdit, setMarkerEdit] = useState<string | null>(null);
+  const workspace = useRef<HTMLDivElement>(null);
+  const labels = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const scrubbing = useRef(false);
+  const pointer = useRef<{ x: number; y: number } | null>(null);
+  const zoomAnchor = useRef<{ time: number; x: number } | null>(null);
+  const labelsWidth = () => labels.current?.offsetWidth ?? 0;
   const [snap, setSnap] = useState(true);
   const [drag, setDrag] = useState<Drag | null>(null);
   const activeDrag = useRef<Drag | null>(null);
@@ -140,7 +165,43 @@ export default function Timeline({
   const duration = durationOf(project);
   const length = Math.max(duration + 3, 15);
   const width = Math.max(800, length * zoom);
-  const step = zoom < 40 ? 5 : zoom < 90 ? 2 : 1;
+  const step = RULER_STEPS.find((seconds) => seconds * zoom >= 56) ?? RULER_STEPS[RULER_STEPS.length - 1];
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  // ⌘/Ctrl + wheel zooms around the pointer; React's wheel listener is passive.
+  useEffect(() => {
+    const element = workspace.current;
+    if (!element) return;
+    const wheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      const x = Math.max(0, event.clientX - element.getBoundingClientRect().left - labelsWidth());
+      zoomAnchor.current = { time: (element.scrollLeft + x) / zoomRef.current, x };
+      setZoom(clampZoom(zoomRef.current * Math.exp(-event.deltaY * 0.002)));
+    };
+    element.addEventListener("wheel", wheel, { passive: false });
+    return () => element.removeEventListener("wheel", wheel);
+  }, []);
+  useLayoutEffect(() => {
+    const anchor = zoomAnchor.current;
+    zoomAnchor.current = null;
+    if (anchor && workspace.current)
+      workspace.current.scrollLeft = Math.max(0, anchor.time * zoom - anchor.x);
+  }, [zoom]);
+  // Playback keeps the playhead in view by paging the timeline.
+  useLayoutEffect(() => {
+    const element = workspace.current;
+    if (!playing || !element) return;
+    const view = element.clientWidth - labelsWidth();
+    const x = time * zoom;
+    if (view > 0 && (x < element.scrollLeft || x > element.scrollLeft + view - 24))
+      element.scrollLeft = Math.max(0, x - 24);
+  }, [playing, time, zoom]);
+  const fitZoom = () => {
+    const view = (workspace.current?.clientWidth ?? 0) - labelsWidth() - 24;
+    setZoom(clampZoom((view > 0 ? view : 800) / Math.max(duration, 1)));
+    if (workspace.current) workspace.current.scrollLeft = 0;
+  };
   const run = (method: string, params: Record<string, unknown> = {}) =>
     onCommand(method, { ...params, expectedRevision: project.revision }).catch(
       () => undefined,
@@ -174,28 +235,83 @@ export default function Timeline({
       if (result) onTrackSelect?.(trackId);
     });
   };
+  const frame = (value: number) => Math.max(0, Math.round(value * project.fps) / project.fps);
+  /** The closest snap target (clip edges, playhead, markers, zero) within reach. */
+  const snapPoint = (value: number, excluded: string[]) => {
+    if (!snap) return null;
+    let best: number | null = null;
+    for (const point of [
+      0,
+      time,
+      ...project.markers.map((marker) => marker.time),
+      ...project.clips
+        .filter((c) => !excluded.includes(c.id))
+        .flatMap((c) => [c.start, c.start + c.duration]),
+    ])
+      if (best === null || Math.abs(point - value) < Math.abs(best - value)) best = point;
+    return best !== null && Math.abs(best - value) * zoom < 7 ? best : null;
+  };
   const snapped = (value: number, excluded: string[] = []) => {
-    let n = Math.max(0, Math.round(value * project.fps) / project.fps);
-    if (snap) {
-      const points = [
-        0,
-        time,
-        ...project.clips
-          .filter((c) => !excluded.includes(c.id))
-          .flatMap((c) => [c.start, c.start + c.duration]),
-      ];
-      const closest = points.sort(
-        (a, b) => Math.abs(a - n) - Math.abs(b - n),
-      )[0];
-      if (closest !== undefined && Math.abs(closest - n) * zoom < 7)
-        n = closest;
-    }
-    return n;
+    const n = frame(value);
+    return snapPoint(n, excluded) ?? n;
   };
-  const seek = (event: React.PointerEvent<HTMLElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    onTime(Math.max(0, Math.min(duration, (event.clientX - rect.left) / zoom)));
+  const timeAt = (clientX: number) =>
+    Math.max(0, Math.min(duration, (clientX - (content.current?.getBoundingClientRect().left ?? 0)) / zoom));
+  const seek = (event: React.PointerEvent<HTMLElement>) => onTime(timeAt(event.clientX));
+  const scrub = {
+    onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      scrubbing.current = true;
+      press(event);
+      seek(event);
+      edgeScroll();
+    },
+    onPointerMove: (event: React.PointerEvent<HTMLElement>) => {
+      if (!scrubbing.current || !travelled(event)) return;
+      seek(event);
+    },
+    onPointerUp: () => { scrubbing.current = false; },
+    onPointerCancel: () => { scrubbing.current = false; },
   };
+  // A press only becomes a drag once the pointer has travelled; until then a
+  // plain click neither moves a clip nor starts edge scrolling.
+  const pressed = useRef<{ x: number; y: number } | null>(null);
+  const press = (event: React.PointerEvent<HTMLElement>) => {
+    pressed.current = pointer.current = { x: event.clientX, y: event.clientY };
+  };
+  const travelled = (event: React.PointerEvent<HTMLElement>) => {
+    pointer.current = { x: event.clientX, y: event.clientY };
+    const from = pressed.current;
+    if (from && Math.hypot(event.clientX - from.x, event.clientY - from.y) >= DRAG_THRESHOLD) pressed.current = null;
+    return !pressed.current;
+  };
+  // While a drag or scrub is held near a horizontal edge, scroll and keep it tracking.
+  const live = useRef({ applyDrag: (_x: number, _y: number) => {}, timeAt, onTime });
+  const edgeFrame = useRef(0);
+  const edgeScroll = () => {
+    cancelAnimationFrame(edgeFrame.current);
+    const tick = () => {
+      const element = workspace.current, at = pointer.current;
+      if (!element || !at || (!activeDrag.current && !scrubbing.current)) return;
+      const rect = element.getBoundingClientRect();
+      const left = rect.left + labelsWidth();
+      const speed = !rect.width || pressed.current ? 0
+        : at.x > rect.right - EDGE ? Math.min(24, 4 + (at.x - rect.right + EDGE) / 2)
+        : at.x < left + EDGE ? -Math.min(24, 4 + (left + EDGE - at.x) / 2) : 0;
+      if (speed) {
+        const before = element.scrollLeft;
+        element.scrollLeft = Math.max(0, before + speed);
+        if (element.scrollLeft !== before) {
+          if (activeDrag.current) live.current.applyDrag(at.x, at.y);
+          else live.current.onTime(live.current.timeAt(at.x));
+        }
+      }
+      edgeFrame.current = requestAnimationFrame(tick);
+    };
+    edgeFrame.current = requestAnimationFrame(tick);
+  };
+  useEffect(() => () => cancelAnimationFrame(edgeFrame.current), []);
   const setActiveDrag = (value: Drag | null) => {
     activeDrag.current = value;
     setDrag(value);
@@ -237,20 +353,33 @@ export default function Timeline({
       origin: clip,
       clips: mode === "move" ? selectedClips(project, ids) : [clip],
       revision: project.revision,
+      scroll: workspace.current?.scrollLeft ?? 0,
       previews: {},
     });
+    press(event);
+    edgeScroll();
   };
   const move = (event: React.PointerEvent<HTMLElement>) => {
+    if (!activeDrag.current) return;
+    event.stopPropagation();
+    if (!travelled(event)) return;
+    applyDrag(event.clientX, event.clientY);
+  };
+  const applyDrag = (clientX: number, clientY: number) => {
     const current = activeDrag.current;
     if (!current) return;
-    event.stopPropagation();
     const clip = current.origin;
-    const delta = (event.clientX - current.x) / zoom;
+    const delta = (clientX - current.x + (workspace.current?.scrollLeft ?? 0) - current.scroll) / zoom;
     const exclude = current.clips.map((item) => item.id);
     let previews: Drag["previews"] = {};
     let targetTrack: string | undefined;
     if (current.mode === "move") {
-      const offset = snapped(clip.start + delta, exclude) - clip.start;
+      // Either edge of the dragged clip may land on a snap target; the nearer one wins.
+      const start = frame(clip.start + delta);
+      const head = snapPoint(start, exclude), tail = snapPoint(start + clip.duration, exclude);
+      const offset = (tail !== null && (head === null || Math.abs(tail - start - clip.duration) < Math.abs(head - start))
+        ? tail - clip.duration
+        : head ?? start) - clip.start;
       previews = Object.fromEntries(
         moveSelection(current.clips, offset).map((command) => [
           command.params.id,
@@ -259,7 +388,7 @@ export default function Timeline({
       );
       const destination = project.tracks.find((track) => {
         const rect = trackRows.current.get(track.id)?.getBoundingClientRect();
-        return rect && rect.height > 0 && event.clientY >= rect.top && event.clientY < rect.bottom;
+        return rect && rect.height > 0 && clientY >= rect.top && clientY < rect.bottom;
       });
       if (destination && destination.id !== clip.trackId && !destination.locked && current.clips.every((item) => trackKindForClip(item) === destination.kind)) {
         targetTrack = destination.id;
@@ -273,6 +402,7 @@ export default function Timeline({
     }
     setActiveDrag({ ...current, previews, targetTrack });
   };
+  live.current = { applyDrag, timeAt, onTime };
   const finish = (event: React.PointerEvent<HTMLElement>) => {
     event.stopPropagation();
     const current = activeDrag.current;
@@ -444,23 +574,27 @@ export default function Timeline({
             <Magnet size={17} />
           </button>
           <i />
+          <button title="전체 맞춤" aria-label="타임라인 전체 맞춤" onClick={fitZoom}>
+            <MoveHorizontal size={15} />
+          </button>
           <button
             title="타임라인 축소"
-            onClick={() => setZoom(Math.max(20, zoom - 15))}
+            onClick={() => setZoom(clampZoom(zoom / 1.25))}
           >
             <Minus size={14} />
           </button>
           <input
             aria-label="타임라인 확대"
+            title="⌘/Ctrl + 휠로도 확대·축소"
             type="range"
-            min={20}
-            max={180}
-            value={zoom}
-            onChange={(event) => setZoom(+event.target.value)}
+            min={sliderOf(MIN_ZOOM)}
+            max={sliderOf(MAX_ZOOM)}
+            value={sliderOf(zoom)}
+            onChange={(event) => setZoom(clampZoom(Math.exp(+event.target.value / 100)))}
           />
           <button
             title="타임라인 확대"
-            onClick={() => setZoom(Math.min(180, zoom + 15))}
+            onClick={() => setZoom(clampZoom(zoom * 1.25))}
           >
             <Plus size={14} />
           </button>
@@ -485,12 +619,12 @@ export default function Timeline({
             : editGuide}
         </span>
       </div>
-      <div className="timeline-workspace">
-        <div className="track-labels">
+      <div className="timeline-workspace" ref={workspace}>
+        <div className="track-labels" ref={labels}>
           <div className="track-label-spacer">
             {timecode(time, project.fps)}
           </div>
-          {project.tracks.map((track) => (
+          {project.tracks.map((track, index) => (
             <div className={`track-label ${track.kind} ${selectedTrackId === track.id ? "active-track" : ""}`} key={track.id}
               onClick={() => onTrackSelect?.(track.id)}>
               <div className="track-name">
@@ -543,27 +677,68 @@ export default function Timeline({
                 >
                   {track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
                 </button>
+                <button title="트랙 위로 이동" aria-label={`${track.name} 위로 이동`} disabled={index === 0}
+                  onClick={() => void run("edit.trackMove", { id: track.id, index: index - 1 })}>
+                  <ChevronUp size={13} />
+                </button>
+                <button title="트랙 아래로 이동" aria-label={`${track.name} 아래로 이동`} disabled={index === project.tracks.length - 1}
+                  onClick={() => void run("edit.trackMove", { id: track.id, index: index + 1 })}>
+                  <ChevronDown size={13} />
+                </button>
+                <button title={track.locked ? "잠긴 트랙은 삭제할 수 없습니다" : "트랙과 클립 삭제 (실행 취소 가능)"} aria-label={`${track.name} 삭제`} disabled={track.locked}
+                  onClick={(event) => { event.stopPropagation(); void run("edit.trackDelete", { id: track.id }); }}>
+                  <Trash2 size={12} />
+                </button>
               </div>
             </div>
           ))}
         </div>
         <div className="timeline-scroll">
-          <div className="timeline-content" style={{ width }}>
-            <div className="timeline-ruler" onPointerDown={seek}>
+          <div className="timeline-content" ref={content} style={{ width }}>
+            <div className="timeline-ruler" {...scrub}>
               <RulerTicks length={length} step={step} zoom={zoom} />
               {project.markers.map((marker) => (
                 <button
                   className="timeline-marker"
                   key={marker.id}
-                  title={marker.label}
+                  title={`${marker.label} · 더블클릭해서 이름 변경·삭제`}
+                  aria-label={`마커 ${marker.label}`}
+                  aria-expanded={markerEdit === marker.id}
                   style={{ left: marker.time * zoom }}
+                  onPointerDown={(event) => event.stopPropagation()}
                   onClick={(event) => {
                     event.stopPropagation();
                     onTime(marker.time);
                   }}
+                  onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    setMarkerEdit(marker.id);
+                  }}
                 >
                   <Flag size={12} />
                 </button>
+              ))}
+              {project.markers.filter((marker) => marker.id === markerEdit).map((marker) => (
+                <div className="marker-popover" key={marker.id} style={{ left: marker.time * zoom }}
+                  onPointerDown={(event) => event.stopPropagation()}>
+                  <input aria-label="마커 이름" defaultValue={marker.label} maxLength={80} autoFocus
+                    onBlur={(event) => {
+                      const label = event.target.value.trim();
+                      if (label && label !== marker.label) void run("edit.markerUpdate", { id: marker.id, label });
+                      if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) setMarkerEdit(null);
+                    }}
+                    onKeyDown={(event) => {
+                      event.stopPropagation();
+                      if (event.key === "Enter") event.currentTarget.blur();
+                      if (event.key === "Escape") { event.currentTarget.value = marker.label; setMarkerEdit(null); }
+                    }} />
+                  <button title="마커 삭제" aria-label="마커 삭제"
+                    // Keep the input focused so its blur does not send a rename ahead of the delete.
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => { setMarkerEdit(null); void run("edit.markerDelete", { id: marker.id }); }}>
+                    <Trash2 size={12} />
+                  </button>
+                </div>
               ))}
             </div>
             {project.tracks.map((track) => (
@@ -605,10 +780,14 @@ export default function Timeline({
                       ...original,
                       ...drag?.previews[original.id],
                     };
+                    const media = project.media.find((item) => item.id === clip.mediaId);
+                    const peaks = clip.kind === "audio" ? media?.waveform : undefined;
+                    const [from, to] = peaks ? waveformRange(clip, media!.duration, peaks.length) : [0, 0];
                     return (
                       <div
                         key={clip.id}
-                        className={`timeline-clip ${clip.kind} ${selectedIds.includes(clip.id) ? "selected" : ""} ${clip.id === selectedId ? "primary-selection" : ""}`}
+                        className={`timeline-clip ${clip.kind} ${selectedIds.includes(clip.id) ? "selected" : ""} ${clip.id === selectedId ? "primary-selection" : ""} ${media?.missing ? "missing" : ""}`}
+                        title={media?.missing ? "원본 파일을 찾을 수 없습니다" : undefined}
                         style={{
                           left: clip.start * zoom,
                           width: Math.max(8, clip.duration * zoom),
@@ -626,7 +805,8 @@ export default function Timeline({
                           onPointerMove={move}
                           onPointerUp={finish}
                           onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
+                            // Space stays with the editor so a clicked clip still plays.
+                            if (event.key === "Enter") {
                               event.stopPropagation();
                               event.preventDefault();
                               choose(clip, event.shiftKey || event.metaKey || event.ctrlKey);
@@ -648,7 +828,10 @@ export default function Timeline({
                           <ClipVisual
                             kind={clip.kind}
                             thumbnail={clip.kind === "video" || clip.kind === "image" ? assetUrl(clip.mediaId!, true) : undefined}
-                            waveform={clip.kind === "audio" ? project.media.find((media) => media.id === clip.mediaId)?.waveform : undefined}
+                            waveform={peaks}
+                            from={from}
+                            to={to}
+                            reverse={clip.reverse}
                             text={clip.text?.content}
                           />
                         </div>
@@ -691,7 +874,7 @@ export default function Timeline({
               </div>
             )}
             <div className="playhead" style={{ left: time * zoom }}>
-              <div />
+              <div className="playhead-handle" title="드래그해서 탐색" {...scrub} />
             </div>
           </div>
         </div>
@@ -700,7 +883,7 @@ export default function Timeline({
         <span title="← → 프레임 이동 · ↑ ↓ 편집점 이동 · ⌥← → 선택 이동 · ⌥↑ ↓ 트랙 이동">
           {selectedIds.length > 1
             ? `${selectedIds.length}개 선택 · ⇧/⌘ 클릭으로 추가 선택`
-            : "위아래 드래그로 트랙 이동 · ⇧/⌘ 클릭 다중 선택"}
+            : "위아래 드래그로 트랙 이동 · ⇧/⌘ 클릭 다중 선택 · ⌘C/X/V 복사·잘라내기·붙여넣기"}
         </span>
         <span>
           {project.fps} fps <span className="small-divider">·</span> 전체{" "}

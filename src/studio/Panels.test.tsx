@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Library } from "./Library";
 import { Inspector } from "./Inspector";
 import type { Clip, Project } from "./types";
+import { pickFiles, savePath } from "./api";
 
 vi.mock("./api", () => ({
   assetUrl: (id: string) => `http://studio/assets/${id}`,
@@ -171,11 +172,16 @@ describe("Library", () => {
     expect(command).toHaveBeenCalledWith("edit.update", {
       id: "clip1",
       expectedRevision: 7,
-      patch: {
-        color: { brightness: 0, contrast: 1.12, saturation: 0, temperature: 0 },
-        filter: "mono",
-      },
+      patch: { filter: "mono" },
     });
+    for (const name of ["원본", "시네마", "따뜻한 오후", "쿨 블루", "빈티지"])
+      await user.click(screen.getByRole("button", { name }));
+    expect(
+      command.mock.calls.map(([, params]) => params.patch.filter),
+    ).toEqual(["mono", "none", "cinematic", "warm", "cool", "vintage"]);
+    expect(
+      command.mock.calls.every(([, params]) => !("color" in params.patch)),
+    ).toBe(true);
   });
 
   it("creates an audio track before extracting audio from imported video", async () => {
@@ -647,5 +653,250 @@ describe("Inspector", () => {
     expect(
       screen.queryByRole("button", { name: "흔들림 보정" }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("Library media management", () => {
+  const library = (value: Project, command = vi.fn().mockResolvedValue(value)) => {
+    render(
+      <Library
+        project={value}
+        selected={null}
+        onCommand={command}
+        onImport={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+    return command;
+  };
+
+  it("explains why media used on the timeline cannot be removed", async () => {
+    const command = library(project);
+    fireEvent.click(screen.getByRole("button", { name: "바다.mp4 소재 삭제" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "타임라인에서 사용 중입니다",
+    );
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it("removes unused media with a revision guard", async () => {
+    const command = library({ ...project, clips: [] });
+    fireEvent.click(screen.getByRole("button", { name: "바다.mp4 소재 삭제" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("media.remove", {
+        id: "media1",
+        expectedRevision: 7,
+      }),
+    );
+  });
+
+  it("marks missing media and relinks it to a chosen file", async () => {
+    vi.mocked(pickFiles).mockResolvedValueOnce(["/new/ocean.mp4"]);
+    const command = library({
+      ...project,
+      media: [{ ...project.media[0], missing: true }],
+    });
+    expect(screen.getByText("원본 없음")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "바다.mp4 타임라인에 추가" }),
+    ).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "바다.mp4 원본 다시 연결" }),
+    );
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("media.relink", {
+        id: "media1",
+        path: "/new/ocean.mp4",
+        expectedRevision: 7,
+      }),
+    );
+  });
+
+  it("shows the thumbnail again once media with a failed thumbnail is relinked", () => {
+    const props = {
+      selected: null,
+      onCommand: vi.fn(),
+      onImport: vi.fn(),
+      onSelect: vi.fn(),
+    };
+    const { container, rerender } = render(<Library project={project} {...props} />);
+    const thumb = () => container.querySelector(".media-thumb img");
+    fireEvent.error(thumb()!);
+    expect(thumb()).toBeNull();
+    rerender(
+      <Library
+        project={{
+          ...project,
+          media: [{ ...project.media[0], path: "/new/ocean.mp4" }],
+        }}
+        {...props}
+      />,
+    );
+    expect(thumb()).not.toBeNull();
+  });
+
+  it("searches built-in presets on every preset tab", async () => {
+    library(project);
+    const search = () => screen.getByRole("textbox", { name: "소재 검색" });
+    fireEvent.click(screen.getByRole("button", { name: "텍스트" }));
+    fireEvent.change(search(), { target: { value: "타이틀" } });
+    expect(screen.getByRole("button", { name: /타이틀/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /미니멀/ })).toBeNull();
+    for (const [tab, hit, miss] of [
+      ["스티커", "LIVE", "NEW"],
+      ["효과", "가까이", "원형 프레임"],
+      ["전환", "페이드 인", "없음"],
+      ["필터", "빈티지", "모노"],
+    ]) {
+      fireEvent.click(screen.getByRole("button", { name: tab }));
+      fireEvent.change(search(), { target: { value: hit } });
+      expect(screen.getByRole("button", { name: new RegExp(hit) })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: new RegExp(`^${miss}`) })).toBeNull();
+    }
+    fireEvent.change(search(), { target: { value: "없는 필터" } });
+    expect(
+      screen.getByText("기본 소재에 검색 결과가 없습니다."),
+    ).toBeInTheDocument();
+  });
+
+  it("overwrites a caption file only at the path the save dialog confirmed", async () => {
+    vi.mocked(savePath).mockResolvedValueOnce("/out/captions.srt");
+    const text: Clip = { ...clip, id: "text1", kind: "text", mediaId: undefined };
+    const command = library({ ...project, clips: [text] });
+    fireEvent.click(screen.getByRole("button", { name: "자막" }));
+    fireEvent.click(screen.getByRole("button", { name: "자막 파일 내보내기" }));
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("captions.export", {
+        path: "/out/captions.srt",
+        overwrite: true,
+      }),
+    );
+  });
+});
+
+describe("Inspector color inputs", () => {
+  it("previews while choosing and commits a color once when the choice is final", async () => {
+    const command = vi.fn().mockResolvedValue(project);
+    const text: Clip = {
+      ...clip,
+      kind: "text",
+      mediaId: undefined,
+      text: {
+        content: "제목",
+        fontSize: 64,
+        color: "#ffffff",
+        fontFamily: "Arial",
+        bold: false,
+        align: "center",
+        background: "#18191de6",
+      },
+    };
+    render(
+      <Inspector project={project} selected={text} onCommand={command} playhead={1} />,
+    );
+    const color = screen.getByLabelText("텍스트 색상");
+    for (const value of ["#ff0000", "#00ff00", "#0000ff"])
+      fireEvent.input(color, { target: { value } });
+    expect(command).not.toHaveBeenCalled();
+    fireEvent.change(color, { target: { value: "#0000ff" } });
+    fireEvent.blur(color);
+    expect(command).toHaveBeenCalledTimes(1);
+    expect(command).toHaveBeenCalledWith("edit.update", {
+      id: "clip1",
+      expectedRevision: 7,
+      patch: { text: { ...text.text, color: "#0000ff" } },
+    });
+    command.mockClear();
+    const background = screen.getByLabelText("텍스트 배경 색상");
+    fireEvent.change(background, { target: { value: "#102030" } });
+    expect(command).toHaveBeenCalledWith(
+      "edit.update",
+      expect.objectContaining({
+        patch: { text: { ...text.text, background: "#102030e6" } },
+      }),
+    );
+  });
+
+  it("does not commit when a stored uppercase or 8-digit color is only focused and blurred", () => {
+    const command = vi.fn().mockResolvedValue(project);
+    const text: Clip = {
+      ...clip,
+      kind: "text",
+      mediaId: undefined,
+      text: {
+        content: "제목",
+        fontSize: 64,
+        color: "#FFE76A80",
+        fontFamily: "Arial",
+        bold: false,
+        align: "center",
+        background: "#18191DE6",
+      },
+    };
+    const { unmount } = render(
+      <Inspector project={project} selected={text} onCommand={command} playhead={1} />,
+    );
+    const color = screen.getByLabelText("텍스트 색상");
+    expect(color).toHaveValue("#ffe76a");
+    fireEvent.blur(color);
+    fireEvent.blur(screen.getByLabelText("텍스트 배경 색상"));
+    expect(command).not.toHaveBeenCalled();
+    // Choosing a color keeps the stored alpha.
+    fireEvent.change(color, { target: { value: "#0000ff" } });
+    expect(command).toHaveBeenCalledWith(
+      "edit.update",
+      expect.objectContaining({
+        patch: { text: { ...text.text, color: "#0000ff80" } },
+      }),
+    );
+    unmount();
+    command.mockClear();
+    render(
+      <Inspector
+        project={{ ...project, background: "#FFFFFF" }}
+        selected={null}
+        onCommand={command}
+        playhead={0}
+      />,
+    );
+    fireEvent.blur(screen.getByLabelText("프로젝트 배경 색상"));
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it("shows the stored color again and allows a retry after a rejected commit", async () => {
+    const command = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("stale revision"))
+      .mockResolvedValue(project);
+    render(
+      <Inspector project={project} selected={null} onCommand={command} playhead={0} />,
+    );
+    const color = screen.getByLabelText("프로젝트 배경 색상");
+    const stored = (color as HTMLInputElement).value;
+    fireEvent.input(color, { target: { value: "#223344" } });
+    fireEvent.change(color, { target: { value: "#223344" } });
+    expect(await screen.findByText("stale revision")).toBeInTheDocument();
+    await waitFor(() => expect(color).toHaveValue(stored));
+    fireEvent.blur(color);
+    expect(command).toHaveBeenCalledTimes(1);
+    fireEvent.input(color, { target: { value: "#223344" } });
+    fireEvent.change(color, { target: { value: "#223344" } });
+    expect(command).toHaveBeenCalledTimes(2);
+  });
+
+  it("commits the project background once", () => {
+    const command = vi.fn().mockResolvedValue(project);
+    render(
+      <Inspector project={project} selected={null} onCommand={command} playhead={0} />,
+    );
+    const color = screen.getByLabelText("프로젝트 배경 색상");
+    fireEvent.input(color, { target: { value: "#112233" } });
+    fireEvent.input(color, { target: { value: "#223344" } });
+    expect(command).not.toHaveBeenCalled();
+    fireEvent.change(color, { target: { value: "#223344" } });
+    expect(command).toHaveBeenCalledTimes(1);
+    expect(command).toHaveBeenCalledWith("project.update", {
+      patch: { background: "#223344" },
+    });
   });
 });

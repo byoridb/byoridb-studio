@@ -5,13 +5,29 @@ use crate::{
     media, render,
 };
 use serde_json::{json, Value};
-use std::{collections::VecDeque, future::Future, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::{Mutex, Semaphore};
+
+const CANCELLED: &str = "더 새로운 미리보기 요청으로 대체되었습니다. (PREVIEW_CANCELLED)";
 
 pub struct PreviewFrames {
     cache: Mutex<VecDeque<(String, Value)>>,
     renderer: Mutex<()>,
     requests: Semaphore,
+    /// Queued and rendering UI requests as (id, content hash, cancel flag). A UI request
+    /// for different content cancels them, so only the newest scrub frame is rendered.
+    /// Agent requests are not listed: they neither cancel the UI's frame nor get cancelled.
+    pending: std::sync::Mutex<Vec<(u64, u64, Arc<AtomicBool>)>>,
+    sequence: AtomicU64,
 }
 impl Default for PreviewFrames {
     fn default() -> Self {
@@ -19,7 +35,16 @@ impl Default for PreviewFrames {
             cache: Mutex::new(VecDeque::new()),
             renderer: Mutex::new(()),
             requests: Semaphore::new(8),
+            pending: std::sync::Mutex::new(Vec::new()),
+            sequence: AtomicU64::new(0),
         }
+    }
+}
+/// Removes the request from the pending list, also when its future is dropped.
+struct Pending<'a>(&'a PreviewFrames, u64);
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.pending.lock().unwrap().retain(|(id, ..)| *id != self.1);
     }
 }
 impl PreviewFrames {
@@ -28,10 +53,18 @@ impl PreviewFrames {
         editor: &Arc<Mutex<Editor>>,
         params: Value,
         project_id: Option<&str>,
+        agent: bool,
     ) -> Result<Value, String> {
-        self.frame_with(editor, params, project_id, |project, params, root| async move {
-            render::preview_frame(&project, &params, &root).await
-        }).await
+        self.frame_with(
+            editor,
+            params,
+            project_id,
+            agent,
+            |project, params, root, cancel| async move {
+                render::preview_frame_cancellable(&project, &params, &root, cancel).await
+            },
+        )
+        .await
     }
 
     async fn frame_with<F, Fut>(
@@ -39,10 +72,11 @@ impl PreviewFrames {
         editor: &Arc<Mutex<Editor>>,
         params: Value,
         project_id: Option<&str>,
+        agent: bool,
         render: F,
     ) -> Result<Value, String>
     where
-        F: FnOnce(Value, Value, PathBuf) -> Fut,
+        F: FnOnce(Value, Value, PathBuf, Arc<AtomicBool>) -> Fut,
         Fut: Future<Output = Result<Value, String>>,
     {
         let _queue = self
@@ -56,8 +90,26 @@ impl PreviewFrames {
             "{}:{width}:{frame}",
             serde_json::to_string(&project).map_err(|e| e.to_string())?
         );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = self.sequence.fetch_add(1, Ordering::Relaxed);
+        if !agent {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            let content = hasher.finish();
+            let mut pending = self.pending.lock().unwrap();
+            for (_, other, flag) in pending.iter() {
+                if *other != content {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            pending.push((id, content, cancel.clone()));
+        }
+        let _pending = Pending(self, id);
         // Waiting for another render also deduplicates identical in-flight requests.
         let _renderer = self.renderer.lock().await;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
         editor.lock().await.preview_is_current(&project)?;
         {
             let mut cache = self.cache.lock().await;
@@ -75,7 +127,14 @@ impl PreviewFrames {
                 return Ok(value);
             }
         }
-        let mut result = render(project.clone(), params, root).await?;
+        let result = render(project.clone(), params, root, cancel.clone()).await;
+        if cancel.load(Ordering::Relaxed) {
+            if let Some(path) = result.as_ref().ok().and_then(|value| value["path"].as_str()) {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(CANCELLED.into());
+        }
+        let mut result = result?;
         let path = PathBuf::from(result["path"].as_str().ok_or("미리보기 파일이 없습니다.")?);
         let mut guard = editor.lock().await;
         if let Err(error) = guard.preview_is_current(&project) {
@@ -135,7 +194,7 @@ mod tests {
             let frames = frames.clone();
             tokio::spawn(async move {
                 frames
-                    .frame_with(&editor, json!({"time":0}), None, |_, _, root| async move {
+                    .frame_with(&editor, json!({"time":0}), None, false, |_, _, root, _| async move {
                         started_tx.send(()).unwrap();
                         finish_rx.await.unwrap();
                         output(root, Arc::new(AtomicUsize::new(0))).await
@@ -173,7 +232,8 @@ mod tests {
                     &editor,
                     json!({"time":0,"width":width}),
                     None,
-                    |_, _, root| output(root, count),
+                    false,
+                    |_, _, root, _| output(root, count),
                 )
                 .await
                 .unwrap();
@@ -190,10 +250,96 @@ mod tests {
                 &editor,
                 json!({"time":0,"expectedRevision":0}),
                 None,
-                |_, _, root| output(root, count),
+                false,
+                |_, _, root, _| output(root, count),
             )
             .await;
         assert!(result.unwrap_err().contains("REVISION_CONFLICT"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn newer_request_cancels_running_and_queued_renders_but_identical_one_does_not() {
+        let (root, editor) = setup();
+        let frames = Arc::new(PreviewFrames::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        // Stands in for FFmpeg: runs until its cancel flag is set, as run_process does.
+        let slow = |time: f64, agent: bool| {
+            let (editor, frames) = (editor.clone(), frames.clone());
+            tokio::spawn(async move {
+                frames
+                    .frame_with(&editor, json!({"time":time}), None, agent, |_, _, _, cancel| async move {
+                        while !cancel.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err("stopped".to_string())
+                    })
+                    .await
+            })
+        };
+        // Counts requests that have registered, not those still pending: a superseded
+        // request may already have left the list by the time this is polled.
+        let wait_pending = |n: u64| {
+            let frames = frames.clone();
+            async move {
+                while frames.sequence.load(Ordering::Relaxed) < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        let running = slow(0.0, false);
+        wait_pending(1).await;
+        let same = slow(0.0, false);
+        wait_pending(2).await;
+        assert!(!running.is_finished(), "an identical request must not cancel");
+        let queued = slow(0.5, false);
+        wait_pending(3).await;
+        let newest = tokio::time::timeout(
+            Duration::from_secs(5),
+            frames.frame_with(&editor, json!({"time":0.9}), None, false, |_, _, root, _| {
+                output(root, count.clone())
+            }),
+        )
+        .await
+        .expect("the newest request must not wait for superseded renders");
+        assert_eq!(newest.unwrap()["cacheHit"], false);
+        for task in [running, same, queued] {
+            assert!(task.await.unwrap().unwrap_err().contains("PREVIEW_CANCELLED"));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(frames.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn agent_and_ui_frames_do_not_cancel_each_other() {
+        let (root, editor) = setup();
+        let frames = Arc::new(PreviewFrames::default());
+        // Finishes on its own unless cancelled, like a real render.
+        let request = |time: f64, agent: bool| {
+            let (editor, frames) = (editor.clone(), frames.clone());
+            tokio::spawn(async move {
+                frames
+                    .frame_with(&editor, json!({"time":time}), None, agent, |_, _, root, cancel| async move {
+                        for _ in 0..20 {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err("stopped".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        output(root, Arc::new(AtomicUsize::new(0))).await
+                    })
+                    .await
+            })
+        };
+        // UI render running, then an agent asks for another time, then the reverse.
+        let ui = request(0.0, false);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let agent = request(1.0, true);
+        ui.await.unwrap().expect("an agent request must not cancel the UI frame");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let later_ui = request(2.0, false);
+        agent.await.unwrap().expect("a UI request must not cancel the agent frame");
+        later_ui.await.unwrap().unwrap();
+        assert!(frames.pending.lock().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

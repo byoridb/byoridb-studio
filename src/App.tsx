@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Check,
   ChevronDown,
+  CloudOff,
   Download,
   Film,
   FolderOpen,
@@ -11,6 +12,7 @@ import {
   Save,
   Settings2,
   Sparkles,
+  TriangleAlert,
   X,
 } from "lucide-react";
 import {
@@ -20,7 +22,7 @@ import {
   rpc,
   uploadFile,
 } from "./studio/api";
-import type { Command, Job, Project, RuntimeStatus } from "./studio/types";
+import type { Clip, Command, Job, Media, Project, RuntimeStatus } from "./studio/types";
 import { durationOf } from "./studio/types";
 import {
   canEditSelection,
@@ -45,7 +47,26 @@ import Inspector from "./studio/Inspector";
 import AssistantPanel from "./studio/AssistantPanel";
 import Settings from "./studio/Settings";
 import ExportDialog from "./studio/ExportDialog";
+import { useModal } from "./studio/useModal";
 import "./styles/studio.css";
+
+/** Letter shortcuts follow the physical key when an IME (e.g. Hangul) changes event.key. */
+const shortcutKey = (event: KeyboardEvent) =>
+  /^[a-z]$/i.test(event.key)
+    ? event.key.toLowerCase()
+    : /^Key[A-Z]$/.test(event.code)
+      ? event.code.slice(3).toLowerCase()
+      : event.key.toLowerCase();
+const missingKey = (project: Project | null) =>
+  project?.media.filter((media) => media.missing).map((media) => media.id).join() ?? "";
+interface Selection {
+  projectId: string | null;
+  ids: string[];
+  primary: string | null;
+  trackId: string | null;
+}
+const noSelection: Selection = { projectId: null, ids: [], primary: null, trackId: null };
+const noIds: string[] = [];
 
 export default function App() {
   const [project, setProject] = useState<Project | null>(null);
@@ -53,9 +74,31 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+  // Selection belongs to one project and is validated while rendering, so a
+  // project change can never race a selection made in the same tick.
+  const [selection, setSelection] = useState<Selection>(noSelection);
+  const selectedIds = useMemo(() => {
+    if (!project || selection.projectId !== project.id) return noIds;
+    const valid = selection.ids.filter((id) =>
+      project.clips.some((clip) => clip.id === id),
+    );
+    return valid.length === selection.ids.length ? selection.ids : valid;
+  }, [project, selection]);
+  const selectedId =
+    selection.primary && selectedIds.includes(selection.primary)
+      ? selection.primary
+      : null;
+  const selectedTrackId =
+    project &&
+    selection.projectId === project.id &&
+    project.tracks.some((track) => track.id === selection.trackId)
+      ? selection.trackId
+      : null;
+  const [offline, setOffline] = useState(false);
+  const [pending, setPending] = useState(0);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [serviceNotice, setServiceNotice] = useState<string | null>(null);
+  const clipboard = useRef<{ projectId: string; clips: Clip[] } | null>(null);
   const [time, setTime] = useState(0);
   const [seekEpoch, setSeekEpoch] = useState(0);
   const seekTime = useCallback((value: number | ((current: number) => number)) => {
@@ -107,20 +150,34 @@ export default function App() {
   }, [!!project]);
   const current = useRef<Project | null>(null);
   current.current = project;
-  const selectionProject = useRef<string | null>(null);
   const projectGeneration = useRef(0);
   const selectMany = useCallback((ids: string[], primary?: string | null) => {
+    const active = current.current;
     const valid = [...new Set(ids)].filter((id) =>
-      current.current?.clips.some((clip) => clip.id === id),
+      active?.clips.some((clip) => clip.id === id),
     );
-    setSelectedIds(valid);
-    setSelectedId(
-      primary && valid.includes(primary)
-        ? primary
-        : valid[valid.length - 1] || null,
-    );
-    const primaryClip = current.current?.clips.find((clip) => clip.id === (primary || valid[valid.length - 1]));
-    if (primaryClip) setSelectedTrackId(primaryClip.trackId);
+    const primaryClip = active?.clips.find((clip) => clip.id === (primary || valid[valid.length - 1]));
+    setSelection((previous) => ({
+      projectId: active?.id ?? null,
+      ids: valid,
+      primary:
+        primary && valid.includes(primary)
+          ? primary
+          : valid[valid.length - 1] || null,
+      trackId: primaryClip
+        ? primaryClip.trackId
+        : previous.projectId === active?.id
+          ? previous.trackId
+          : null,
+    }));
+  }, []);
+  const selectTrack = useCallback((trackId: string) => {
+    const projectId = current.current?.id ?? null;
+    setSelection((previous) => ({
+      ...(previous.projectId === projectId ? previous : noSelection),
+      projectId,
+      trackId,
+    }));
   }, []);
   const selectClip = useCallback(
     (id: string | null) => {
@@ -131,32 +188,17 @@ export default function App() {
     },
     [selectMany],
   );
-  useEffect(() => {
-    if (!project) return;
-    if (selectionProject.current !== project.id) {
-      selectionProject.current = project.id;
-      selectMany([], null);
-      setSelectedTrackId(null);
-      return;
-    }
-    setSelectedIds((ids) => {
-      const valid = ids.filter((id) =>
-        project.clips.some((clip) => clip.id === id),
-      );
-      return valid.length === ids.length ? ids : valid;
-    });
-    setSelectedId((id) =>
-      project.clips.some((clip) => clip.id === id) ? id : null,
-    );
-    setSelectedTrackId((id) => project.tracks.some((track) => track.id === id) ? id : null);
-  }, [project, selectMany]);
   const initialize = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
       await connectStudio();
       setConnected(true);
+      setOffline(false);
       setProject(await rpc<Project>("project.get"));
+      void rpc<{ notice?: string | null }>("project.notice")
+        .then((result) => setServiceNotice(result?.notice || null))
+        .catch(() => {});
       void rpc<RuntimeStatus>("runtime.status")
         .then(setRuntime)
         .catch(() => {});
@@ -172,14 +214,42 @@ export default function App() {
   }, [initialize]);
   useEffect(() => {
     if (!connected) return;
+    // One poll per project generation at a time; an unchanged project costs
+    // a few bytes instead of the whole document and never re-renders.
+    let inFlight = -1;
+    let failures = 0;
+    // A missing-file flag changes without a revision bump, and another
+    // project.get caller may have consumed the change first: compare the
+    // reported set, or re-read in full now and then when none is reported.
+    let full = false;
+    let unchangedReplies = 0;
     const timer = setInterval(() => {
       const generation = projectGeneration.current;
-      void rpc<Project>("project.get")
+      if (inFlight === generation) return;
+      inFlight = generation;
+      const known = current.current;
+      const conditional = known && !full;
+      full = false;
+      void rpc<Project | { unchanged: true; missing?: string[] }>(
+        "project.get",
+        conditional ? { ifProjectId: known.id, ifRevision: known.revision } : {},
+      )
         .then((p) => {
+          failures = 0;
+          setOffline(false);
           if (projectGeneration.current !== generation) return;
+          if ("unchanged" in p) {
+            full = p.missing
+              ? p.missing.join() !== missingKey(current.current)
+              : ++unchangedReplies >= 5;
+            if (full) unchangedReplies = 0;
+            return;
+          }
           if (
             p.id !== current.current?.id ||
-            p.revision > (current.current?.revision ?? -1)
+            p.revision > (current.current?.revision ?? -1) ||
+            (p.revision === current.current.revision &&
+              missingKey(p) !== missingKey(current.current))
           ) {
             if (p.id !== current.current?.id) projectGeneration.current++;
             current.current = p;
@@ -196,7 +266,12 @@ export default function App() {
               .catch(() => {});
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          if (++failures >= 2) setOffline(true);
+        })
+        .finally(() => {
+          if (inFlight === generation) inFlight = -1;
+        });
     }, 1200);
     return () => clearInterval(timer);
   }, [connected]);
@@ -209,6 +284,7 @@ export default function App() {
       ? ++projectGeneration.current
       : projectGeneration.current;
     const projectId = switching ? undefined : current.current?.id;
+    setPending((count) => count + 1);
     try {
       const guarded =
         (method.startsWith("edit.") || method === "project.update") &&
@@ -216,6 +292,8 @@ export default function App() {
           ? { ...params, expectedRevision: current.current?.revision }
           : params;
       const result = await rpc<unknown>(method, guarded, projectId);
+      setOffline(false);
+      setSaveFailed(false);
       if (projectGeneration.current !== generation) return result;
       if (switching) generation = ++projectGeneration.current;
       if (
@@ -244,8 +322,13 @@ export default function App() {
       if (projectGeneration.current === generation) setHistory(h);
       return result;
     } catch (e) {
+      // fetch rejects with a TypeError only when the service is unreachable.
+      if (e instanceof TypeError) setOffline(true);
+      if (method === "project.save") setSaveFailed(true);
       setError(e instanceof Error ? e.message : String(e));
       throw e;
+    } finally {
+      setPending((count) => count - 1);
     }
   }, []);
   const safeCommand: Command = useCallback(
@@ -370,20 +453,25 @@ export default function App() {
       /* shown inline */
     }
   }, [command]);
+  // The listener is registered once and reads the latest render through a ref,
+  // so a key pressed right after a state change never sees stale values.
+  const live = useRef({ selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save });
+  live.current = { selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save };
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
+      const { selectedIds, time, total, playing, preparing, settings, exportOpen, recent, requestPlayback, save } = live.current;
+      if (recent) return; // The dialog handles its own keys (useModal).
       if (
         (event.target instanceof Element &&
           event.target.closest(
             'input,textarea,select,[contenteditable="true"]',
           )) ||
         settings ||
-        exportOpen ||
-        recent
+        exportOpen
       )
         return;
       const cmd = event.metaKey || event.ctrlKey;
-      const key = event.key.toLowerCase();
+      const key = shortcutKey(event);
       const active = current.current;
       if (!active) return;
       const editable = canEditSelection(active, selectedIds);
@@ -434,6 +522,33 @@ export default function App() {
               if (ids.length) selectMany(ids);
             },
           );
+      } else if (
+        cmd && !event.shiftKey && !event.altKey && (key === "c" || key === "x") &&
+        selectedIds.length && !window.getSelection()?.toString()
+      ) {
+        event.preventDefault();
+        if (key === "x" && !editable) return;
+        const clips = structuredClone(selectedClips(active, selectedIds));
+        clipboard.current = { projectId: active.id, clips };
+        if (key === "c") setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
+        else
+          void safeCommand("edit.delete", {
+            ids: selectedIds,
+            expectedRevision: active.revision,
+          }).then((result) => {
+            if (result) selectMany([], null);
+          });
+      } else if (cmd && !event.shiftKey && !event.altKey && key === "v" && clipboard.current?.projectId === active.id) {
+        event.preventDefault();
+        if (event.repeat) return;
+        void safeCommand("edit.paste", {
+          clips: clipboard.current.clips,
+          at: time,
+          expectedRevision: active.revision,
+        }).then((result) => {
+          const ids = newClipIds(active, result);
+          if (ids.length) selectMany(ids);
+        });
       } else if (cmd && key === "g" && selectedIds.length) {
         event.preventDefault();
         if (editable && (event.shiftKey || selectedIds.length > 1))
@@ -512,22 +627,24 @@ export default function App() {
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [
-    selectedId,
-    selectedIds,
-    time,
-    total,
-    settings,
-    exportOpen,
-    recent,
-    safeCommand,
-    save,
-    playing,
-    preparing,
-    requestPlayback,
-    selectMany,
-    seekTime,
-  ]);
+  }, [safeCommand, selectMany, seekTime]);
+  const relink = async (media: Media) => {
+    try {
+      const paths = await pickFiles();
+      if (paths === null) {
+        setError("원본 다시 연결은 데스크톱 앱에서 할 수 있습니다.");
+        return;
+      }
+      if (paths.length)
+        await safeCommand("media.relink", {
+          id: media.id,
+          path: paths[0],
+          expectedRevision: current.current?.revision,
+        });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const importPaths = async () => {
     try {
       const paths = await pickFiles();
@@ -624,6 +741,14 @@ export default function App() {
       </main>
     );
   const selected = project.clips.find((c) => c.id === selectedId) || null;
+  const missing = project.media.filter((media) => media.missing);
+  const saveState = pending
+    ? { label: "저장 중", title: "변경 사항을 저장하고 있습니다", icon: <LoaderCircle className="spin" size={11} /> }
+    : offline
+      ? { label: "연결 끊김", title: "편집 서비스에 연결할 수 없습니다. 변경 사항이 저장되지 않습니다.", icon: <CloudOff size={11} /> }
+      : saveFailed
+        ? { label: "저장 오류", title: "프로젝트를 저장하지 못했습니다. 다시 저장해 주세요.", icon: <TriangleAlert size={11} /> }
+        : { label: "저장됨", title: "자동 저장", icon: <Check size={11} /> };
   return (
     <PreviewDraftContext.Provider value={preview}>
       <main
@@ -705,7 +830,7 @@ export default function App() {
           <div className="project-title">
             <input
               aria-label="프로젝트 이름"
-              key={project.id}
+              key={`${project.id}:${project.name}`}
               defaultValue={project.name}
               onBlur={(e) => {
                 if (e.target.value.trim() && e.target.value !== project.name)
@@ -717,8 +842,12 @@ export default function App() {
                 if (e.key === "Enter") e.currentTarget.blur();
               }}
             />
-            <span title="자동 저장">
-              <Check size={11} /> 저장됨
+            <span
+              className={offline || saveFailed ? "save-error" : ""}
+              title={saveState.title}
+              role="status"
+            >
+              {saveState.icon} {saveState.label}
             </span>
           </div>
           <div className="topbar-actions">
@@ -752,13 +881,15 @@ export default function App() {
             className={`studio-notification ${error ? "error" : ""}`}
             role={error ? "alert" : "status"}
           >
-            {busy ? (
+            {error ? (
+              <TriangleAlert size={14} />
+            ) : busy ? (
               <LoaderCircle className="spin" size={14} />
             ) : (
               <Check size={14} />
             )}
             <span>{error || busy || notice}</span>
-            {!busy && (
+            {(!busy || error) && (
               <button
                 title="알림 닫기"
                 onClick={() => {
@@ -769,6 +900,30 @@ export default function App() {
                 <X size={13} />
               </button>
             )}
+          </div>
+        )}
+        {serviceNotice && (
+          <div className="studio-banner" role="alert">
+            <TriangleAlert size={14} />
+            <span>{serviceNotice}</span>
+            <button
+              onClick={() => {
+                setServiceNotice(null);
+                void rpc("project.noticeDismiss").catch(() => {});
+              }}
+            >
+              확인
+            </button>
+          </div>
+        )}
+        {missing.length > 0 && (
+          <div className="studio-banner" role="alert">
+            <TriangleAlert size={14} />
+            <span>
+              원본 파일을 찾을 수 없습니다 · {missing[0].name}
+              {missing.length > 1 && ` 외 ${missing.length - 1}개`}
+            </span>
+            <button onClick={() => void relink(missing[0])}>다시 연결</button>
           </div>
         )}
         <div className="editor-workspace">
@@ -866,7 +1021,8 @@ export default function App() {
             </div>
             <Timeline
               selectedTrackId={selectedTrackId}
-              onTrackSelect={setSelectedTrackId}
+              onTrackSelect={selectTrack}
+              playing={playing}
               project={project}
               time={time}
               onTime={seekTime}
@@ -922,12 +1078,7 @@ export default function App() {
         )}
         {recent && (
           <div className="modal-backdrop">
-            <section
-              className="recent-modal"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="recent-title"
-            >
+            <RecentModal onClose={() => setRecent(null)}>
               <header>
                 <h2 id="recent-title">프로젝트 열기</h2>
                 <button title="닫기" onClick={() => setRecent(null)}>
@@ -959,10 +1110,26 @@ export default function App() {
                 ))}
                 {!recent.length && <p>저장된 프로젝트가 없습니다.</p>}
               </div>
-            </section>
+            </RecentModal>
           </div>
         )}
       </main>
     </PreviewDraftContext.Provider>
+  );
+}
+
+function RecentModal({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const ref = useModal<HTMLElement>(onClose);
+  return (
+    <section
+      ref={ref}
+      tabIndex={-1}
+      className="recent-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="recent-title"
+    >
+      {children}
+    </section>
   );
 }

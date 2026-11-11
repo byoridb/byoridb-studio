@@ -76,7 +76,7 @@ npm run build
 npm run tauri build -- --bundles app
 ```
 
-macOS 앱 출력 경로는 `src-tauri/target/release/bundle/macos/Byori Studio.app`입니다. 앱에는 프런트엔드, Rust 편집 서비스, MCP/CLI 브리지와 데모 소재가 포함됩니다. 같은 데이터 폴더와 포트로 서비스가 이미 실행 중이면 인증된 기존 서비스에 연결합니다. 외부 배포용 Developer ID 서명·공증은 별도 배포 작업입니다.
+macOS 앱 출력 경로는 `src-tauri/target/release/bundle/macos/Byori Studio.app`입니다. 앱에는 프런트엔드, Rust 편집 서비스, MCP/CLI 브리지와 데모 소재가 포함됩니다. 같은 데이터 폴더와 포트로 개발 서비스(`npm run service`)가 이미 실행 중이면 앱은 그 서비스에 연결합니다. 앱이 이미 실행 중이면 두 번째 앱이나 개발 서비스는 시작되지 않습니다. 외부 배포용 Developer ID 서명·공증은 별도 배포 작업입니다.
 
 브라우저에서는 파일 선택·드롭 시 소재가 Studio 가져오기 폴더로 복사됩니다. 네이티브 앱에서는 파일 대화상자로 원본 경로를 가져옵니다. 내보내기 위치는 파일시스템 경로이며 네이티브 앱에서는 저장 대화상자도 사용할 수 있습니다.
 
@@ -91,7 +91,7 @@ python3 scripts/studio-cli.py edit.add '{"trackId":"text-1","start":0,"duration"
 python3 scripts/studio-cli.py history.undo
 ```
 
-클립·트랙 ID는 현재 `project.get` 응답에서 확인합니다. 여러 변경을 한 번에 적용하려면 `edit.batch`에 `commands`와 조회한 `expectedRevision`을 전달합니다. 버전이 달라지면 충돌 오류를 반환합니다. API 계약은 [IMPLEMENTATION.md](./IMPLEMENTATION.md), MCP의 현재 허용 메서드는 [studio-mcp.py](./scripts/studio-mcp.py)에서 확인할 수 있습니다.
+클립·트랙 ID는 현재 `project.get` 응답에서 확인합니다. 여러 변경을 한 번에 적용하려면 `edit.batch`에 `commands`와 조회한 `expectedRevision`을 전달합니다. 버전이 달라지면 충돌 오류를 반환합니다. API 계약은 [IMPLEMENTATION.md](./IMPLEMENTATION.md), MCP의 현재 허용 메서드는 [studio-tools.json](./scripts/studio-tools.json)에서 확인할 수 있습니다.
 
 앱의 에이전트 패널은 각 작업에 전용 작업 폴더와 MCP 설정을 만들고, `studio_project`, `studio_edit`, `studio_export`, `studio_memory`, `studio_speech`, `studio_assets` 도구를 해당 CLI에 제공합니다. 사용자의 전역 CLI 설정을 수정하지 않습니다. 직접 외부 MCP 클라이언트에 연결하려면 Python 3으로 `scripts/studio-mcp.py`를 stdio 서버로 실행하면 됩니다. 기본 연결 파일은 아래 데이터 폴더에 있으며 `--connection <경로>`로 지정할 수 있습니다.
 
@@ -125,7 +125,7 @@ CLI 실행은 해당 제공자의 계정·사용량 정책을 따릅니다. 프�
 
 프로젝트는 원본 미디어의 로컬 경로를 참조합니다. 외부로 프로젝트 JSON만 옮기면 원본 영상까지 함께 이동하지 않습니다. 실행 취소 이력과 실행 작업 상태는 현재 서비스 실행 중에 유지됩니다. 창작 기억은 발견한 ByoriDB의 `studio_creative` 공간에 저장됩니다.
 
-격리된 개발·테스트에는 `BYORI_STUDIO_HOME`으로 데이터 폴더를, `BYORI_STUDIO_PORT`로 서비스 포트를 지정할 수 있습니다. 브라우저 연결 설정은 기본 포트를 사용하므로 포트를 바꾼 테스트는 연결 파일을 지정한 CLI/API를 사용하세요. `BYORIDB_HOME`은 명시적인 DB 설치 위치를 지정합니다.
+격리된 개발·테스트에는 `BYORI_STUDIO_HOME`으로 데이터 폴더를, `BYORI_STUDIO_PORT`로 서비스 포트를 지정할 수 있습니다. `npm run studio`는 `BYORI_STUDIO_PORT`(서비스, 기본 43123)와 `BYORI_STUDIO_DEV_PORT`(Vite, 기본 1420)를 두 프로세스에 전달하고 브라우저 화면은 `VITE_STUDIO_PORT`로 서비스에 연결합니다. `scripts/studio-cli.py`와 MCP도 `BYORI_STUDIO_HOME`의 연결 파일을 사용합니다. 전체 검증은 `npm run verify`입니다. `BYORIDB_HOME`은 명시적인 DB 설치 위치를 지정합니다.
 
 서비스는 IPv4 loopback에만 바인딩하며 RPC에 bearer 토큰을 요구합니다. 브라우저 업로드는 시작한 프로젝트와 revision을 고정하고, 업로드 중 편집·프로젝트 전환이 생기면 적용을 거부합니다. 데이터 폴더는 사용자 전용 권한, 연결 파일은 `0600`으로 저장합니다. 브라우저 Origin은 개발 서버와 Tauri origin으로 제한하고, 미디어 HTTP 응답은 프로젝트에 등록된 파일·관리된 글꼴·생성한 미리보기만 제공합니다. 토큰이 있는 로컬 클라이언트에는 가져오기·내보내기 파일 접근 권한이 있으므로 연결 파일을 공개하지 마세요. 작업별 CLI 폴더는 설정 분리 목적이며 별도의 운영체제 보안 격리 공간은 아닙니다.
 

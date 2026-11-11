@@ -36,7 +36,7 @@ Rust 73개(편집기 대상 57개), Python MCP 4개, TypeScript·Vite 빌드와 
 
 - [ ] 전환 이후 작업 전체 커밋(수정 15·미추적 22 항목, `src/studio/`와 Rust 신규 모듈 포함).
 - [ ] CI 구성과 단일 검증 명령(vitest + cargo test + Python unittest + 빌드).
-- [ ] 레거시 정리: `src/components/`, `client.rs`, CLAUDE.md 하단 DB 탐색기 문서, 크레이트 이름 `byoridb-studio`, 미사용 `tauri-plugin-shell`.
+- [ ] 레거시 정리: CLAUDE.md 하단 DB 탐색기 문서. (`src/components/`, `client.rs`, 크레이트 이름, `tauri-plugin-shell` 은 정리됨)
 - [ ] `src/App.test.tsx:302` 선택/리플 삭제 테스트의 간헐 실패(2회 중 1회) 원인 확인.
 
 ### 2. 데이터 안전·안정성
@@ -63,7 +63,7 @@ Rust 73개(편집기 대상 57개), Python MCP 4개, TypeScript·Vite 빌드와 
 - [ ] 컨셉 탭 입력 중 리비전이 바뀌면 미저장 입력 초기화.
 - [ ] 내장 필터가 UI(`Library.tsx`)와 `editor.rs`에 다른 id·값으로 이중 정의. 필터 적용 시 color 객체 통째 교체.
 - [ ] `fadeIn/fadeOut` 직접 수정 시 `transitionIn/Out` duration과 어긋남.
-- [ ] `scripts/studio-cli.py`가 `BYORI_STUDIO_HOME`을 무시.
+- [x] `scripts/studio-cli.py`가 `BYORI_STUDIO_HOME`을 무시.
 - [ ] 저장 상태 표시가 하드코딩된 "저장됨". 화면 비율 라벨이 실제 비율과 무관.
 - [ ] 출력 해상도 비율이 프로젝트와 다르면 화면이 늘어남. FFmpeg stderr를 64KB까지만 읽음.
 
@@ -112,7 +112,7 @@ Rust 73개(편집기 대상 57개), Python MCP 4개, TypeScript·Vite 빌드와 
 - [ ] Gemini CLI 로그인 후 실제 편집 → UI 반영 → 실행 취소 검증.
 - [ ] 별도 빈 설치 환경에서 ByoriDB 설치·업데이트를 실제 배포물로 검증.
 - [ ] Higgsfield 실제 계정 로그인·CLI 조회 종단 검증. allowlist 도구 이름이 실제 서버 도구와 일치하는지 확인.
-- [ ] 통합·E2E 자동 테스트. 브라우저 모드의 포트 43123·Origin 하드코딩(`src/studio/api.ts:14`)을 먼저 풀어야 격리 실행이 가능하다.
+- [ ] 통합·E2E 자동 테스트. 포트·Origin 은 `BYORI_STUDIO_PORT`/`BYORI_STUDIO_DEV_PORT`/`VITE_STUDIO_PORT` 로 격리할 수 있다.
 - [ ] 테스트 공백: `Settings.tsx`·`api.ts` 0%, AssistantPanel·CurveEditor·전환/효과/스티커 탭, 프로젝트 수명주기·자막 dispatch·마커·소재 제거, 렌더, runtime 프로세스·speech·service 라우팅.
 
 ### 8. 로드맵 기능 확장

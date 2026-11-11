@@ -11,7 +11,8 @@ export async function connectStudio(force = false): Promise<Connection> {
   if (connection) return connection;
   if (isTauri()) connection = await invoke<Connection>("studio_connection");
   else {
-    const response = await fetch("http://127.0.0.1:43123/session");
+    const port = import.meta.env.VITE_STUDIO_PORT || "43123";
+    const response = await fetch(`http://127.0.0.1:${port}/session`);
     if (!response.ok)
       throw new Error(
         "편집 서비스에 연결할 수 없습니다. npm run studio를 실행해 주세요.",

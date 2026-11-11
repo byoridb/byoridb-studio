@@ -7,7 +7,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import Player from "./Player";
+import Player, { aspectLabel } from "./Player";
 import { rpc } from "./api";
 import { usePreviewFrame } from "./usePreviewFrame";
 import { withPreviewDraft } from "./previewDraft";
@@ -92,6 +92,50 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+describe("canvas", () => {
+  it("labels the real frame ratio", () => {
+    expect(aspectLabel(1920, 1080)).toBe("16:9");
+    expect(aspectLabel(1080, 1920)).toBe("9:16");
+    expect(aspectLabel(1440, 1080)).toBe("4:3");
+    expect(aspectLabel(1080, 1350)).toBe("4:5");
+    expect(aspectLabel(2560, 1080)).toBe("64:27");
+    expect(aspectLabel(1080, 1080)).toBe("1:1");
+    render(<Player project={{ ...project, width: 1440, height: 1080, clips: [] }} time={0} playing={false} onTime={vi.fn()} onPlaying={vi.fn()} selectedId={null} onSelect={vi.fn()} onCommand={vi.fn()} />);
+    expect(screen.getByText("4:3")).toBeInTheDocument();
+  });
+  it("drags an animated layer from its on-screen position into a revision-guarded keyframe", () => {
+    const image: Clip = { ...visual, kind: "image", keyframes: [
+      { property: "x", time: 0, value: 0 },
+      { property: "x", time: 4, value: 400 },
+    ] };
+    const onCommand = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(<Player project={{ ...project, revision: 9, clips: [image] }} time={2} playing={false} onTime={vi.fn()} onPlaying={vi.fn()} selectedId={null} onSelect={vi.fn()} onCommand={onCommand} />);
+    const layer = container.querySelector<HTMLElement>(".composition-layer")!;
+    layer.setPointerCapture = vi.fn();
+    const scale = 640 / 1920;
+    fireEvent.pointerDown(layer, { clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(layer, { clientX: 30 * scale, clientY: 60 * scale });
+    fireEvent.pointerUp(layer);
+    expect(onCommand).toHaveBeenCalledWith("edit.update", {
+      id: "v",
+      expectedRevision: 9,
+      patch: {
+        transform: { ...visual.transform, y: 60 },
+        keyframes: [
+          { property: "x", time: 0, value: 0 },
+          { property: "x", time: 2, value: 230 },
+          { property: "x", time: 4, value: 400 },
+        ],
+      },
+    });
+    onCommand.mockClear();
+    fireEvent.pointerDown(layer, { clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(layer, { clientX: 30, clientY: 30 });
+    fireEvent.pointerCancel(layer);
+    fireEvent.pointerUp(layer);
+    expect(onCommand).not.toHaveBeenCalled();
+  });
 });
 describe("responsive preview", () => {
   it("seeks source media only for an explicit seek, not a delayed playback frame", async () => {
@@ -228,7 +272,7 @@ describe("responsive preview", () => {
     expect(next.revision).toBe(project.revision);
     expect(withPreviewDraft(project, null)).toBe(project);
   });
-  it("coalesces scrubbing to the latest frame and ignores obsolete responses", async () => {
+  it("sends each settled scrub position at once and ignores obsolete responses", async () => {
     vi.useFakeTimers();
     let complete: (value: unknown) => void = () => {};
     vi.mocked(rpc).mockImplementationOnce(
@@ -257,11 +301,13 @@ describe("responsive preview", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(120);
     });
-    expect(rpc).toHaveBeenCalledTimes(1);
+    // The service cancels superseded renders, so the client never queues behind one.
+    expect(rpc).toHaveBeenCalledTimes(3);
+    expect(result.current?.url).toBe("http://studio/latest");
     await act(async () => {
       complete({ assetId: "obsolete", revision: 1, projectId: "p" });
     });
-    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(rpc).toHaveBeenCalledTimes(3);
     expect(rpc).toHaveBeenLastCalledWith(
       "preview.frame",
       { time: 2, width: 640, expectedRevision: 1 },

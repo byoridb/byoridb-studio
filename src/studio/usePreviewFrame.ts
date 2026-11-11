@@ -3,16 +3,7 @@ import { assetUrl, rpc } from "./api";
 import { durationOf, type Project } from "./types";
 
 type Frame = { url: string; key: string };
-type Request = {
-  key: string;
-  projectId: string;
-  revision: number;
-  time: number;
-  width: number;
-  valid: () => boolean;
-};
-
-/** Only one request is in flight; scrubbing replaces, rather than accumulates, work. */
+/** Scrubbing is debounced; a newer request makes the service cancel the older render. */
 export function usePreviewFrame(
   project: Project,
   time: number,
@@ -26,77 +17,46 @@ export function usePreviewFrame(
   const at = Math.min(time, Math.max(0, durationOf(project) - 1 / project.fps));
   const key = `${content}:${Math.floor(at * project.fps)}:${pixels}`;
   const cache = useRef(new Map<string, Frame>());
-  const latest = useRef<Request | null>(null);
-  const running = useRef(false);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
-      latest.current = null;
     };
   }, []);
   useEffect(() => {
     let valid = true;
-    if (!enabled) {
-      latest.current = null;
-      return;
-    }
+    if (!enabled) return;
     const hit = cache.current.get(key);
     if (hit) {
       setFrame(hit);
       return;
     }
-    const pump = async () => {
-      if (running.current) return;
-      running.current = true;
-      try {
-        while (alive.current && latest.current) {
-          const request = latest.current;
-          latest.current = null;
-          if (!request.valid()) continue;
-          try {
-            const result = await rpc<{
-              assetId: string;
-              revision: number;
-              projectId?: string;
-            }>(
-              "preview.frame",
-              {
-                time: request.time,
-                width: request.width,
-                expectedRevision: request.revision,
-              },
-              request.projectId,
-            );
-            if (
-              result.revision !== request.revision ||
-              (result.projectId && result.projectId !== request.projectId)
-            )
-              continue;
-            const next = { url: assetUrl(result.assetId), key: request.key };
-            if (cache.current.size >= 32)
-              cache.current.delete(cache.current.keys().next().value!);
-            cache.current.set(request.key, next);
-            if (alive.current && request.valid()) setFrame(next);
-          } catch {
-            /* The immediate local preview remains usable on render failure. */
-          }
-        }
-      } finally {
-        running.current = false;
-      }
-    };
+    // Sent as soon as the scrub settles: the service cancels the superseded render
+    // (PREVIEW_CANCELLED), so only the newest frame is ever waited for.
     const timer = setTimeout(() => {
-      latest.current = {
-        key,
-        projectId: project.id,
-        revision: project.revision,
-        time: at,
-        width: pixels,
-        valid: () => valid,
-      };
-      void pump();
+      const request = { key, projectId: project.id, revision: project.revision };
+      rpc<{ assetId: string; revision: number; projectId?: string }>(
+        "preview.frame",
+        { time: at, width: pixels, expectedRevision: request.revision },
+        request.projectId,
+      ).then(
+        (result) => {
+          if (
+            result.revision !== request.revision ||
+            (result.projectId && result.projectId !== request.projectId)
+          )
+            return;
+          const next = { url: assetUrl(result.assetId), key: request.key };
+          if (cache.current.size >= 32)
+            cache.current.delete(cache.current.keys().next().value!);
+          cache.current.set(request.key, next);
+          if (alive.current && valid) setFrame(next);
+        },
+        () => {
+          /* The immediate local preview remains usable on render failure or cancellation. */
+        },
+      );
     }, 120);
     return () => {
       valid = false;

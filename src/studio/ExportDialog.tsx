@@ -3,6 +3,11 @@ import { Download, FolderOpen, LoaderCircle, X } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { assetUrl, rpc, savePath } from "./api";
 import { durationOf, type Job, type Project } from "./types";
+import { useModal } from "./useModal";
+import { usePoll } from "./usePoll";
+import "./panels.css";
+
+const audioFormats = ["mp3", "wav"];
 export default function ExportDialog({
   project,
   onClose,
@@ -47,16 +52,20 @@ export default function ExportDialog({
       clearTimeout(timer);
     };
   }, [project.id, project.revision, range, startTime]);
-  const active = job && ["queued", "running", "cancelling"].includes(job.state);
-  useEffect(() => {
-    if (!active || !job) return;
-    const t = setInterval(() => {
-      void rpc<Job>("export.status", { id: job.id })
-        .then(setJob)
-        .catch((e) => setError(String(e)));
-    }, 500);
-    return () => clearInterval(t);
-  }, [active, job?.id]);
+  const [pickedPath, setPickedPath] = useState("");
+  const active =
+    !!job && ["queued", "running", "cancelling"].includes(job.state);
+  const dialog = useModal<HTMLElement>(onClose, !active && !busy);
+  const poll = usePoll(
+    active ? job.id : null,
+    async () => {
+      const id = job!.id;
+      const next = await rpc<Job>("export.status", { id });
+      setJob((existing) => (existing?.id === id ? next : existing));
+    },
+    500,
+  );
+  const audioOnly = audioFormats.includes(format);
   const start = async () => {
     setBusy(true);
     setError("");
@@ -75,18 +84,32 @@ export default function ExportDialog({
         {
           path,
           format,
-          width:
-            Math.round(((project.width / project.height) * height) / 2) * 2,
-          height,
-          fps,
-          crf: quality,
+          ...(audioOnly
+            ? {}
+            : {
+                width:
+                  Math.round(((project.width / project.height) * height) / 2) *
+                  2,
+                height,
+                fps,
+                crf: quality,
+              }),
+          // Only a path confirmed by the native save dialog may replace a file.
+          ...(pickedPath && path === pickedPath ? { overwrite: true } : {}),
           ...(range ? { start: startTime, end: endTime } : {}),
         },
         project.id,
       );
       setJob({ id: j.id, state: "running", progress: 0 });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setError(
+        message.includes("FILE_EXISTS")
+          ? isTauri()
+            ? "같은 이름의 파일이 이미 있습니다. 파일 이름을 바꾸거나 ‘저장 위치 선택’으로 덮어쓸 파일을 직접 고르세요."
+            : "같은 이름의 파일이 이미 있습니다. 다른 파일 이름을 입력하세요."
+          : message,
+      );
     } finally {
       setBusy(false);
     }
@@ -98,6 +121,8 @@ export default function ExportDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="export-title"
+        tabIndex={-1}
+        ref={dialog}
       >
         <header>
           <div>
@@ -110,7 +135,7 @@ export default function ExportDialog({
                 ? "내보내기가 끝나거나 취소되면 닫을 수 있습니다"
                 : "내보내기 닫기"
             }
-            disabled={!!active || busy}
+            disabled={active || busy}
             onClick={onClose}
           >
             <X size={19} />
@@ -131,14 +156,7 @@ export default function ExportDialog({
             ) : (
               <div
                 className="export-frame-placeholder"
-                style={{
-                  aspectRatio: `${project.width}/${project.height}`,
-                  display: "grid",
-                  placeItems: "center",
-                  background: "#111",
-                  color: "#b9c0ca",
-                  fontSize: 11,
-                }}
+                style={{ aspectRatio: `${project.width}/${project.height}` }}
               >
                 {previewError
                   ? "합성 미리보기를 불러오지 못했습니다"
@@ -157,16 +175,19 @@ export default function ExportDialog({
                 <input
                   value={path}
                   onChange={(e) => setPath(e.target.value)}
-                  disabled={!!active}
+                  disabled={active}
                 />
                 {isTauri() && (
                   <button
                     title="저장 위치 선택"
-                    disabled={!!active || busy}
+                    disabled={active || busy}
                     onClick={() => {
                       void savePath(`${project.name}.${format}`, format).then(
                         (p) => {
-                          if (p) setPath(p);
+                          if (p) {
+                            setPath(p);
+                            setPickedPath(p);
+                          }
                         },
                       );
                     }}
@@ -179,7 +200,7 @@ export default function ExportDialog({
             <label>
               형식
               <select
-                disabled={!!active}
+                disabled={active}
                 value={format}
                 onChange={(e) => {
                   setFormat(e.target.value);
@@ -196,7 +217,7 @@ export default function ExportDialog({
             <label>
               해상도
               <select
-                disabled={!!active}
+                disabled={active || audioOnly}
                 value={height}
                 onChange={(e) => setHeight(+e.target.value)}
               >
@@ -212,21 +233,23 @@ export default function ExportDialog({
             <label>
               프레임레이트
               <select
-                disabled={!!active}
+                disabled={active || audioOnly}
                 value={fps}
                 onChange={(e) => setFps(+e.target.value)}
               >
-                {[24, 25, 30, 50, 60].map((f) => (
-                  <option key={f} value={f}>
-                    {f} fps
-                  </option>
-                ))}
+                {Array.from(new Set([24, 25, 30, 50, 60, project.fps]))
+                  .sort((a, b) => a - b)
+                  .map((f) => (
+                    <option key={f} value={f}>
+                      {f} fps{f === project.fps ? " · 프로젝트" : ""}
+                    </option>
+                  ))}
               </select>
             </label>
             <label>
               품질
               <select
-                disabled={!!active}
+                disabled={active || audioOnly}
                 value={quality}
                 onChange={(e) => setQuality(+e.target.value)}
               >
@@ -238,7 +261,7 @@ export default function ExportDialog({
             <label>
               내보낼 구간
               <select
-                disabled={!!active}
+                disabled={active}
                 value={range ? "range" : "all"}
                 onChange={(e) => setRange(e.target.value === "range")}
               >
@@ -246,6 +269,12 @@ export default function ExportDialog({
                 <option value="range">구간 지정</option>
               </select>
             </label>
+            {audioOnly && (
+              <p className="export-hint">
+                오디오 형식은 소리만 내보내므로 해상도·프레임레이트·품질을
+                사용하지 않습니다.
+              </p>
+            )}
             {range && (
               <div className="export-range">
                 <label>
@@ -256,7 +285,7 @@ export default function ExportDialog({
                     max={durationOf(project)}
                     step={0.1}
                     value={startTime}
-                    disabled={!!active}
+                    disabled={active}
                     onChange={(e) => setStartTime(+e.target.value)}
                   />
                 </label>
@@ -268,7 +297,7 @@ export default function ExportDialog({
                     max={durationOf(project)}
                     step={0.1}
                     value={endTime}
-                    disabled={!!active}
+                    disabled={active}
                     onChange={(e) => setEndTime(+e.target.value)}
                   />
                 </label>
@@ -276,7 +305,17 @@ export default function ExportDialog({
             )}
           </div>
         </div>
-        {error && <div className="inline-error">{error}</div>}
+        {error && (
+          <div className="inline-error" role="alert">
+            {error}
+          </div>
+        )}
+        {poll.stalled && (
+          <div className="inline-error" role="alert">
+            내보내기 상태를 확인하지 못했습니다. {poll.error}{" "}
+            <button onClick={poll.retry}>다시 시도</button>
+          </div>
+        )}
         {job && (
           <div className="export-progress">
             <div>

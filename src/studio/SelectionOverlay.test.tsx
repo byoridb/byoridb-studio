@@ -68,3 +68,40 @@ it("moves in project pixels and preserves unrelated transform properties", () =>
     patch: { transform: { ...clip.transform, x: 10, y: 0 } },
   });
 });
+it("edits the keyframe at the playhead when the moved property is animated", () => {
+  const command = vi.fn().mockResolvedValue({});
+  const animated: Clip = { ...clip, start: 1, keyframes: [
+    { property: "x", time: 0, value: 0 },
+    { property: "x", time: 2, value: 200 },
+  ] };
+  render(
+    <SelectionOverlay
+      clip={animated}
+      revision={12}
+      box={{ width: 400, height: 225 }}
+      ratio={0.5}
+      transform={{ x: 200, y: 0, scale: 1 }}
+      rotation={0}
+      time={3}
+      fps={30}
+      onPreview={vi.fn()}
+      onCommand={command}
+    />,
+  );
+  const handle = screen.getByRole("button", { name: "선택 클립 이동" });
+  handle.setPointerCapture = vi.fn();
+  fireEvent.pointerDown(handle, { clientX: 100, clientY: 100 });
+  fireEvent.pointerMove(handle, { clientX: 150, clientY: 110 });
+  fireEvent.pointerUp(handle);
+  expect(command).toHaveBeenCalledWith("edit.update", {
+    id: "clip",
+    expectedRevision: 12,
+    patch: {
+      transform: { ...clip.transform, y: 20 },
+      keyframes: [
+        { property: "x", time: 0, value: 0 },
+        { property: "x", time: 2, value: 300 },
+      ],
+    },
+  });
+});

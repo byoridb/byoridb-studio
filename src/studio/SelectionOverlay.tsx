@@ -1,5 +1,6 @@
 import { useRef } from "react";
 import type { Clip, Command } from "./types";
+import { canvasTransformPatch } from "./clipEditing";
 import "./selection-overlay.css";
 
 export type LiveTransform = { x: number; y: number; scale: number };
@@ -10,6 +11,8 @@ export default function SelectionOverlay({
   ratio,
   transform,
   rotation,
+  time = clip.start,
+  fps = 30,
   onPreview,
   onCommand,
 }: {
@@ -19,6 +22,9 @@ export default function SelectionOverlay({
   ratio: number;
   transform: LiveTransform;
   rotation: number;
+  /** Project time and frame rate: an animated property is edited as a keyframe here. */
+  time?: number;
+  fps?: number;
   onPreview: (value: LiveTransform | null) => void;
   onCommand: Command;
 }) {
@@ -91,7 +97,12 @@ export default function SelectionOverlay({
       void onCommand("edit.update", {
         id: clip.id,
         expectedRevision: g.revision,
-        patch: { transform: { ...clip.transform, ...g.next } },
+        patch: canvasTransformPatch(
+          clip,
+          g.mode === "move" ? { x: g.next.x, y: g.next.y } : { scale: g.next.scale },
+          time,
+          fps,
+        ),
       });
   };
   return (
@@ -127,13 +138,15 @@ export default function SelectionOverlay({
           void onCommand("edit.update", {
             id: clip.id,
             expectedRevision: revision,
-            patch: {
-              transform: {
-                ...clip.transform,
+            patch: canvasTransformPatch(
+              clip,
+              {
                 x: transform.x + delta[0] * (e.shiftKey ? 10 : 1),
                 y: transform.y + delta[1] * (e.shiftKey ? 10 : 1),
               },
-            },
+              time,
+              fps,
+            ),
           });
         }}
       />
@@ -165,12 +178,12 @@ export default function SelectionOverlay({
             void onCommand("edit.update", {
               id: clip.id,
               expectedRevision: revision,
-              patch: {
-                transform: {
-                  ...clip.transform,
-                  scale: Math.max(0.05, Math.min(10, transform.scale + delta)),
-                },
-              },
+              patch: canvasTransformPatch(
+                clip,
+                { scale: Math.max(0.05, Math.min(10, transform.scale + delta)) },
+                time,
+                fps,
+              ),
             });
           }}
         />

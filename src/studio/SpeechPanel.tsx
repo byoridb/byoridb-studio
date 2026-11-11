@@ -57,7 +57,7 @@ export default function SpeechPanel({
   const [operation, setOperation] = useState<Operation>(mode);
   const refreshedJob = useRef<string | null>(null);
   const probed = useRef(false);
-  const active = !!job && ["queued", "running"].includes(job.state);
+  const active = !!job && ["queued", "running", "cancelling"].includes(job.state);
   const hasAudio = project.clips.some(
     (c) =>
       c.kind === "audio" ||

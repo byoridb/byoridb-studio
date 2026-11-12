@@ -1,0 +1,390 @@
+# Studio implementation contract
+
+This describes the implemented local API as of 2026-11-11. Product direction lives in PRODUCT.md and ROADMAP.md; this document describes actual requests and responses rather than future scope.
+
+## Service and transport
+
+The Rust service binds to `127.0.0.1:43123`. `BYORI_STUDIO_PORT` overrides the port; `BYORI_STUDIO_HOME` overrides the default data root `~/.byori-studio`. One service owns one open project. UI and agents use the same Editor and undo history.
+
+```json
+POST /rpc
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"method":"edit.update","params":{"id":"clip-id","patch":{"start":2},"expectedRevision":7},"projectId":"project-id"}
+```
+
+- `params` is an object; omitted/null becomes `{}`. RPC bodies are limited to 2 MB.
+- Success is HTTP 200 with `{"result": ...}`. Dispatch/validation errors are HTTP 400 with `{"error":"..."}`. Missing/invalid authentication or untrusted Origin is HTTP 401. Oversized bodies return HTTP 413.
+- Top-level `projectId` is optional for ordinary RPC, and is included by per-agent MCP connections. Editor requests check it against the open project under the same editor lock used for dispatch. A mismatch returns HTTP 409 before the command runs. `memory.record` and speech start requests also validate the bound project before recording/starting; other runtime status/job queries do not switch projects.
+- `params.expectedRevision`, when supplied, must be a nonnegative integer equal to the current revision. Editor dispatch checks it before handling the method; mismatches currently return HTTP 400 with an error containing `REVISION_CONFLICT`. Supply it on writes that depend on a previously read state.
+- Successful mutations increment revision and atomically persist `current.json` and `projects/<id>.json` (the service writes shortly after the edit rather than within it: see "Fourth-phase contract"). Undo/redo also increment revision. Undo history and job registries are in memory for the service lifetime.
+- `project.get` polling updates the UI. There is **no `/events` endpoint**.
+
+The private connection file is `{url,token}` in `connection.json` with mode `0600`; the data root has mode `0700`. `GET /session` exists only in the development service (`studio-service`) and returns that connection only to Origin `http://localhost:<BYORI_STUDIO_DEV_PORT>` or `http://127.0.0.1:<BYORI_STUDIO_DEV_PORT>` (default 1420); missing Origin is rejected. The browser UI reaches the service on `VITE_STUDIO_PORT` (default 43123). Other authenticated endpoints accept these development origins plus `tauri://localhost`, `http://tauri.localhost`, and `https://tauri.localhost`. Local nonbrowser clients may omit Origin.
+
+`GET /assets/<assetId>` and `/assets/<assetId>/thumbnail` accept `?token=...` or the bearer header and support byte ranges. IDs resolve only to current-project media or registered generated previews. There is no arbitrary-path file-serving endpoint.
+
+### Browser uploads
+
+```text
+POST /upload?name=<URL-encoded-filename>&projectId=<URL-encoded-project-id>
+Authorization: Bearer <token>
+<body: raw file bytes>
+```
+
+`projectId` is required. Before streaming, the service checks that ID and captures the current revision. The body is streamed into a unique sanitized filename under `imports/`, with a 2 GB per-file limit. After receiving the body, the service locks the Editor, verifies both the captured project ID and revision, then dispatches with `expectedRevision`:
+
+- `.srt` filenames → `captions.import {path,expectedRevision}`.
+- Other filenames → `media.import {paths:[path],expectedRevision}`.
+
+Success returns `{"result":Project}`. Missing ID is HTTP 400; wrong ID or a project/revision change during upload is HTTP 409. Failed imports and conflicted uploads remove the staged file. Concurrent edits therefore cannot redirect an upload into another project. Sequentially upload multiple files and use each resulting Project to refresh the UI.
+
+### Native commands
+
+- `studio_connection()` → `{url,token}`.
+- `studio_open_files({extensions?:string[]})` → `string[]` of selected local paths; cancellation returns `[]`. Defaults include media, SRT and LUT. Font/preset callers request `ttf|otf` or `json|cube|3dl` filters.
+- `studio_save_file({name,extension?})` → local path or `null`.
+- `studio_reveal_file({path})` → shows an existing file (an absolute path) in Finder with `/usr/bin/open -R`; nothing is opened or run. Rejects with a Korean message when the file is gone. Used by the export dialog's 「파일 위치 열기」, which the browser UI does not show.
+
+Tauri embeds the Python MCP/CLI scripts into the Rust binary, copies them to `tools/`, and bundles `public/demo/` as `demo/`. Native setup exposes the bundled demo directory through `BYORI_STUDIO_DEMO_DIR`.
+
+## Rust API
+
+```rust
+Editor::new(root: PathBuf) -> Result<Editor, String>
+Editor::dispatch(&mut self, method: &str, params: Value) -> Result<Value, String> // async
+Editor::asset_path(&self, id: &str, thumbnail: bool) -> Option<PathBuf>
+Runtime::dispatch(&self, method: &str, params: Value) -> Result<Value, String> // async
+```
+
+Editor handles `project.*`, `media.*`, `edit.*`, `history.*`, `color.*`, `captions.*`, `assets.*`, `fonts.*`, `presets.*`, `preview.start`, and `export.*`. HTTP `preview.frame` snapshots Editor state and delegates to PreviewFrames outside the editor lock. Runtime handles `runtime.*`, `agent.*`, `memory.*`, and forwards `speech.*` to Speech.
+
+## Types and units
+
+Keys are camelCase and IDs are strings. Timeline positions, source offsets, durations, keyframe times and fades are **seconds**. `updatedAt`, `createdAt`, `checkedAt`, `startedAt`, `finishedAt`, and job-log `at` values generated by Rust are numeric **Unix epoch milliseconds**. Do not parse these numbers as seconds or require ISO strings. SRT itself uses `HH:MM:SS,mmm`.
+
+```text
+Project {
+  id, name, revision, width, height, fps, background,
+  media: Media[], tracks: Track[], clips: Clip[], markers: Marker[],
+  concept: {audience, message, appeal, direction}, notes: Note[], updatedAt
+}
+Media {
+  id, name, path, kind: "video"|"audio"|"image", duration,
+  width, height, hasAudio, thumbnail?: string|null, waveform?: number[],
+  missing?: true, proxy?: true, codec?: string, fps?: number
+}
+Track {id, name, kind: "video"|"audio"|"text", muted, hidden, locked}
+Marker {id, time, label}
+Note {id, body, createdAt, kind, clipId?}
+Clip {
+  id, mediaId?, trackId, name, kind: "video"|"audio"|"image"|"text",
+  start, duration, sourceIn, speed, reverse, volume, fadeIn, fadeOut,
+  transform: {x, y, scale, rotation, opacity, flipX?, flipY?},
+  color: ColorAdjustment, keyframes: Keyframe[],
+  text?: {content, fontSize, color, fontFamily, fontId?, fontPath?, bold, align, background},
+  crop?, mask?, chromaKey?, audio?, stabilize?, groupId?,
+  filter?, transitionIn?, transitionOut?, blendMode?, sourceSpan?
+}
+```
+
+Transform defaults: `x=0,y=0,scale=1,rotation=0,opacity=1`; x/y are project pixels, rotation is degrees, flips are booleans. Volume defaults to 1. Text align is `left|center|right`; background accepts `transparent` or a supported color. Captions are ordinary `kind:"text"` clips rather than a separate caption kind.
+
+`Keyframe {property,time,value}` uses clip-relative timeline seconds. Supported properties are `transform.x`, `transform.y`, `transform.scale`, `transform.rotation`, `transform.opacity`, their short names, and `volume`. Values interpolate linearly. Split and duration changes preserve/trim keyframes according to clip boundaries.
+
+Optional clip processing objects:
+
+```text
+crop: {x?,y?,width?,height?}                   // normalized source coordinates
+mask: {type:"none"|"circle"|"rectangle",x?,y?,width?,height?,feather?}
+chromaKey: {enabled?,color?,similarity?,blend?}
+audio: {normalize?,denoise?,voiceEnhance?,eq?:{bass?,mid?,treble?}}
+stabilize: {enabled:boolean,strength?:1|2|3}  // video only; single-pass FFmpeg deshake
+```
+
+Crop x/y are 0..1, width/height 0.01..1, and the rectangle must stay within the source. Mask x/y are normalized centers 0..1, width/height 0.01..2, feather 0..1. Chroma similarity is 0.01..1 and blend 0..1. Audio EQ values are -20..20 dB. Stabilization is not tracking, optical flow or a two-pass vidstab analysis.
+
+### ColorAdjustment
+
+```text
+{
+  brightness: -1..1, contrast: 0..3, saturation: 0..3, temperature: -1..1,
+  hue?: -180..180,
+  hsl?: {
+    red?, yellow?, green?, cyan?, blue?, magenta?
+    // each {hue?:-180..180,saturation?:-1..1,lightness?:-1..1}
+  },
+  curves?: {
+    preset?: string,
+    master?: [number,number][], red?: [number,number][],
+    green?: [number,number][], blue?: [number,number][]
+  },
+  lut?: {path?:string,name?:string,enabled:boolean}
+}
+```
+
+Base color defaults are brightness 0, contrast 1, saturation 1, temperature 0. HSL channel adjustments default to zero; the lightness control maps to FFmpeg huesaturation intensity. Curve channels accept an empty array to clear custom points, or 2..16 `[x,y]` points in 0..1, with strictly increasing x and endpoints at x=0 and x=1. Presets are `none`, `color_negative`, `cross_process`, `darker`, `increase_contrast`, `lighter`, `linear_contrast`, `medium_contrast`, `negative`, `strong_contrast`, `vintage`.
+
+Use `color.importLut` to validate and copy a `.cube` or `.3dl` into managed project assets, then attach it to the selected clip. LUTs are at most 10 MB; supported 3D cube dimensions are 2..65. Project save to another path copies managed LUT assets. `edit.update` can toggle the existing `color.lut.enabled`. Rendering and preview use the same color/stabilization composition path.
+
+## Editor RPC
+
+All Editor methods accept optional `expectedRevision` as described above. Mutating methods return the updated Project unless noted.
+
+| Method | Parameters | Result / behavior |
+| --- | --- | --- |
+| `project.get` | `{ifProjectId?,ifRevision?}` | Project, or `{unchanged:true,id,revision,missing:string[]}` when both match and no `Media.missing` flag changed in this call; `missing` lists the ids of media whose file is absent |
+| `project.list` | `{}` | `[{id,name,updatedAt,thumbnail?:{mediaId,path},empty?:true}]`; see the third-phase contract |
+| `project.new` | `{name?,width?,height?,fps?}` | New Project; resets session undo history |
+| `project.open` | `{id? ,path?}` | Opens saved Project; resets undo history. A file whose id belongs to a different stored project gets a new id |
+| `project.save` | `{path?,overwrite?}` | `{path,project}`; agent tokens may not pass `path` |
+| `project.update` | `{patch}` | Permitted project metadata, dimensions, concept, notes, markers |
+| `project.demo` | `{}` | Creates explicit sample project using real bundled media |
+| `media.import` | `{paths:string[]}` | Probes and imports 1..100 files |
+| `media.importAndAdd` | `{paths,start?,trackId?,duration?}` | Imports and places sequential clips in one undoable commit; selects a suitable unlocked track if omitted |
+| `media.reprobe` | `{ids:string[],expectedRevision?}` | Reprobes 1..100 distinct existing media IDs; repairs misclassified audio clips and returns Project in one undoable commit |
+| `media.relink` | `{id,path,expectedRevision?}` | Points an existing media ID at another file and refreshes its metadata in one undoable commit; rejects a file of a different kind or one already in the project |
+| `media.remove` | `{id}` | Rejects media still used by clips |
+| `edit.add` | `{mediaId?,trackId?,newTrack?,start?,duration?,text?,name?,transform?}` | Adds media or text; text may be string or text object; `name`/`transform` place an overlay already named and sized; `newTrack:"<name>"` (instead of `trackId`) makes a track of the clip's kind for it in the same undo step |
+| `edit.shift` | `{trackId,from,delta}` | Moves every clip of the track that starts at or after `from` by `delta` seconds (rounded to whole frames); refused when a start would go below 0, the track is locked or `delta` rounds to no frame. Usable inside `edit.batch` |
+| `edit.update` | `{id,patch}` | Deep-merges permitted clip fields; rejects locked target track |
+| `edit.delete` | `{ids:string[],ripple?:boolean}` | Deletes selected clips; ripple closes only the time the deleted clips occupied alone (time still covered by a surviving, overlapping clip stays) |
+| `edit.split` | `{id,time}` | `time` is absolute timeline time |
+| `edit.trim` | `{id,start?,end?,expectedRevision?}` | Retains absolute timeline bounds, with at least one boundary supplied; omitted bounds stay unchanged. Minimum one frame. Video/audio extension is source-bounded; still/text extension is unbounded. One commit/undo. |
+| `edit.duplicate` | `{ids:string[]}` or legacy `{id}` | Preserves relative spacing; offsets the selection by its total time span; assigns new clip/group IDs |
+| `edit.group` | `{ids:string[]}` | At least two clips; assigns common persistent groupId |
+| `edit.ungroup` | `{ids:string[]}` | Removes groupId from selected clips |
+| `edit.track` | `{id,patch}` or `{kind:"video"\|"audio"\|"text",name?,clipIds?:string[]}` | Updates name/muted/hidden/locked, or atomically creates a track and optionally moves compatible selected clips into it |
+| `edit.marker` | `{time,label}` | Adds timeline marker |
+| `edit.batch` | `{commands:[{method,params}],expectedRevision?}` | Atomic set of edit commands; one commit/undo entry; failures leave project unchanged |
+| `color.importLut` | `{id:clipId,path}` | Validates/copies LUT and updates color.lut; rejects audio clips |
+| `history.undo` / `history.redo` | `{}` | Updated Project |
+| `history.status` | `{}` | `{canUndo,canRedo}` |
+| `captions.import` | `{path}` | Parses SRT and adds editable text clips |
+| `captions.export` | `{path,overwrite?}` | `{path}` containing exported SRT |
+
+Selection is frontend state; groupId persists in Project. Multi-clip move uses an atomic batch of `edit.update`. Callers must send all intended selected IDs; one `edit.update` does not implicitly update every member of a group.
+
+Clip editing uses the same `edit.trim` contract from handles, Q/W shortcuts and MCP. For old timeline `[s,e]`, new `[a,b]`, source lower bound `q` and speed `v`, forward trim uses `q+(a-s)*v`; reverse uses `q+(e-b)*v`. Keyframes rebase by `a-s`, interpolate retained boundaries, and hold endpoint values through extension. Fades clamp to the retained duration and transition metadata stays synchronized. Split requires at least one frame on each side; validation retains legacy 0.01-second clips while allowing a full frame at 120fps. Multi-selected playhead actions batch only clips crossing the cut, with expectedRevision on the outer batch. Pointer snapping preserves exact media edges; handle arrow nudges preserve a full-frame delta even from off-grid boundaries. Normal playback clocks and memoized timeline visuals are unchanged.
+
+The selected target track is also frontend state. The library uses it for compatible media/text additions. The timeline supports explicit video/audio/text track creation, inline rename, existing-track moves, and new-track separation. Vertical dragging accepts only compatible unlocked destinations; horizontal dragging preserves the original tracks of a multi-layer selection. Creating a track with `clipIds` preserves clip identity, timing, settings and group membership, and is one undo entry. A stale revision, locked source or incompatible clip kind rejects the operation without a partial track or move.
+
+Later entries in `Project.tracks` composite above earlier visual entries. New tracks are inserted after the last of their kind; new video tracks are additionally kept before the first text track, preserving captions above new footage. `edit.trackMove` and the track header's up/down buttons reorder tracks; `edit.trackDelete` removes an unlocked track with its clips.
+
+Media probing ignores attached album artwork and timed thumbnails when deciding whether a file has playable video. An MP3 with only audio plus cover art is an audio asset. `media.reprobe` refreshes metadata without replacing the existing media ID, name or source path. If a former video asset proves to be audio, its video clips become audio clips on new audio tracks associated with their original layers; source-track mute/visibility and clip timing, source offset, volume and other settings are retained. Video stabilization is disabled on those repaired audio clips. Reimporting an existing source path uses the same repair without creating a duplicate asset. Locked referenced tracks, unknown/duplicate IDs or revision conflicts reject the whole project change. This is an explicit repair, not an automatic rewrite when opening a project.
+
+### Reusable fonts and presets
+
+Catalog data lives in `catalog/index.json`; changes to this application-wide catalog do not create project undo entries. Apply commands return an updated Project and make one validated, undoable commit. Send the top-level `projectId` and `expectedRevision` for project-dependent operations.
+
+| Method | Params | Result / behavior |
+| --- | --- | --- |
+| `assets.list` | `{}` | `{fonts:Font[],presets:Preset[]}` |
+| `fonts.import` | `{path,name?}` | Validates TTF/OTF (nonempty, at most 32MB), copies into `catalog/fonts/`, deduplicates by content hash; returns Font |
+| `fonts.apply` | `{id,clipId,expectedRevision?}` | Sets a text clip's managed font references; rejects non-text clips and locked tracks |
+| `fonts.remove` | `{id}` | Removes catalog entry; retains immutable files for existing projects/undo |
+| `presets.save` | `{clipId,name,kind:"filter"|"effect",expectedRevision?}` | Captures supported settings from the current clip; returns Preset |
+| `presets.import` | `{path}` | Validates Studio preset JSON v1 (at most 16MB); returns newly registered Preset |
+| `presets.export` | `{id,path}` | `{path}`; exports portable JSON and embeds required LUT text |
+| `presets.apply` | `{id,clipId,expectedRevision?}` | Deep-merges supported settings; scales keyframe/fade/transition timing to target duration |
+| `presets.remove` | `{id}` | Removes catalog entry without deleting referenced managed dependencies |
+
+`Font {id,name,family,path}` uses a hash-based ID and a unique CSS family. Managed fonts are available through authenticated `/assets/<fontId>` even after removal from the catalog. Browser FontFace registration and the exact raster renderer use the managed font bytes. Imported-font bold uses synthetic glyph emboldening; a missing imported file produces a render error. Choosing a system family sends only the new `fontFamily`, allowing Editor to clear managed references.
+
+`Preset {id,name,version:1,kind,target:"visual"|"audio",sourceDuration,patch,createdAt}` stores declarative editing settings. Filters capture color/LUT settings; visual effects capture transform/crop/mask/chroma/stabilization/fades/keyframes; audio effects capture volume/fades/keyframes/audio processing. Unsupported fields, executable expressions and incompatible target types are rejected. Exported LUTs use `lutData:{extension,name,content}` instead of local paths; imported JSON may not instruct the app to read an arbitrary LUT path. These presets are not arbitrary third-party effect plugins. Project packaging and transferring managed font/media dependencies remain separate work.
+
+### Rendering and previews
+
+- `export.start {path?,width?,height?,fps?,format?,crf?,start?,end?,overwrite?}` → `{id}`. Formats are `mp4|mov|webm|mp3|wav`; the extension must match. MP3/WAV render the timeline audio mix. Range is absolute seconds. Output may not overwrite current source media or a path used by a running export.
+- `export.status {id}` → `{id,state,progress,path,projectRevision,error?}`. `progress` is 0..1; states are `queued|running|completed|failed|cancelled`. Exports render a captured Project snapshot, not later edits.
+- `export.cancel {id}` → `{id,state:"cancelling"}` for an active job, otherwise its current status. Poll until terminal.
+- `preview.frame {time,width?,expectedRevision?}` → `{path,assetId,width,height,time,revision,projectId,cacheHit}`. Actual PNG composed by the render pipeline. Width defaults to 640, clamped to 64..1920 and even pixels.
+- `preview.start {width?}` → `{id,assetId,revision}`. Starts an MP4 preview export; poll `export.status`. Width defaults to 960, capped at 960. Once completed, use `/assets/<assetId>` with authentication. Preserve revision to avoid presenting old previews as current.
+
+HTTP frame rendering captures immutable project state under the Editor lock, releases it while FFmpeg runs, and rejects changed project/revision results before registering assets. A single renderer and bounded request admission deduplicate work; a 32-entry content/time/size cache retains recent frames. Assets are registered for the current service lifetime and removed on cache eviction. They are not arbitrary filesystem URLs.
+
+The UI defaults to immediate local-media playback (`빠른 재생`) with a visible approximate-preview label; complex LUT/mask/audio/reverse processing may differ from final output. `정밀 재생` still uses the full FFmpeg proxy. Paused exact frames use 120ms debounce, one in-flight request, latest-request replacement and a client cache. Transient slider/text/filter-hover drafts deep-merge into a Player-only project and suppress stale exact overlays; they never enter persistence/export. A committed edit still uses the shared revision-checked command path.
+
+Local media elements stay mounted across clip boundaries and are primed silently from the playback gesture. Audio within three seconds of the playhead requests automatic preloading; distant clips request metadata. The playback controller waits for metadata before seeking. Explicit timeline/player/keyboard seeks increment a frontend-only `seekEpoch`, including replay from the end. A delayed animation frame is not a seek request. Continuous forward playback does not periodically rewrite `currentTime` to correct clock drift; initial activation, explicit seeking and source mapping changes remain seek boundaries. A ready layer held for another layer's buffering pauses without seeking itself and creating another buffering cycle. Native rate, mute and volume properties are assigned only when their values change. Timeline waveform/thumbnail/text visuals and ruler ticks are memoized separately from live editing handlers and the playhead.
+
+Track visibility controls the visual layer; track mute and the player's master mute control sound. Precise proxy playback silences local sources to avoid duplicate audio. A rejected playback start is surfaced and stops the transport instead of silently advancing. Media readiness still gates timeline progress and has a bounded error timeout. Regression tests cover these control paths; the isolated browser harness in `scripts/preview-playback-check.html` additionally counts native media seeks, rate writes and playback events. Neither mocked tests nor timeline progression alone establish smooth or audible output from the native macOS app; that remains a separate foreground playback and listening check.
+
+## Local speech RPC
+
+- `speech.status {}` → `{whisperAvailable,ttsAvailable,voices:[{id,name,language}],models:["tiny","base","small"],modelDirectory}`. `language` in voices is a language tag such as `en-US`; voice `id` is accepted unchanged by synthesize.
+- `speech.transcribe {language?:"ko"|"en"|"auto",model?:"tiny"|"base"|"small",translate?:boolean}` → `{id,state:"running"}`. Defaults are auto/base/false. Renders full timeline audio to WAV, runs local Whisper on CPU, creates SRT, then imports captions. `translate:true` requests English translation. First use downloads the chosen model into `models/whisper/`.
+- `speech.synthesize {text,voice?,rate?,start?}` → `{id,state:"running"}`. Uses installed macOS system voices to generate AIFF, then `media.importAndAdd`. Text is nonempty and at most 10,000 characters; rate defaults to 175 and is clamped to 80..400; start defaults to 0 and must be nonnegative seconds.
+- `speech.job {id}` → `{id,kind:"transcribe"|"synthesize",state,progress,projectId,revision,startedAt,finishedAt?,logs:[{at,text}],message?,output?,result?:Project,error?}`.
+- `speech.cancel {id}` → current job; requests cancellation. Poll until `cancelled` or another terminal state.
+
+Speech states are `running|completed|failed|cancelled`; progress is 0..1. Each job captures project ID and revision, and checks both under the Editor lock before committing. A changed project is not overwritten: job fails explicitly, keeps any generated output path, and leaves the project unchanged. Cancellation also cancels its preparatory audio render or speech subprocess. Successful insertion is one undoable commit.
+
+## Runtime, CLI agents and ByoriDB
+
+`runtime.status {}` returns:
+
+```text
+{
+  ffmpeg:{available,path?,version?},
+  providers:[{id:"claude"|"codex"|"gemini",name,available,path?,version?,authStatus}],
+  byoridb:{installed,home,version?,running,connected,url,error?,managed},
+  connection:{url}
+}
+```
+
+An installed CLI is not proof of authentication. Status uses the provider's available local probe; an actual login failure remains a failed agent job.
+
+- `runtime.checkUpdate {}` → `{installedVersion,latestVersion,tag,url,updateAvailable,checkedAt}`. Queries official GitHub stable release metadata; absent/unknown installed version can produce `updateAvailable:null`.
+- `runtime.install {tag}` → `{id,state:"running"}`. Validates a stable semantic version and platform asset, prevents downgrade, downloads/validates the release, preserves existing data and credentials, and replaces the binary with rollback on failure. Existing known Byori installations are reused. Live unmanaged external DB processes are not replaced.
+- `runtime.installStatus {id}` → `{id,kind:"install",state,progress,logs:[{at,stream,text}],tag,error?}`. Installation does not currently offer mid-transaction cancellation.
+- `runtime.start {}` → RuntimeStatus after attempting to start the detected local DB.
+- `agent.list {}` → up to 50 recent jobs `[{id,provider,state,projectId,startedAt,finishedAt?}]`, newest first.
+- `agent.start {provider:"claude"|"codex"|"gemini",prompt,clipId?}` → `{id}`. The job gets its own token; the service limits that token to the methods in `scripts/studio-tools.json` (403 otherwise), to the project open at start (409 after a switch) and to the job's lifetime (401 afterwards). Agent file output is new files only, in `<data root>/exports` or the user's Movies/Videos/Documents/Desktop/Downloads/Music folders. Uses the locally installed CLI, a per-job working directory and MCP configuration, and a connection file bound to the original project ID. Prompts are nonempty and limited to 64 KB.
+- `agent.status {id}` → `{id,provider,state,projectId,startedAt,finishedAt?,logs:[{at,stream,text}],result?:string,error?,authRequired?}`. States are `running|cancelling|completed|failed|cancelled`; completion describes the CLI session, and actual edits must be confirmed by tool results/Project state.
+- `agent.cancel {id}` → current job; requests process-group termination. Agent runtime is limited to 15 minutes. `runtime.cancel` is an alias for this job-cancellation handler; an install without a cancellation channel is unchanged.
+- `memory.search {text?,limit?}` → `{items:MemoryNote[],source:"byoridb"}`. Defaults: empty search and limit 30, clamped 1..100. Searches persisted creative records across projects.
+- `memory.record {body,kind?,clipId?}` → MemoryNote `{id,body,kind,createdAt,projectId,clipId,source:"byoridb"}`. Body is nonempty, at most 64 KB; kind defaults to `feedback`. Uses the open/bound project ID. Success means an actual DB insert.
+
+Memory uses the local ByoriDB HTTP session/query API, space `studio_creative`, tag `studio_note(id,body,kind,project_id,clip_id,ts)`. The server's session ID may be a decimal string or integer; Rust normalizes it internally. Credentials are read from the detected installation/environment and are not included in RPC responses or child-agent environment overrides.
+
+### Higgsfield connection
+
+- `runtime.mcpGet {}` / `runtime.mcpStatus {}` → `{id,name,url,added,enabled,phase,toolCount,checkedAt,error,bridgeAvailable,bridgePackage}`.
+- `runtime.mcpSave {enabled:boolean}` adds/updates the Studio-owned connection.
+- `runtime.mcpConnect {}` starts asynchronous OAuth/connection verification; poll status. Only `initialize` and `tools/list` are used for verification.
+- `runtime.mcpCancel {}` requests cancellation of connection verification.
+- `runtime.mcpRemove {}` removes Studio's connection/auth cache. Active verification or agent use prevents removal until that activity ends.
+
+Phases are `unchecked|connecting|cancelling|connected|failed|cancelled`. The fixed server is `https://mcp.higgsfield.ai/mcp`, reached with `mcp-remote@0.15.2` through `npx`. Config, OAuth and npm cache live under `mcp/higgsfield/`; credentials are not returned by RPC or copied into projects/ByoriDB. The user's global CLI configuration remains untouched. After service restart, connection verification must be repeated; the bridge can reuse Studio's saved OAuth cache.
+
+Enabled, verified connections are leased to subsequent Claude Code/Codex/Gemini jobs. All three adapters currently expose only `models_list`, `models_get`, `models_search`, `models_recommend`, `balance`, and `get_preferences`. `toolCount` reports discovered server tools, not the size of this client allowlist. Paid generation and other mutating tools are unavailable until the cost/approval/application flow is implemented. A missing/unverified optional connection does not block local editing.
+
+References: [Higgsfield connection guide](https://higgsfield.ai/creator-hub/help-center/integrations/how-do-i-connect-higgsfield-to-ai-agent), [mcp-remote](https://github.com/punkpeye/mcp-remote).
+
+## MCP / direct CLI
+
+`scripts/studio-mcp.py` is a dependency-free Python stdio MCP server. `scripts/studio-cli.py` calls the same authenticated RPC methods. Both default to `~/.byori-studio/connection.json` and honor `BYORI_STUDIO_HOME`; `--connection <path>` selects a connection file. The agent-facing methods are defined once in `scripts/studio-tools.json`, which the MCP server, the CLI and the service's server-side agent allowlist all read. Per-agent files include `projectId`, which the bridge forwards as the top-level RPC field.
+
+Six tools expose explicit allowlists: `studio_project`, `studio_edit`, `studio_export`, `studio_memory`, `studio_speech`, `studio_assets`. They accept `{method,params?}`. The assets tool exposes the font/preset catalog and validated application commands. The editing tool includes group/ungroup, multi-duplicate, managed LUT import and atomic media import/place. The export tool includes both preview methods; `preview.frame` additionally returns a PNG image block when its generated file is below 10 MB. Unsupported methods and backend errors produce `isError:true`.
+
+The allowlists are narrower than the full service: they do not expose runtime software installation, spawning other agents, or arbitrary shell execution. See `scripts/studio-tools.json` for the authoritative lists. Each CLI receives workspace-local Studio configuration rather than a mutation of the user's global CLI settings.
+
+## Schema version 2 additions
+
+Projects carry `schemaVersion` (currently 2); older files are migrated when opened and newer ones are refused. An unreadable `current.json` is kept as `current.json.corrupt-<ms>` and the most recent valid project (or an empty one) is opened; `project.notice {}` → `{notice}` reports it and `project.noticeDismiss {}` clears it.
+
+- `project.delete {id}` → list (the open project is refused), `project.duplicate {id}` → `{id,name,updatedAt}` (not opened), `project.rename {id,name}` → list.
+- `Media.missing` is `true` while the source file is absent (refreshed without a revision bump); `media.relink {id,path,expectedRevision?}` → Project.
+- `edit.trackDelete {id}`, `edit.trackMove {id,index}`, `edit.markerUpdate {id,time?,label?}`, `edit.markerDelete {id}`, `edit.paste {clips,at}` → Project; all accept `expectedRevision` and undo in one step.
+- Filter ids are `none|cinematic|warm|cool|mono|vintage`; setting only `filter` merges brightness/contrast/saturation/temperature and keeps hsl/curves/lut/hue. `transitionIn/Out` is `null` or `{type,duration}` (types: see the second-phase contract below).
+- `export.start`, `project.save {path}`, `captions.export` and (with `overwrite:false`) `presets.export` fail with `FILE_EXISTS` when the target exists unless `overwrite:true`. `project.save`/`captions.export` never write into the data root except its `exports` folder.
+- `preview.frame {time,width?,client?}`: a newer request for different content ends older requests of the same `client` with `PREVIEW_CANCELLED` (the player sends `"player"`, the export dialog `"export"`; a UI request without one counts as the player). The service names each agent job's requests `agent-<hash of its token>`, so agents neither cancel the UI nor each other. A time within 1e-6 frames below a frame boundary is that frame.
+- `Media.waveform` holds 128–1024 peaks (by duration) spanning the whole file, decoded from 8 kHz mono audio. Audio shorter than the container, or anything not decoded within 15 seconds, stays zero rather than stretching. Import/reprobe/relink run only FFprobe and the thumbnail under the editor lock; the waveform is computed afterwards by the service's background worker (10-minute limit) and stored without a revision or an undo entry.
+- Text clips name themselves after at most the first 1000 bytes of their content. `presets.apply`/`presets.import` accept old filter ids (`cinema` → `cinematic`, unknown → `none`).
+- A successfully applied transcription removes its work folder, so its `speech.job` has no `output`.
+
+### Windowed rendering
+
+Frames, preview ranges and export ranges use the same filter graph as a full export. For a window that starts inside a forward video/audio clip, FFmpeg seeks the input to 0.5 s of source before the window, decodes 0.5 s past its end, restores full-timeline timestamps with `setpts` (compensating the seek's rounding to stream ticks) and trims to the window, so a windowed frame equals the same frame of the full render. Reversed clips decode only their window and are re-timed from zero. A slow-motion or low-fps clip holds its last source frame to the clip end.
+
+### Agent tokens
+
+`agent.start` issues a token for that job only. The service accepts it only for methods listed in `scripts/studio-tools.json` (HTTP 403 otherwise), only while the project open at start is still open (409) and only while the job runs (401). With it, `project.save` takes no `path`, and export/caption/preset output must be a new file in `<data root>/exports` or the user's Movies/Videos/Documents/Desktop/Downloads/Music folders. The UI token in `connection.json` is unrestricted.
+
+### Process lifetime
+
+Agents, speech tools, MCP probes and a Studio-started ByoriDB run in their own process groups, which are terminated and then killed on cancel and on shutdown. At exit the app and `studio-service` also kill their remaining direct children (a running FFmpeg export) and delete the `.<name>.<id>.partial.<ext>` files of unfinished exports. `previews/` and `renders/` are emptied at the next start. `studio-service` refuses to start while the desktop app's service owns the port; the app attaches to a compatible running `studio-service` and refuses a second app instance.
+
+### Removed
+
+The earlier database-explorer UI (`src/components/` and its stylesheets) and `src-tauri/src/client.rs` are deleted. ByoriDB is reached only through `runtime.rs`.
+
+## Second-phase contract
+
+Added on top of everything above; where the third-phase contract below differs (the limit on the sum of fades, the two-command transition batch), the third phase is current. The editor validates and stores, `render.rs` outputs, the frontend edits and approximates in the fast preview; the names below are identical in `src/studio/types.ts`, `editor.rs` (`EASINGS`, `TRANSITIONS`, `BLEND_MODES`) and `render.rs`.
+
+- `Keyframe.easing?: "linear"|"easeIn"|"easeOut"|"easeInOut"|"hold"` (absent = linear) applies from that keyframe to the next: t², 1-(1-t)², 3t²-2t³, or the value held until the next keyframe.
+- `Clip.transitionIn/Out: null | {type,duration}`, `type` one of `fade|dissolve|wipeLeft|wipeRight|wipeUp|wipeDown|slideLeft|slideRight|zoom` (audio clips: `fade` only). It is the clip's own entrance/exit with linear progress p (0 absent → 1 present). fade/dissolve: alpha p. wipe: a crop of the clip's own box whose edge travels in the named direction (entering reveals behind the edge, leaving hides behind it). slide: x offset `sign·(1-p)·max(0, (frame width + layer width)/2 − sign·x)`, where x is the layer's own x at that time (keyframes included) and sign is +1 towards the right edge, −1 towards the left, so at p=0 the layer lies just outside the edge wherever it rests; `slideLeft` enters from the right and leaves to the left. The fast preview uses the same expression, except that a text clip's width is taken as the frame width. zoom: scale 0.8+0.2p with alpha p. `fadeIn/fadeOut` always equal the transition duration and drive the audio fade (since the fifth phase only while a video clip has no `audioFadeIn/audioFadeOut` of its own); the picture's alpha fades only for fade/dissolve/zoom, or for an old clip with `fadeIn/fadeOut` and no transition object. `edit.update` and `presets.apply` clamp each fade and transition to the clip's duration (a zero-length transition becomes `null`); the sum of the in and out lengths is not limited. A video clip reclassified as audio by `media.reprobe` keeps its transition lengths as `fade` and loses `blendMode`.
+- Clips of one track may overlap; the one that starts later is composited on top (array order on a tie). "Transition between clips" is one `edit.batch`: the later clip and every clip after it on the track move earlier by the duration, and the later clip gets `transitionIn`. Removing it moves them back. The timeline, Library and Inspector build that batch with `clipEditing.junctionTransitionCommands` and limit the duration to half of the shorter clip, in whole frames. Because every later clip of the track is one `edit.update`, a junction followed by more than 499 clips on its track exceeds the 500-command batch limit: the timeline disables that junction with the reason, the panels show the server's error.
+- `Clip.blendMode?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"add"` (video, image and text clips; `overlay` is relative to the picture below, as in CSS).
+- `Clip.text` also accepts `italic`, `letterSpacing` (px, -5..50), `lineHeight` (0.8..3, default 1.2), `outline {color,width 0..20}` and `shadow {color,x,y,blur 0..40}` (`null` clears either; `width:0` and `x=y=blur=0` mean "off" and are not drawn). Layout is the same in the browser and the export: the text wraps at 90% of the project width (words at spaces; CJK and words longer than a line by character; explicit newlines kept; closing punctuation stays with the character before it, opening brackets with the one after, and a hyphen inside a word allows a break after it — not the full UAX #14 rules, so the browser can differ on small kana, quotation marks and punctuation directly followed by Latin letters), the line box is `fontSize × lineHeight`, the background adds 12 px of padding, the outline grows outwards by `width`, a shadow's blur is the CSS text-shadow radius. There is no default shadow.
+- `edit.freeze {id,time,duration?,expectedRevision?}` → Project. Video clips only: extracts the frame at timeline `time` as a managed image in `<root>/projects/<id>-assets/frames/`, splits the clip there, inserts an image clip of `duration` (default 2 s) and pushes the later clips of the track. One undo. Not available inside `edit.batch`. The frame is the last source frame at or before that time (`media::extract_frame`); the renderer rounds source frames to the nearest output slot, so the still can differ by one frame when a source frame arrives less than half an output frame late. Stills that no saved project (or archived `current.json.corrupt-*`) names are deleted at startup — nothing is deleted if any project file is unreadable — and are left out of `project.duplicate` and id-collision copies.
+- `Media.proxy?: true` while `<root>/proxies/<mediaId>.mp4` exists and its `.source` note names the media's current path (since the fourth phase also the file's current size and modification time); like `Media.missing` it changes without a revision. Proxies (long side ≤ 1280, H.264, short keyframe interval, with audio) are built for video whose long side exceeds 1920 or whose codec is not h264/vp8/vp9/av1. `GET /assets/<id>/proxy` serves it (Range → 206, absent → 404, same authentication as `/assets/<id>`). Fast playback uses the proxy when there is one; precise frames and exports always read the original, which is never modified.
+- Background media work: one worker in the service fills missing waveforms, then builds one proxy at a time. It wakes after imports, uploads, relinks, undo/redo, batches, freezes and project switches, checks every 5 s otherwise, and stops at shutdown. A relinked media's proxy is rebuilt. `media.reprobe` and `media.relink` clear that media's waveform (a re-import of the same path only when its duration or `hasAudio` changed), and the worker computes it again in the same run. A waveform that could not be decoded is stored as `[]` and retried at the next start or `project.open/new`; one whose save failed is retried only after a restart. At startup the service deletes only `proxies/` files that no saved project mentions (nothing if any project file is unreadable). `imports/` copies and `speech/<id>` results are never deleted automatically, because a project saved outside the store may be their only reference; there is no cleanup screen yet.
+- Conditional `project.get {ifProjectId,ifRevision}` returns the full Project once after a waveform, proxy or missing flag changed; otherwise `{unchanged:true,id,revision,missing:[ids],proxy?:[ids]}`. The frontend accepts a same-revision Project when that derived state differs.
+- `export.start` also accepts `codec?: "h264"|"hevc"` (mp4/mov), `hardware?: boolean` (default true: VideoToolbox when it works, with an automatic software retry — progress restarts from 0) and `bitrate?: number` (kbps, 100..200000, replaces CRF). `export.status` reports `encoder`.
+- Old preset filter ids (`cinema`, `original`, `vivid`, `soft`) are normalised when the catalog is loaded or imported.
+- `memory.search {text?,limit?,projectId?}` filters by project on the server when `projectId` is given. `runtime.mcpStatus.allowedTools` lists the Higgsfield tools actually passed to agents.
+
+Frontend structure: the app opens on a home screen (new project by frame preset, recent projects with open/rename/duplicate/delete, demo, settings) when the open project is empty and still has the default name. The playhead lives in `src/studio/playbackClock.ts` (`useSyncExternalStore`), so playback re-renders only the player, the playhead and the timecode; a paused or explicitly sought playhead is snapped to a whole frame. Library and Inspector receive the paused playhead plus a `now()` getter for actions taken during playback. The timeline renders only clips near the visible time range and the player mounts media elements only near the playhead.
+
+Wipes and opacity keyframes rely on FFmpeg's `sendcmd` and filter commands; this was verified with FFmpeg 9.0.2 only. A clip is drawn on the frames whose time is at or after its start and before its end, with a 0.1 ms tolerance so that boundaries such as 7/30 s, which differ from the frame time in the last binary digit, land on the intended frame.
+
+## Third-phase contract
+
+Added on top of everything above.
+
+- **Frame grid.** New `start`, `duration`, trim and split positions (`edit.add/update/trim/split/freeze/paste/shift`) are rounded to the nearest frame of the project's fps, at least one frame long; the returned Project is authoritative. Where a start and a duration arrive together (`edit.add`, `edit.paste`, `edit.update` with both, imported captions) the start and the end are rounded separately and the duration is their difference, so clips that touched before rounding still touch. A negative start is refused, not rounded up to 0. `edit.update` with only `duration` rounds the length alone. `sourceIn`, fade lengths, keyframe and marker times are not rounded. Stored projects are not migrated: an off-grid clip stays where it is until it is edited, and changing the project fps does not move clips.
+- **Fades.** `fadeIn + fadeOut` (transitions included) never exceed the clip: each is first limited to the clip, then both are reduced in proportion so that they sum to its duration, and the transition durations follow. Applied by `edit.update`, `edit.trim`, `edit.split`, `edit.paste` and `presets.apply`; not by validation, so existing files open unchanged.
+- **Speed.** A speed change stores the stretch of source it keeps in `Clip.sourceSpan` (seconds) and derives the duration from it, so 1× → 1.7× → 1× returns the original length. The stored span is used only while it still explains the current duration: after a trim, split or duration change the clip's current length is the basis again. `edit.update {speed,duration}` whose duration equals current source span ÷ new speed is treated as the same speed change. `edit.paste` does not copy `sourceSpan`.
+- **`edit.shift` and groups.** Clips on other tracks that share a `groupId` with a moved clip move by the same delta (all of them when the whole group moves; otherwise only those at or after `from`). The command is refused when such a clip's track is locked or a start would go below 0. It does not check for overlaps, because the transition between clips overlaps on purpose. `edit.freeze` uses the same shift.
+- **Transition between clips.** One `edit.batch` of two commands however long the track is: `edit.update {transitionIn (+fadeIn)}` on the later clip and `edit.shift {trackId, from:<later clip start>, delta}`. Its length is a whole number of frames and at most half of the shorter clip, rounded down (`clipEditing.junctionTransitionCommands` for the timeline, `clipPresets.incomingTransitionCommands` for the Library and Inspector).
+- **Overlays from the Library.** Text and stickers go to the preferred track when it is free at the playhead, else to the topmost free track of the kind, else `edit.add` is sent with `newTrack` (`App.libraryCommand`, `clipEditing.overlayPlacement`). Hidden and locked tracks are never chosen by the UI. The core's own default for an `edit.add` without `trackId` is still the first unlocked track of the kind, hidden or not.
+- **`project.list`** items carry `thumbnail {mediaId,path}` when the earliest video/image clip's media has a thumbnail inside `<root>/thumbnails`, and `empty:true` when the project has no clips and no media. `GET /projects/<id>/thumbnail?media=<mediaId>` (`?token=` or Bearer; 404 without a cover) serves it for closed projects too; `path` is a local path and is not used by the browser UI. The home screen leaves out projects that are `empty` and still carry a default name.
+- **Uploads.** A file received on `/upload` is stored as `imports/<uuid>-<name>`; its `Media.name` is `<name>`.
+- **Storage.** `storage.usage {}` → `{folders:{proxies|imports|speech|renders|previews:{files,bytes,cleanable,reclaimableFiles?,reclaimableBytes?}},bytes,reclaimableBytes}`; `storage.clean {}` → the same shape with `removedFiles`/`removedBytes`. Only proxies no project mentions and preview/render scratch that no running render, cached frame or registered preview asset uses are removed; `imports` and `speech` are reported only. Not in `scripts/studio-tools.json`: agent tokens get 403.
+- **Preview frames** are composed at the project size and resized at the end, exactly as an export is; there is one code path (`render::render_frame`). Composing at the frame's own size was measured and removed: on 4K projects it saved 0–7% and at frame widths that do not divide the project evenly text could land up to a pixel off. A preview is current when the project matches apart from `Media.waveform`/`Media.proxy`, so a waveform arriving in the background does not make it `PREVIEW_STALE`.
+- **Waveforms** that cannot be saved are retried after 2, 4 and 8 s within the run (the decoded peaks are kept), then left until the next start.
+- **Errors in the UI.** `src/studio/errorText.ts` turns service and OS errors into one Korean sentence (the original text stays in a tooltip). The Library and Inspector show a failure in place, pinned below the panel's scroll area so it is visible at any scroll position, and their commands (`App.panelCommand`) raise no toast; every other failure is a toast with the same wording.
+- **Timeline details.** While a trim handle is dragged the row shows the resulting start, end and length next to the dragged edge; the result is announced once on release. A clip whose media is missing is outlined with `--danger-text`. Escape closes the shortcut popover without clearing the selection.
+- **Frontend state kept in `localStorage`:** `byori.timeline.<projectId>` (zoom, snap), `byori.inspector.sections` (collapsed sections), `byori.assistant.introduced`. All are optional conveniences read inside try/catch.
+- Text clips: the Inspector does not create a clip's own entrance/exit *transition* (the animation tab's presets replace it); an existing one is shown and can be removed. Video and image clips have the selectors again (see "Fourth-phase contract"). CLI/MCP can set `transitionIn/Out` on any clip.
+
+### Verification
+
+`npm run verify` runs the version check (`scripts/check-version.mjs`; `package.json` is the single version source, `--write` syncs the others), Vitest, `cargo test --lib`, a `studio-service` build, the Python tests including `scripts/test_integration.py` against the real binary (temporary `BYORI_STUDIO_HOME`, free port, never 43123) and the production build. `.github/workflows/ci.yml` runs `cargo fmt --check`, the same verify and `cargo clippy --all-targets -- -D warnings` on macOS; it has not been run on GitHub yet.
+
+The packaged app (`npm run tauri build -- --bundles app`) honours `BYORI_STUDIO_HOME` and `BYORI_STUDIO_PORT` like `studio-service`, so it can be started against a temporary folder and a free port for end-to-end checks. What was checked that way, and what was not, is in [VALIDATION.md](VALIDATION.md).
+
+## Fourth-phase contract
+
+Added on top of everything above (2026-11-12). Where the fifth-phase contract below differs (when edits reach the disk, shutdown, cancelled preview frames, the sound fade, the UI's use of `omitWaveforms`, `proxies` and the edit queue), the fifth phase is current.
+
+- **Deferred saves.** The service (`Editor::defer_saves`) no longer writes inside each edit. An autosave task writes `projects/<id>.json` and `current.json` (one serialization, temp file + fsync + rename each) 300 ms after the last edit and at the latest 1 s after the first unsaved one (`SAVE_IDLE`, `SAVE_LATEST`). `project.save`, switching projects (`project.new/open/demo`), service shutdown and dropping the Editor write at once, and so does the start of a command that probes or transcodes while it holds the editor (`SLOW_COMMANDS`: `media.import`, `media.importAndAdd`, `media.reprobe`, `media.relink`, `project.demo`, `edit.freeze`, `color.importLut`), because the autosave cannot run until such a command returns. **Superseded by the fifth phase: an answered edit is in `current.json` before the reply, so a crash or kill no longer loses it.** A command added later that holds the editor for long belongs in `SLOW_COMMANDS`. The desktop app treats SIGTERM as Quit once its window is set up (`main.rs`: `handle.exit(0)`, so `RunEvent::Exit` runs `shutdown()`); in the first fraction of a second after start it is still killed outright. When a write fails the edits stay in memory and every later edit saves immediately (and fails visibly) until a write succeeds. A plain `Editor::new` (tests, tools) still saves per edit. Anything that reads the project files right after an RPC must allow for the delay or stop the service first; `main.rs` and `bin/studio-service.rs` must keep calling `StudioService::shutdown()` before exiting.
+- **Edit cost.** Undo/redo snapshots share unchanged clips (`Arc`), a single `edit.*` or an `edit.batch` is validated once, and `project.list` reports the open project from memory.
+- **One revision per accepted edit.** Every accepted `edit.*`, `history.*` or `project.update` raises `revision` by exactly one, and the `expectedRevision` check and the commit happen under one lock. The frontend relies on this: `App.execute` sends those commands one at a time and, for a command built on an older revision, sends the newest revision reachable through *this window's own* edits (`OwnRevisions` in `src/App.tsx`). A revision made by anyone else (an agent, the CLI) is never skipped, so a real conflict is still refused with `REVISION_CONFLICT`. If an edit ever raises the revision by another amount, `OwnRevisions.record` must change with it. Because a command built on an older render can thus land on top of this window's edit before it, **a patch must carry only what it changes**: the Inspector and the Library send `{text:{bold:true}}`, not the whole `text` object (the service deep-merges `edit.update` patches), and send a whole object only for one the clip does not have yet. `App.execute` also accepts a function `(project) => params | null` in place of the parameters; it is called when the edit's turn comes, with the project the edits before it left (the Alt+arrow nudge uses it, so a repeating key keeps moving). `project.new/open/demo` take their turn in the same queue: edits made before the switch reach the project they were made for, and an edit still waiting when the project has changed is dropped without a request.
+- **Timeline drags.** A dropped clip is drawn where it was dropped until the service answers, and a drag started meanwhile takes that position as its origin (`Timeline.tsx`). Since the fifth phase the other keyboard and toolbar edits are built when they are sent, too (see below).
+- **Waveforms.** Peaks are stored rounded to three decimals (also when an older project is opened). Any editor RPC accepts `omitWaveforms:true`: the Project in the reply then carries `media[].waveformPeaks` (count; 0 = audio unreadable; absent = not computed yet) instead of `media[].waveform`, and `media.waveform {id}` → `{id, waveform: number[] | null}` returns the peaks. Agent (CLI/MCP) replies always omit the peaks; `media.waveform` is not in the agent allowlist. Since the fifth phase the UI sends `omitWaveforms` with every editor RPC and fetches the peaks with `media.waveform`.
+- **`edit.add` defaults.** Without `trackId`/`newTrack` the clip goes to the first track of its kind that is not locked, hidden or (audio) muted; when there is none a track named `영상 N`/`오디오 N`/`텍스트 N` is made in the same undo step. Text without `transform.y` stands on the lower third (`0.32 × height`), or, when other text is on screen during that time, on the centre and then the upper third (`editor.rs free_text_row`; the Library's `clipPresets.freeTextY` applies the same rule before sending).
+- **`project.new`** with the name `새 프로젝트` or `이름 없는 프로젝트` (`UNNAMED_PROJECTS` in `editor.rs`, `DEFAULT_PROJECT_NAME` in `src/studio/Home.tsx`: change them together) reuses an untouched unnamed project, open or stored, instead of making another: the reply may carry the same `id` as before with a higher `revision`. The open project is judged as it is in memory, never by its file (which may not have caught up with an edit yet). Empty projects already stored are not removed.
+- **`preview.frame`** reads proxies when the frame is at most 1280 wide; `proxy:false`, wider frames, sources with alpha and every export read the originals. The reply carries `proxies` (how many sources were read from a proxy); since the fifth phase the player shows it. Precise-playback previews (`preview.start`) read proxies too. A proxy stands in for its source only while the note beside it (`proxies/<mediaId>.source`: the source path, then `<size> <mtime ns>` on a second line) matches the file as it is now (`media::proxy_is_of`); a source replaced at its path is read directly until the worker has rebuilt the proxy (it looks every 5 s), a note without the second line counts as stale, and while the source cannot be read the path alone decides. The frame cache is keyed on the same size and time of every media file, so a replaced file is not answered with an old frame.
+- **`preview.cancel {client?}`** → `{cancelled:n}`. Stops the frames that client (`"player"` by default) is waiting for: queued ones are dropped and the running FFmpeg is stopped; they answer `{cancelled:true,reason}` (fifth phase; before, an error). The player sends it when playback starts while a frame is still being rendered (`usePreviewFrame`). Not in the agent allowlist.
+- **Long exports.** When a range holds more clips than one FFmpeg run should decode at once (12 at 1080p, 4 at 4K, never more than 16) it is rendered in parts of at least 2 s: video with the final encoder, sound as PCM, joined without re-encoding, the limiter applied once after joining. Clip frames are placed on the *output* frame grid (rounded up), so an export at another fps than the project's neither drops a clip's first frame nor shows a frame of background at a cut.
+- **Storage.** `.partial.mp4` proxies are removed at start, and reclaimed by `storage.usage/clean` when no media item is building them and they have not been written for 60 s. A waveform that cannot be saved is retried after 2, 4 and 8 s and then every 60 s.
+- **Assistant drawer** (`drawerLayout` in `src/App.tsx`): the player keeps 420 px beside the drawer. When it cannot with the inspector shown, the inspector folds away and the top bar shows 「속성」 (which closes the assistant, brings the inspector back and moves focus to it); when it cannot even then (window below about 1044 px) the drawer floats over the editing surface (`.editor-workspace.drawer-overlay`) and the inspector under it is `inert`. Measured in the browser: at 1180 px the inspector folds and the player is 556 px wide; at 1440 px both stay and the player is 518 px.
+- **Inspector transitions.** Video and image clips have 「등장 전환」/「퇴장 전환」 (none + 9 kinds) with a length once a kind is chosen; a clip overlapping the one before shows 「앞 클립과 전환」 in place of the entrance. A video clip's sound fade (오디오 › 페이드 인/아웃) is `audioFadeIn/audioFadeOut` since the fifth phase and shows the picture transition's length only until it is set.
+- **Export dialog.** The bar, percentage and encoder show only while rendering; a finished export shows its path with 「경로 복사」 (which reads 「복사했습니다」 for two seconds) and, in the desktop app, 「파일 위치 열기」; a failed one shows the cause and 「다시 시도」. The encoding summary names the quality as the 품질 choice does (`qualityNames`).
+- **Home.** A 920 px centred column; four aspect cards in one row; recent projects with their count; an empty state with one 「예제 열기」. A project card shows its name and date across its whole width, and its actions over the cover's corner on hover or focus.
+- **Tests.** `testTimeout` is 30 s and Testing Library's async timeout 10 s for every file (`vite.config.ts`, `src/test/setup.ts`): a test that renders the whole app takes seconds when all cores are busy.
+- **Benchmark.** `npm run bench -- --out bench.json` builds the release `studio-service` and runs `scripts/bench.py` against it with a temporary `BYORI_STUDIO_HOME` and a free port (`--media-dir` keeps the synthetic media, `--baseline` compares, `--only a,b,c,d,f,g`, `--quick`). Numbers are in VALIDATION.md.
+- **Native self-diagnosis.** With `BYORI_STUDIO_SELFTEST=<file.json>` the app injects a collector before the page loads, `src/studio/selfTest.ts` inspects the rendered window (CSP, errors, fonts, tokens, layout, playback clock, exact frame, images, Korean input, capabilities) and posts to `tauri://localhost/__selftest/report`, which the shell writes to the file before quitting (`BYORI_STUDIO_SELFTEST_TIMEOUT`, default 240 s, exit code 2 with partial results). Without the variable nothing is injected and the route does not exist. The window is declared with `"create": false` and built in `setup`. `requestAnimationFrame` stops while the window is hidden or the screen is locked; since the fifth phase a timer keeps the playback clock moving then, and the self-test reports the missing frames. The self-test depends on these selectors: `.studio-topbar`, `.studio-library`, `.player-panel`, `.studio-inspector`, `.timeline-panel`, `.studio-statusbar`, `.play-button`, `img.rendered-preview`, `.sticker-grid`, `.timeline-clip.text .clip-body`, `.inspector-text-field textarea`, and the home screen's button whose text is `예제 열기`.
+
+## Fifth-phase contract
+
+Added on top of everything above (2026-11-12, after the fourth phase).
+
+- **Saving.** Every accepted edit is in `current.json` before its reply (compact JSON, temp file + rename, no fsync). `projects/<id>.json` follows 300 ms after the last edit and at the latest 1 s after the first unsaved one, as an fsynced copy, and `current.json` is fsynced then. After `kill -9` the answered edits are all in `current.json`, and the next start brings the saved copy up to date (integration tests kill the service right after one reply, after 17 edits 100 ms apart and after 23 edits without a pause). A power cut can still lose what was not yet fsynced (at most that last second); that was not tested. A write cut off between its temporary file and the rename leaves `current.tmp-<uuid>` or `projects/<id>.tmp-<uuid>`; `Editor::new` removes those at start (it runs after the port is bound, so no other process is writing). When the delayed write fails, edits are saved synchronously and an edit that cannot be saved is refused. Shutdown no longer waits for the editor lock: it flushes through a shared handle, so the 5 s give-up and the role of `SLOW_COMMANDS` as a safety net are gone. An agent job's end flushes at once, before the job is reported as finished.
+- **`preview.frame` that will not be drawn** is a result, not an error: HTTP 200 `{"result":{"cancelled":true,"reason":"… (CODE)"}}` when the same client asked for another frame or stopped it with `preview.cancel` (`PREVIEW_CANCELLED`), when the project changed while it was drawn (`PREVIEW_STALE`) and when `expectedRevision` is no longer the project's (`REVISION_CONFLICT`) — `preview::was_superseded`. A browser therefore logs no failed request while scrubbing or editing. Real failures (bad parameters, a render error, too many requests) stay 400. `scripts/studio-mcp.py` turns such a result back into an error carrying the reason, so CLI and MCP callers see what they saw before. `usePreviewFrame` drops any reply without `assetId`.
+- **Project mismatch** (`projectId` in the request is not the open project) is 409 `{"error":…,"code":"PROJECT_CHANGED"}` with wording for the caller: the UI reads 「다른 프로젝트가 열려 있어 요청을 처리하지 않았습니다.」, an agent is told to start a new job. `errorText` strips the trailing code.
+- **Storage.** `storage.usage` also reports `emptyProjects:{count,bytes}` (stored projects other than the open one that still carry a default name, hold nothing — `editor.rs untouched`, whatever their revision: `project.new` starts a project one revision past the one that was open, and an undone edit leaves a revision too) and `proxyLimitBytes`. `storage.clean {targets?:("temporary"|"emptyProjects")[]}` defaults to `["temporary"]`; with `emptyProjects` those projects are deleted and the reply's `emptyProjects` carries `removed`/`removedBytes`. Nothing deletes them automatically. `storage.configure {proxyLimitBytes}` (0 = no limit, default 20 GiB, kept in `<root>/storage.json`) answers like `storage.usage`. The media worker looks at `proxies/` after a project switch, a limit change and each finished proxy, and every 10 minutes: over the limit it removes proxies of projects that are not open, least recently open first (the `.source` note's modification time, refreshed while the project is open). Proxies of the open project are never removed, so they alone can exceed the limit. All three are UI-only (403 for agent tokens). Settings shows the empty-project count with a confirmed delete and a limit selector (5/10/20/50 GB, no limit); the home screen re-reads `project.list` when Settings closes.
+- **Schema version 3: a video clip's sound fade.** `Clip.audioFadeIn/audioFadeOut?: number` (seconds, stored on video clips only). Absent, the sound follows `fadeIn/fadeOut` (the transition length), so older projects and the crossfade of overlapping clips are unchanged; a v2 file only gets the new version number. Set with `edit.update` (rounded to the frame grid; `null` removes the field); on an audio clip the same names set `fadeIn/fadeOut` and nothing is stored; image and text clips are refused. Each is limited to the clip; when both are present and exceed it they shrink in proportion; when only one is present it alone shrinks so that it and the picture fade on the other edge fit. Applied by `edit.update/trim/split/paste` and `presets.apply`; `edit.split` sets the cut side to 0; `media.reprobe` moves them to `fadeIn/fadeOut` when the clip becomes audio; presets do not carry them. `render.rs audio_fades` and the fast preview (`Player.tsx`) both use `audioFade* ?? fade*`. The Inspector's 오디오 › 페이드 인/아웃 sends `audioFadeIn/audioFadeOut` for video clips and `fadeIn/fadeOut` for audio clips. A version-3 project does not open in an older build.
+- **Speed.** `edit.update {speed}` keeps the source span, derives the duration and moves keyframe times by the same ratio (keyframes sent along are taken as sent). `{speed,duration}` whose duration is that length (before or after frame rounding) is the same command; any other duration is a resize. The Inspector sends `{speed}` only.
+- **`edit.batch`** validates the project once, after the last command. A command's own refusal fails at once; when the final project is invalid the batch is replayed command by command on the original to return the first error. Either way nothing changes. A batch whose intermediate state alone is invalid now succeeds. Because a command inside a batch can therefore meet a state no single command leaves (a keyframe that is a number), the unchecked pass runs under `catch_unwind` and anything it cannot finish, a panic included, is settled by the checked replay: the caller gets the first bad command's 400, never a closed connection. Code in `apply` must still not index into a value it has not seen to be an object. `captions.import` validates once as well.
+- **Rendering.** A video clip is converted to RGBA by its resize (crop, stabilise and reverse keep the old order), which changes downscaled pixels slightly against the fourth phase (about 46 dB PSNR on a synthetic 4K frame; preview and export share the path and agree with each other). A range where more clips overlap at one instant than a part may hold is not divided into parts.
+- **The UI's edit queue.** Every keyboard, toolbar, context-menu, track, marker, transition and drop edit hands `App.execute` a function `(project) => params | null`, built when its turn comes from the project the edits before it left; an edit whose target is gone is not sent. Split and the playhead trims (⌘B, Q, W) therefore always go out as `edit.batch`, even for one clip. Copy takes the clips as they are on screen when the key is pressed. ⌘Z/⇧⌘Z send nothing while nothing can be undone/redone and no edit is on its way. Verified in the browser: three nudges followed at once by split; delete followed at once by paste; nine nudges that move the clip off the playhead followed by split (no split is sent) and duplicate.
+- **`omitWaveforms` in the UI.** `api.ts rpc()` adds `omitWaveforms:true` to every method except `runtime.|agent.|memory.|speech.|preview.|export.|storage.` and `media.waveform`; `waveforms.ts` fetches the peaks of the media that audio clips use once per media (`media.waveform`, retried after 5 s on failure) and hands them to the timeline. With `omitWaveforms` each media item also carries `waveformId` (a hash of the stored peaks, the same in every process), and `media.waveform` repeats it: `{id, waveform, waveformId?}`. The UI keeps fetched peaks under that name, so a file replaced by one of the same length and reprobed by anyone (this window, an agent, the CLI) is fetched again even when this window never saw the waveform cleared; `App.tsx derivedKey` includes it so the poll picks the change up. A new method prefix that does not reach the editor and rejects unknown parameters must be added to `editorMethod`. `/upload` replies still carry the peaks.
+- **Player.** The playback clock (`playbackClock.runPlayback`) follows the wall clock; while no frame arrives (hidden window) a 250 ms timer advances it, and `visibilitychange` re-syncs at once. A repeat wraps to the range's start; only a playhead that ran past the end during a gap of 0.25 s or more (a hidden window) keeps its place in the range (`over % length`). One that was already past the end at the previous step (a seek beyond the range, a repeat turned on behind the playhead) starts the range. A paused frame drawn from proxies shows a 「프록시」 badge; when the project has proxy media the player's options offer 「원본으로 보기」 (`proxy:false`, cached separately). A keyboard trim is announced in the timeline's live region after the service applied it. In overlay mode (`coveredInert.ts`) every player and timeline control whose centre lies under the assistant drawer is `inert` (measured at 1000×700: 17 controls, none outside the drawer). `useCoveredInert` takes a fourth argument that changes when the editing surface is mounted again (`project`/`home`), because the drawer can stay open across a visit to the home screen.
+- **Window.** `tauri.conf.json` `minHeight` is 600: on macOS 27 the title bar (32 pt) is inside the window height, so the page is 32 px shorter than configured (800 → 768, 600 → 568) and the layout needs 511 px (54+220+8+200+6+23).
+- **Native self-diagnosis** (report schema 2) adds the steps `window`, `visual`, `export`, `revealFile` and `windowSizes`, the shell routes `/__selftest/window` and `/__selftest/resize`, and a development-only `?selftest` entry (`import.meta.env.DEV`; absent from the production bundle) that leaves the report in `window.__BYORI_SELFTEST_REPORT__`. The self-test window is brought forward (`bring_forward`: always-on-top, show, focus).
+

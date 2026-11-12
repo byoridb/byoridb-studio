@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-studio-reveal-file"
+description = "Enables the studio_reveal_file command without any pre-configured scope."
+commands.allow = ["studio_reveal_file"]
+
+[[permission]]
+identifier = "deny-studio-reveal-file"
+description = "Denies the studio_reveal_file command without any pre-configured scope."
+commands.deny = ["studio_reveal_file"]

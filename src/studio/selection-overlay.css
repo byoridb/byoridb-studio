@@ -1,0 +1,123 @@
+.selection-overlay {
+  --inverse-scale: 1;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 8;
+  border: calc(1px * var(--inverse-scale)) solid var(--accent);
+  pointer-events: none;
+  transform-origin: center;
+}
+.selection-overlay button {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+.selection-overlay .selection-move {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  cursor: move;
+}
+/* 8px handles centred on the corners, with a 16px hit area. */
+.selection-overlay .selection-handle {
+  width: 8px;
+  height: 8px;
+  background: var(--text);
+  border: 1px solid var(--action-ink);
+}
+.selection-overlay .selection-handle::before,
+.selection-overlay .selection-rotate::before {
+  content: "";
+  position: absolute;
+  inset: -5px;
+}
+.selection-handle.nw {
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%) scale(var(--inverse-scale));
+  cursor: nwse-resize;
+}
+.selection-handle.ne {
+  right: 0;
+  top: 0;
+  transform: translate(50%, -50%) scale(var(--inverse-scale));
+  cursor: nesw-resize;
+}
+.selection-handle.sw {
+  left: 0;
+  bottom: 0;
+  transform: translate(-50%, 50%) scale(var(--inverse-scale));
+  cursor: nesw-resize;
+}
+.selection-handle.se {
+  right: 0;
+  bottom: 0;
+  transform: translate(50%, 50%) scale(var(--inverse-scale));
+  cursor: nwse-resize;
+}
+.selection-overlay button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.selection-overlay .selection-rotate {
+  left: 50%;
+  top: 0;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--action-ink);
+  border-radius: 50%;
+  background: var(--text);
+  /* Its centre sits 20 screen pixels above the top edge. */
+  transform: translate(-50%, -50%) scale(var(--inverse-scale)) translateY(-20px);
+  cursor: grab;
+}
+.selection-overlay .selection-rotate::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 1px;
+  height: 14px;
+  background: var(--accent);
+  pointer-events: none;
+}
+/* No room above the frame: the handle moves just inside the top edge. */
+.selection-overlay.rotate-inside .selection-rotate {
+  transform: translate(-50%, -50%) scale(var(--inverse-scale)) translateY(20px);
+}
+.selection-overlay.rotate-inside .selection-rotate::after {
+  top: auto;
+  bottom: 100%;
+}
+.selection-overlay .selection-rotate:active {
+  cursor: grabbing;
+}
+.snap-guide {
+  position: absolute;
+  z-index: 9;
+  background: var(--accent);
+  pointer-events: none;
+}
+.snap-guide.vertical {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+.snap-guide.horizontal {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+/* The editor's generic button hover must not paint over the selected picture or its handles. */
+.studio-app .selection-overlay .selection-move:hover:not(:disabled) {
+  background-color: transparent;
+}
+.studio-app .selection-overlay .selection-handle:hover:not(:disabled),
+.studio-app .selection-overlay .selection-rotate:hover:not(:disabled) {
+  background-color: var(--text);
+}

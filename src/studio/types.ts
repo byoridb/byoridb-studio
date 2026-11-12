@@ -1,0 +1,258 @@
+export type MediaKind = "video" | "audio" | "image";
+export interface Media {
+  id: string;
+  name: string;
+  path: string;
+  kind: MediaKind;
+  duration: number;
+  width: number;
+  height: number;
+  hasAudio: boolean;
+  thumbnail?: string;
+  waveform?: number[];
+  /**
+   * Sent instead of `waveform` to a caller that asked for `omitWaveforms`: the number
+   * of peaks (0: the audio could not be read; absent: not computed yet). The peaks
+   * themselves then come from `media.waveform {id}`.
+   */
+  waveformPeaks?: number;
+  /** Sent with `waveformPeaks`: names those peaks. Other peaks, another name. */
+  waveformId?: string;
+  missing?: boolean;
+  proxy?: boolean;
+  codec?: string;
+  fps?: number;
+}
+export interface Track {
+  id: string;
+  name: string;
+  kind: "video" | "audio" | "text";
+  muted: boolean;
+  hidden: boolean;
+  locked: boolean;
+}
+export type Easing = "linear" | "easeIn" | "easeOut" | "easeInOut" | "hold";
+export interface Keyframe {
+  property: string;
+  time: number;
+  value: number;
+  /** Applies from this keyframe to the next one; absent means linear. */
+  easing?: Easing;
+}
+export type CurvePoint = [number, number];
+export type CurveChannel = "master" | "red" | "green" | "blue";
+export type HslChannel =
+  "red" | "yellow" | "green" | "cyan" | "blue" | "magenta";
+export interface ColorAdjustment {
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  temperature: number;
+  hue?: number;
+  hsl?: Partial<
+    Record<
+      HslChannel,
+      { hue?: number; saturation?: number; lightness?: number }
+    >
+  >;
+  curves?: {
+    preset?: string;
+    master?: CurvePoint[];
+    red?: CurvePoint[];
+    green?: CurvePoint[];
+    blue?: CurvePoint[];
+  };
+  lut?: { path?: string; name?: string; enabled: boolean };
+}
+export type TransitionType =
+  | "fade"
+  | "dissolve"
+  | "wipeLeft"
+  | "wipeRight"
+  | "wipeUp"
+  | "wipeDown"
+  | "slideLeft"
+  | "slideRight"
+  | "zoom";
+export interface Transition {
+  type: TransitionType;
+  duration: number;
+}
+export type BlendMode =
+  | "normal"
+  | "multiply"
+  | "screen"
+  | "overlay"
+  | "darken"
+  | "lighten"
+  | "add";
+export interface Clip {
+  id: string;
+  mediaId?: string;
+  trackId: string;
+  name: string;
+  kind: MediaKind | "text";
+  start: number;
+  duration: number;
+  sourceIn: number;
+  speed: number;
+  reverse: boolean;
+  volume: number;
+  fadeIn: number;
+  fadeOut: number;
+  /** A video clip's own sound fade, in seconds; absent, the sound follows fadeIn/fadeOut. */
+  audioFadeIn?: number;
+  audioFadeOut?: number;
+  transform: {
+    x: number;
+    y: number;
+    scale: number;
+    rotation: number;
+    opacity: number;
+    flipX?: boolean;
+    flipY?: boolean;
+  };
+  color: ColorAdjustment;
+  text?: {
+    content: string;
+    fontSize: number;
+    color: string;
+    fontFamily: string;
+    fontId?: string;
+    fontPath?: string;
+    bold: boolean;
+    align: string;
+    background: string;
+    italic?: boolean;
+    letterSpacing?: number;
+    lineHeight?: number;
+    outline?: { color: string; width: number };
+    shadow?: { color: string; x: number; y: number; blur: number };
+  };
+  filter?: string;
+  transitionIn?: Transition | null;
+  transitionOut?: Transition | null;
+  blendMode?: BlendMode;
+  keyframes: Keyframe[];
+  crop?: { x: number; y: number; width: number; height: number };
+  mask?: {
+    type: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    feather: number;
+  };
+  chromaKey?: {
+    enabled: boolean;
+    color: string;
+    similarity: number;
+    blend: number;
+  };
+  audio?: {
+    normalize: boolean;
+    denoise: boolean;
+    voiceEnhance: boolean;
+    eq?: { bass: number; mid: number; treble: number };
+  };
+  stabilize?: { enabled: boolean; strength: number };
+  groupId?: string;
+  [key: string]: unknown;
+}
+export interface Note {
+  id: string;
+  body: string;
+  createdAt: number | string;
+  kind: string;
+  clipId?: string;
+}
+export interface Project {
+  id: string;
+  name: string;
+  revision: number;
+  schemaVersion?: number;
+  width: number;
+  height: number;
+  fps: number;
+  background: string;
+  media: Media[];
+  tracks: Track[];
+  clips: Clip[];
+  markers: { id: string; time: number; label: string }[];
+  concept: {
+    audience: string;
+    message: string;
+    appeal: string;
+    direction: string;
+  };
+  notes: Note[];
+  updatedAt: number | string;
+}
+export type Command = (
+  method: string,
+  params?: Record<string, unknown>,
+) => Promise<unknown>;
+/**
+ * Makes an edit's parameters from the project as it is when the edit is sent, after
+ * the edits made before it have been answered. Null sends nothing (what it was for
+ * is gone); the command then resolves to undefined.
+ */
+export type CommandBuilder = (project: Project) => Record<string, unknown> | null;
+/** A command whose parameters may be made when it is sent; the app guards it with that project's revision. */
+export type EditCommand = (
+  method: string,
+  params?: Record<string, unknown> | CommandBuilder,
+) => Promise<unknown>;
+export interface Job {
+  id: string;
+  state: string;
+  progress?: number;
+  path?: string;
+  /** export.status: the video encoder in use; changes if hardware encoding fell back. */
+  encoder?: string;
+  logs?: { at: string; stream: string; text: string }[] | string[];
+  result?: string;
+  error?: string;
+  provider?: string;
+}
+export interface AgentSummary {
+  id: string;
+  provider: string;
+  state: string;
+  projectId: string;
+  startedAt: number | string;
+  finishedAt?: number | string;
+}
+export interface RuntimeStatus {
+  ffmpeg: { available: boolean; path?: string; version?: string };
+  providers: {
+    id: string;
+    name: string;
+    available: boolean;
+    path?: string;
+    version?: string;
+    authStatus?: string;
+  }[];
+  byoridb: {
+    installed: boolean;
+    home?: string;
+    version?: string;
+    running: boolean;
+    connected: boolean;
+    url?: string;
+    error?: string;
+  };
+}
+export const durationOf = (project: Project) =>
+  Math.max(0, ...project.clips.map((c) => c.start + c.duration));
+export const timecode = (seconds: number, fps = 30) => {
+  const f = Math.max(0, Math.round(seconds * fps));
+  return [
+    Math.floor(f / fps / 3600),
+    Math.floor(f / fps / 60) % 60,
+    Math.floor(f / fps) % 60,
+    f % fps,
+  ]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+};

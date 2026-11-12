@@ -1,28 +1,22 @@
 name: Release (macOS)
 
-# 세 가지 모드로 동작한다.
-#   auto   — main 에 코드가 푸시되면 패치 버전을 올려 서명·공증된 DMG 를 릴리스한다.
-#   tag    — v* 태그를 밀면 그 버전으로 릴리스한다 (버전을 올리지 않는다).
-#   dryrun — workflow_dispatch. 릴리스를 만들지 않고 서명 경로만 검증한다.
+# 두 가지 모드로 동작한다.
+#   tag    — v* 태그를 밀면 그 버전으로 서명·공증된 DMG 를 릴리스한다.
+#            태그는 package.json 의 버전과 같아야 한다(v0.2.0 ↔ 0.2.0).
+#   dryrun — workflow_dispatch. 릴리스를 만들지 않고 빌드·서명·공증 경로만
+#            검증한다. 어느 ref 에서 실행해도(태그 포함) 릴리스는 만들지 않는다.
 #
-# paths-ignore 로 문서 전용 커밋은 릴리스를 만들지 않는다. 릴리스 1회에
-# macOS 러너와 Apple 공증으로 수 분이 들기 때문이다. 이 필터는 태그 푸시에도
-# 함께 적용되므로, 문서만 바뀐 커밋에 태그를 달면 workflow_dispatch 를 쓴다.
+# 버전은 package.json 한 곳에서 정하고 이 워크플로는 올리지 않는다
+# (scripts/check-version.mjs 가 Cargo.toml·Cargo.lock·studio-tools.json 을 대조한다).
+# 이 저장소가 DB 관리 도구에서 영상 편집기로 바뀐 뒤로 이 워크플로는 아직
+# 한 번도 돌려 보지 않았다. dryrun 으로 먼저 확인한 뒤 태그로 릴리스한다.
 on:
   push:
-    branches: [main]
     tags:
       - "v*"
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "aidlc-docs/**"
-      - "LICENSE"
-      - ".gitignore"
-      - ".vscode/**"
   workflow_dispatch:
 
-# 두 실행이 같은 다음 버전을 동시에 계산하는 것을 막는다.
+# 같은 ref 의 릴리스 두 개가 동시에 돌지 않게 한다.
 concurrency:
   group: release-macos-${{ github.ref }}
   cancel-in-progress: false
@@ -62,22 +56,14 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # 이 리포는 버전을 다섯 곳에 따로 적는다. 커밋된 상태에서 이미 어긋나 있으면
-      # 어떤 값을 올려야 하는지 알 수 없으므로 여기서 막는다.
+      # 버전은 package.json 이 정하고 scripts/check-version.mjs 가 나머지를 대조한다.
       - name: Check version consistency
         run: |
           set -euo pipefail
+          node scripts/check-version.mjs
           PKG=$(node -p "require('./package.json').version")
-          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
-          echo "package.json=$PKG tauri.conf.json=$CONF Cargo.toml=$CARGO"
-          if [ "$PKG" != "$CONF" ] || [ "$PKG" != "$CARGO" ]; then
-            echo "::error::version mismatch across package.json / tauri.conf.json / Cargo.toml"
-            exit 1
-          fi
-          # 태그 모드에서는 태그가 선언된 버전과 같아야 한다. auto 모드는 이
-          # 워크플로가 버전을 올리므로 여기서 비교할 대상이 없다.
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+          # 태그 모드에서는 태그가 선언된 버전과 같아야 한다.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
             TAG_VERSION="${GITHUB_REF_NAME#v}"
             if [ "$TAG_VERSION" != "$PKG" ]; then
               echo "::error::tag $GITHUB_REF_NAME does not match project version $PKG"
@@ -90,34 +76,26 @@ jobs:
     name: Build signed universal DMG
     needs: preflight
     runs-on: macos-latest
-    # 버전 bump 커밋과 태그를 main 에 푸시하고 Release 를 만들기 위해 필요하다.
+    timeout-minutes: 120
+    # Release 를 만들고 DMG 를 올리기 위해 필요하다.
     # 리포의 기본 워크플로 권한은 read 이므로 여기서 명시적으로 올린다.
     permissions:
       contents: write
     env:
-      # Tauri 는 이 이름들을 읽어 codesign 과 공증을 수행한다. org 시크릿 이름과
-      # Tauri 가 기대하는 이름이 달라 여기서 매핑한다.
-      #   MACOS_SIGN_IDENTITY  -> APPLE_SIGNING_IDENTITY
-      #   APPLE_APP_PASSWORD   -> APPLE_PASSWORD
+      # 서명·공증 시크릿은 여기(job 수준)에 두지 않는다. npm ci, verify, brew,
+      # 서드파티 액션까지 잡의 모든 스텝이 받게 되기 때문이다. 필요한 세 스텝
+      # (인증서 import, 앱 빌드, DMG 공증)에만 스텝 env 로 준다.
       #
-      # APPLE_CERTIFICATE 는 의도적으로 넘기지 않는다. 그 경로를 쓰면 Tauri 가
-      # 자체 키체인에 p12 만 import 하는데, Keychain Access 로 뽑은 p12 에는
-      # leaf 와 개인키만 들어 있어 Developer ID intermediate 가 빠지고 codesign 이
-      # identity 를 찾지 못한다. 아래 import 스텝이 intermediate 까지 넣은 키체인을
-      # 검색 목록에 올려두므로 identity 이름만 주면 된다.
-      APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       # runner 컨텍스트는 job 레벨 env 에서 쓸 수 없다. 키체인 경로는 각 스텝에서
       # $RUNNER_TEMP 로 만들고, 비밀번호는 github 컨텍스트만으로 구성한다.
       KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
-      KEYCHAIN_NAME: byoridb-studio-signing.keychain-db
+      KEYCHAIN_NAME: byori-studio-signing.keychain-db
+      # brew: 요청한 것만 설치한다.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
     steps:
-      # fetch-depth: 0 이 필요하다. 다음 패치 번호를 기존 태그에서 계산한다.
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -135,40 +113,18 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # MAJOR.MINOR 는 package.json 이 정한다(수동으로 minor 를 올리면 따라간다).
-      # PATCH 는 같은 MAJOR.MINOR 라인의 가장 높은 태그 +1 이라 단조 증가한다.
+      # 버전은 package.json 그대로다(tauri.conf.json 의 version 이 "../package.json").
+      # 태그와 같은지는 preflight 가 이미 확인했다.
       - name: Resolve release version
         id: version
         run: |
           set -euo pipefail
-          BASE=$(node -p "require('./package.json').version")
-
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
             MODE=tag
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            MODE=auto
-            MAJOR="${BASE%%.*}"
-            REST="${BASE#*.}"
-            MINOR="${REST%%.*}"
-            BASE_PATCH="${REST#*.}"
-
-            # -E 가 필수다. macOS 러너의 BSD sed 는 basic regex 에서 \+ 를
-            # 리터럴 '+' 로 취급해, 태그를 하나도 못 읽고 조용히 빈 값을 준다.
-            HIGHEST=$(git tag -l "v${MAJOR}.${MINOR}.*" \
-              | sed -nE "s/^v${MAJOR}\.${MINOR}\.([0-9]+)$/\1/p" \
-              | sort -n | tail -1)
-
-            if [ -n "$HIGHEST" ] && [ "$HIGHEST" -ge "$BASE_PATCH" ]; then
-              VERSION="${MAJOR}.${MINOR}.$((HIGHEST + 1))"
-            else
-              VERSION="${MAJOR}.${MINOR}.$((BASE_PATCH + 1))"
-            fi
           else
             MODE=dryrun
-            VERSION="$BASE"
           fi
-
           {
             echo "mode=$MODE"
             echo "version=$VERSION"
@@ -176,62 +132,35 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "mode=$MODE version=$VERSION tag=v$VERSION"
 
-      - name: Apply version bump
-        if: steps.version.outputs.mode == 'auto'
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # package.json 과 package-lock.json 을 함께 최소 diff 로 갱신한다.
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-
-          # 최상위 "version" 한 줄만. 들여쓰기를 고정해 다른 키를 건드리지 않는다.
-          sed -i '' -E "s/^(  \"version\": \")[^\"]+(\",)$/\1${VERSION}\2/" \
-            src-tauri/tauri.conf.json
-          # 1,/re/ 로 범위를 좁혀 [package] 의 version 만 바꾼다. 그러지 않으면
-          # 나중에 [dependencies.x] 아래 version 줄까지 덮어쓴다.
-          sed -i '' -E '1,/^version = /s/^version = ".*"$/version = "'"$VERSION"'"/' \
-            src-tauri/Cargo.toml
-
-          # sed 가 조용히 아무것도 바꾸지 않으면 버전이 어긋난 DMG 가 나간다.
-          PKG=$(node -p "require('./package.json').version")
-          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
-          echo "bumped: package.json=$PKG tauri.conf.json=$CONF Cargo.toml=$CARGO"
-          if [ "$PKG" != "$VERSION" ] || [ "$CONF" != "$VERSION" ] || [ "$CARGO" != "$VERSION" ]; then
-            echo "::error::version bump did not apply to every file"
-            exit 1
-          fi
-
       - name: Install frontend deps
         run: npm ci
 
       # 인증서를 import 하기 전에 ci.yml 과 같은 검사를 모두 통과시킨다.
       # 검증되지 않은 커밋에서 릴리스가 나가는 것을 막는 게 목적이므로
       # 스텝 순서 자체가 게이트다.
-      - name: Lint (ESLint)
-        run: npm run lint
-
-      - name: Format check (Prettier)
-        run: npm run format:check
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: Test frontend
-        run: npm test
+      #
+      # 렌더러와 통합 테스트가 실제 ffmpeg/ffprobe 를 실행한다. python3 는
+      # macOS 러너에 들어 있다.
+      - name: Install FFmpeg
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          ffmpeg -hide_banner -version | head -n 1
+          ffprobe -hide_banner -version | head -n 1
+          python3 --version
 
       - name: Format check (rustfmt)
-        run: cargo fmt --check
-        working-directory: src-tauri
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      # 버전 대조, 프런트 테스트, Rust 테스트, 실제 서비스 통합 테스트, 프로덕션 빌드.
+      # 테스트는 빈 포트와 자기 데이터 폴더로 서비스를 띄운다. 이 변수는 그 밖의
+      # 무엇도 러너의 홈을 쓰지 않게 한다.
+      - name: Verify
+        run: npm run verify
+        env:
+          BYORI_STUDIO_HOME: ${{ runner.temp }}/byori-studio-home
 
       - name: Lint (clippy)
-        run: cargo clippy --all-targets --no-default-features -- -D clippy::correctness -W clippy::style -W clippy::perf
-        working-directory: src-tauri
-
-      - name: Test backend
-        run: cargo test --no-default-features
-        working-directory: src-tauri
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       # byoridb/byoridb 의 release.yml 에서 검증된 절차를 그대로 쓴다.
       # 두 가지가 핵심이고 둘 다 조용히 실패한다:
@@ -242,6 +171,7 @@ jobs:
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
@@ -285,8 +215,38 @@ jobs:
             | grep -qF "$APPLE_SIGNING_IDENTITY" \
             || { echo "::error::identity is not visible in the default keychain search list"; exit 1; }
 
+      # 번들에는 실행 파일이 둘 들어간다: 앱(byori-studio)과 같은 크레이트의
+      # src/bin/studio-service. externalBin 이 아니라 크레이트의 bin 대상이라
+      # Tauri 가 target/<대상>/release/ 에서 둘 다 복사한다. universal 빌드에서
+      # Tauri CLI 는 주 실행 파일만 lipo 로 합쳐 target/universal-apple-darwin/release/
+      # 에 두므로, studio-service 는 여기서 두 아키텍처로 빌드해 같은 자리에 합쳐 둔다.
+      # 없으면 번들 단계가 파일을 찾지 못한다. 서명은 번들 단계에서 Tauri 가 한다.
+      # (CLI 가 나중에 직접 합치게 되더라도 같은 파일을 덮어쓸 뿐이다.)
+      - name: Build universal studio-service
+        run: |
+          set -euo pipefail
+          for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --manifest-path src-tauri/Cargo.toml \
+              --target "$triple" --bin studio-service
+          done
+          OUT=src-tauri/target/universal-apple-darwin/release
+          mkdir -p "$OUT"
+          lipo -create -output "$OUT/studio-service" \
+            src-tauri/target/aarch64-apple-darwin/release/studio-service \
+            src-tauri/target/x86_64-apple-darwin/release/studio-service
+          lipo -info "$OUT/studio-service"
+
       # universal 로 빌드해 Intel 과 Apple Silicon 을 DMG 하나로 덮는다.
-      # 위 env 가 채워져 있으므로 Tauri 가 .app 을 서명하고 공증까지 진행한다.
+      # 이 스텝의 env 가 채워져 있으므로 Tauri 가 .app 을 서명하고 공증까지 진행한다.
+      # Tauri 는 아래 이름들을 읽는다. org 시크릿 이름과 달라 여기서 매핑한다.
+      #   MACOS_SIGN_IDENTITY  -> APPLE_SIGNING_IDENTITY
+      #   APPLE_APP_PASSWORD   -> APPLE_PASSWORD
+      #
+      # APPLE_CERTIFICATE 는 의도적으로 넘기지 않는다. 그 경로를 쓰면 Tauri 가
+      # 자체 키체인에 p12 만 import 하는데, Keychain Access 로 뽑은 p12 에는
+      # leaf 와 개인키만 들어 있어 Developer ID intermediate 가 빠지고 codesign 이
+      # identity 를 찾지 못한다. 위 import 스텝이 intermediate 까지 넣은 키체인을
+      # 검색 목록에 올려두므로 identity 이름만 주면 된다.
       #
       # 재시도를 붙인 이유: Tauri 가 부르는 bundle_dmg.sh 는 DMG 창을 꾸미려고
       # AppleEvent 로 Finder 를 조작하는데, Finder 가 바쁘거나 없으면
@@ -294,6 +254,11 @@ jobs:
       # 그 단계를 건너뛰는 --skip-jenkins 를 Tauri 는 넘기지 않으며 그걸 켤
       # 설정도 없다. 릴리스에서 가장 깨지기 쉬운 지점이라 한 번 다시 시도한다.
       - name: Build signed and notarized app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -uo pipefail
           attempt_build() {
@@ -351,12 +316,33 @@ jobs:
 
           # 빌드된 앱이 정말 universal 인지 확인한다. 한쪽 아키텍처만 담긴 DMG 는
           # 절반의 사용자에게 열리지 않는다.
-          BIN="$APP/Contents/MacOS/byoridb-studio"
-          lipo -info "$BIN"
-          lipo -info "$BIN" | grep -q 'x86_64' \
-            || { echo "::error::the binary has no x86_64 slice"; exit 1; }
-          lipo -info "$BIN" | grep -q 'arm64' \
-            || { echo "::error::the binary has no arm64 slice"; exit 1; }
+          # 실행 파일은 둘이다(앱과 studio-service). 둘 다 확인한다.
+          for name in byori-studio studio-service; do
+            BIN="$APP/Contents/MacOS/$name"
+            [ -f "$BIN" ] || { echo "::error::$name is missing from the bundle"; exit 1; }
+            lipo -info "$BIN"
+            lipo -info "$BIN" | grep -q 'x86_64' \
+              || { echo "::error::$name has no x86_64 slice"; exit 1; }
+            lipo -info "$BIN" | grep -q 'arm64' \
+              || { echo "::error::$name has no arm64 slice"; exit 1; }
+            # 두 실행 파일 각각의 서명도 본다. 공증이 몇 분 뒤 거부하기 전에
+            # 어느 파일이 문제인지 여기서 드러난다.
+            codesign --display --verbose=2 "$BIN" 2>&1 \
+              | grep -q '^Authority=Developer ID Application' \
+              || { echo "::error::$name is not signed by a Developer ID authority"; exit 1; }
+            codesign --display --verbose=2 "$BIN" 2>&1 | grep -q 'flags=.*runtime' \
+              || { echo "::error::hardened runtime is not enabled on $name"; exit 1; }
+          done
+
+          # 예제 소재는 리소스로 들어간다(tauri.conf.json 의 bundle.resources).
+          [ -d "$APP/Contents/Resources/demo" ] \
+            || { echo "::error::the demo resources are missing from the bundle"; exit 1; }
+
+          # 번들 버전이 릴리스 버전과 같은지 확인한다.
+          BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$APP/Contents/Info.plist")
+          [ "$BUNDLE_VERSION" = "${{ steps.version.outputs.version }}" ] \
+            || { echo "::error::bundle version $BUNDLE_VERSION is not ${{ steps.version.outputs.version }}"; exit 1; }
 
           # Tauri 는 공증 후 ticket 을 staple 하는 것이 기본이지만(skipStapling
           # 을 켜면 건너뛴다), 사용자가 내려받는 것은 DMG 이고 staple 이 없어도
@@ -373,11 +359,15 @@ jobs:
       # 확인하고 없을 때만 직접 공증한다. 공증은 수 분이 걸려서 무조건 한 번 더
       # 돌리는 것은 낭비다. 검증 자체는 어느 경로로 왔든 똑같이 강제한다.
       - name: Notarize and staple the DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           SRC_DMG="${{ steps.artifacts.outputs.dmg }}"
           VERSION="${{ steps.version.outputs.version }}"
-          DMG="$RUNNER_TEMP/ByoriDB-Studio-${VERSION}-universal.dmg"
+          DMG="$RUNNER_TEMP/Byori-Studio-${VERSION}-universal.dmg"
           cp "$SRC_DMG" "$DMG"
 
           if xcrun stapler validate "$DMG" >/dev/null 2>&1; then
@@ -420,41 +410,10 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh "$DMG_PATH"
-          shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
-
-      # 여기까지 통과한 뒤에만 커밋하고 태그를 붙인다. 빌드에 실패한 버전에
-      # 태그가 남으면 그 번호는 영구히 구멍이 된다.
-      - name: Commit version bump and tag
-        if: steps.version.outputs.mode == 'auto'
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.tag }}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Cargo.lock 은 방금 빌드가 갱신했다. 버전이 박힌 다섯 파일을 모두 담는다.
-          git add package.json package-lock.json \
-            src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-
-          # [skip ci] 로 이 커밋이 워크플로를 다시 돌리지 않게 한다. GITHUB_TOKEN
-          # 으로 만든 push 는 원래 워크플로를 트리거하지 않지만, 나중에 PAT 로
-          # 바꿔도 무한 루프가 생기지 않도록 이중으로 막는다.
-          git commit -m "chore(release): v${VERSION} [skip ci]"
-
-          # 빌드가 도는 동안 main 이 움직였을 수 있다. 리베이스 후 재시도한다.
-          if ! git push origin HEAD:main; then
-            echo "::warning::main moved during the build; rebasing and retrying"
-            git fetch origin main
-            git rebase origin/main
-            git push origin HEAD:main
-          fi
-
-          # 태그는 푸시가 성공한 커밋에 붙인다. 리베이스로 sha 가 바뀌므로
-          # 반드시 push 뒤에 만들어야 태그와 main 이 어긋나지 않는다.
-          git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
+          # 파일 이름만 적는다. 절대 경로가 들어가면 내려받은 쪽에서
+          # `shasum -a 256 -c` 가 러너의 경로를 찾다 실패한다.
+          (cd "$(dirname "$DMG_PATH")" && shasum -a 256 "$(basename "$DMG_PATH")") \
+            | tee "$DMG_PATH.sha256"
 
       - name: Remove signing keychain
         if: always()
@@ -466,7 +425,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: byoridb-studio-macos-universal
+          name: byori-studio-macos-universal
           path: |
             ${{ env.DMG_PATH }}
             ${{ env.DMG_PATH }}.sha256

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Byori preview transport check</title>
+<style>
+  body { font: 16px system-ui; margin: 24px; max-width: 1100px; }
+  button, select, label { font: inherit; margin: 6px; }
+  table { border-collapse: collapse; width: 100%; margin-block: 16px; }
+  td, th { padding: 6px; border-bottom: 1px solid; text-align: right; }
+  td:first-child, th:first-child { text-align: left; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  audio { display: none; }
+</style>
+<h1>Preview transport regression check</h1>
+<p>This isolated page uses the current Studio media transport and six local WAV sources.
+It never connects to a Studio project. Keep the tab visible during measurement.</p>
+<p>Two beds overlap, followed by two pairs of short voice-like tones at 3.7 and 5.8 seconds.
+Native playback is measured; this is not a speaker-output or visual-composition test.</p>
+<label>Source speed <select id="speed"><option value="1">1×</option><option value="1.25">1.25×</option></select></label>
+<label>Start position <select id="start"><option value="0">0 seconds</option><option value="4">4 seconds (trim / seek)</option></select></label>
+<label><input id="audible" type="checkbox"> Quiet audible tones</label>
+<label><input id="stall" type="checkbox"> Inject one 350 ms main-thread stall</label>
+<button id="run" disabled>Run 12-second check</button>
+<button id="stop" disabled>Stop</button>
+<p id="status" role="status">Preparing local audio…</p>
+<p id="metrics"></p>
+<p id="summary" aria-live="polite">No measurement yet.</p>
+<table><thead><tr><th>Source</th><th>Ready</th><th>Position</th><th>play</th><th>pause</th><th>seek</th><th>ratechange</th><th>rate writes</th><th>time writes</th></tr></thead><tbody id="sources"></tbody></table>
+<h2>Result</h2><pre id="result">No run yet.</pre>
+<details><summary>Native event trace (last 100)</summary><pre id="events"></pre></details>
+<script type="module">
+const query = new URLSearchParams(location.search);
+const scheduler = query.get("clock") === "timer" ? "timer" : "raf";
+const modulePath = query.has("baseline") ? "/output/preview-regression/mediaPlayback.before.ts" : "/src/studio/mediaPlayback.ts";
+const { MediaPlayback, primePreviewPlayback, isPreviewPlaybackWaiting } = await import(/* @vite-ignore */ modulePath);
+
+const $ = id => document.getElementById(id);
+const layout = [
+  { name: "bed A", start: 0, duration: 18, sourceIn: 2, tone: 110 },
+  { name: "bed B", start: 1.234, duration: 15, sourceIn: 1, tone: 165 },
+  { name: "voice A1", start: 3.7, duration: 1.2, sourceIn: .2, tone: 330 },
+  { name: "voice A2", start: 3.7, duration: 1.2, sourceIn: .2, tone: 330 },
+  { name: "voice B1", start: 5.8, duration: 1.6, sourceIn: .4, tone: 440 },
+  { name: "voice B2", start: 5.8, duration: 1.6, sourceIn: .4, tone: 440 },
+];
+const eventNames = ["play", "playing", "pause", "seeking", "seeked", "waiting", "stalled", "ratechange", "timeupdate", "error"];
+let sources = [], running = false, raf = 0, time = 0, last = 0, started = 0, lastPaint = 0;
+let waitMs = 0, waitFrames = 0, frames = [], errors = [], trace = [], startAt = 0, seekEpoch = 0;
+let positionDiscontinuities = [], progressSamples = [], hidden = false, stopTimer = 0, runSpeed = 1;
+let injectStall = false, stalled = false;
+$("stall").checked = query.has("stall");
+document.title += query.has("baseline") ? " — baseline" : " — current";
+const round = n => Math.round(n * 1000) / 1000;
+const percentile = (values, p) => values.length ? [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))] : 0;
+const schedule = callback => scheduler === "timer" ? setTimeout(() => callback(performance.now()), 16) : requestAnimationFrame(callback);
+const cancelSchedule = id => scheduler === "timer" ? clearTimeout(id) : cancelAnimationFrame(id);
+
+function wav(tone) {
+  const rate = 22050, count = rate * 26, data = new ArrayBuffer(44 + count * 2), view = new DataView(data);
+  const text = (at, value) => [...value].forEach((c, i) => view.setUint8(at + i, c.charCodeAt(0)));
+  text(0, "RIFF"); view.setUint32(4, 36 + count * 2, true); text(8, "WAVE"); text(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  text(36, "data"); view.setUint32(40, count * 2, true);
+  for (let i = 0; i < count; i++) view.setInt16(44 + i * 2, Math.sin(i / rate * tone * Math.PI * 2) * 900, true);
+  return URL.createObjectURL(new Blob([data], { type: "audio/wav" }));
+}
+
+function instrument(source, property) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, property);
+  if (!descriptor?.get || !descriptor.set) return;
+  Object.defineProperty(source.el, property, {
+    configurable: true,
+    get() { return descriptor.get.call(this); },
+    set(value) {
+      if (running) source.writes[property] = (source.writes[property] || 0) + 1;
+      descriptor.set.call(this, value);
+    },
+  });
+}
+
+function update() {
+  for (const s of sources) {
+    const active = time >= s.start && time < s.start + s.duration;
+    s.transport.update({ time, target: s.sourceIn + Math.max(0, time - s.start) * runSpeed,
+      speed: runSpeed, volume: $("audible").checked ? .15 : 0, playing: running, active, reverse: false, seekEpoch });
+  }
+}
+
+function paint(now = performance.now()) {
+  $("metrics").textContent = `${scheduler === "timer" ? "Timer callbacks (not FPS)" : "RAF"} · Wall ${round((now - started) / 1000)} s · Timeline ${round(time)} s · Waiting ${round(waitMs / 1000)} s · Callback p95 ${round(percentile(frames, .95))} ms`;
+  $("sources").innerHTML = sources.map(s => `<tr><td>${s.name}</td><td>${s.el.readyState}</td><td>${round(s.el.currentTime)}</td><td>${s.count.play || 0}</td><td>${s.count.pause || 0}</td><td>${s.count.seeking || 0}</td><td>${s.count.ratechange || 0}</td><td>${s.writes.playbackRate || 0}</td><td>${s.writes.currentTime || 0}</td></tr>`).join("");
+  $("events").textContent = trace.slice(-100).map(e => JSON.stringify(e)).join("\n");
+}
+
+function finish(reason) {
+  if (!running) return;
+  const now = performance.now(), wall = (now - started) / 1000;
+  const measured = sources.map(s => ({ name: s.name, position: round(s.el.currentTime), events: { ...s.count }, writes: { ...s.writes } }));
+  running = false;
+  cancelSchedule(raf); clearTimeout(stopTimer);
+  update();
+  const totals = measured.reduce((sum, s) => ({ seeks: sum.seeks + (s.events.seeking || 0), pauses: sum.pauses + (s.events.pause || 0), plays: sum.plays + (s.events.play || 0), rateChanges: sum.rateChanges + (s.events.ratechange || 0), rateWrites: sum.rateWrites + (s.writes.playbackRate || 0), timeWrites: sum.timeWrites + (s.writes.currentTime || 0) }), { seeks: 0, pauses: 0, plays: 0, rateChanges: 0, rateWrites: 0, timeWrites: 0 });
+  const result = { reason, scheduler, implementation: modulePath, sourceSpeed: runSpeed, startAt, injectedStall: stalled, wallSeconds: round(wall), timelineElapsed: round(time - startAt),
+    speedRatio: round((time - startAt) / wall), waitingSeconds: round(waitMs / 1000), waitFrames,
+    callbackIntervals: { count: frames.length, p50Ms: round(percentile(frames, .5)), p95Ms: round(percentile(frames, .95)), maxMs: round(Math.max(0, ...frames)) },
+    totals, tabWasHidden: hidden, errors, sourcePositionJumps: positionDiscontinuities, sources: measured, progressSamples };
+  $("summary").textContent = `Summary: ${query.has("baseline") ? "baseline" : "current"}; scheduler ${scheduler}; hidden ${hidden}; timeline/wall ${round((time - startAt) / wall)}; waits ${round(waitMs / 1000)} s; seeks ${totals.seeks}; pauses ${totals.pauses}; rate writes ${totals.rateWrites}; time writes ${totals.timeWrites}; errors ${errors.length}.`;
+  $("result").textContent = JSON.stringify(result, null, 2);
+  $("status").textContent = `${reason}. ${errors.length ? "Playback errors occurred." : "No transport errors reported."}`;
+  $("run").disabled = false; $("stop").disabled = true; $("speed").disabled = false; $("start").disabled = false;
+  paint(now);
+}
+
+function tick(now) {
+  if (!running) return;
+  const dt = now - last; last = now; frames.push(dt);
+  const waiting = isPreviewPlaybackWaiting();
+  if (waiting) { waitMs += dt; waitFrames++; }
+  else { time += dt / 1000; update(); }
+  for (const s of sources) {
+    const p = s.el.currentTime;
+    if (s.previous !== undefined && p < s.previous - .04) positionDiscontinuities.push({ at: round((now - started) / 1000), source: s.name, from: round(s.previous), to: round(p) });
+    s.previous = p;
+  }
+  if (now - lastPaint >= 250) {
+    lastPaint = now;
+    progressSamples.push({ wall: round((now - started) / 1000), timeline: round(time), waiting });
+    paint(now);
+  }
+  if (now - started >= 12000) finish("Completed 12-second check");
+  else if (errors.length) finish("Stopped after playback error");
+  else {
+    if (injectStall && !stalled && now - started >= 6000) {
+      stalled = true;
+      const until = performance.now() + 350;
+      while (performance.now() < until) { /* Controlled one-off UI stall for seek-loop detection. */ }
+    }
+    raf = schedule(tick);
+  }
+}
+
+$("run").onclick = () => {
+  time = startAt = Number($("start").value); runSpeed = Number($("speed").value);
+  waitMs = waitFrames = 0; frames = []; errors = []; trace = []; positionDiscontinuities = []; progressSamples = [];
+  seekEpoch++; stalled = false; injectStall = $("stall").checked;
+  hidden = document.hidden;
+  for (const s of sources) { s.count = {}; s.writes = {}; s.previous = undefined; }
+  update();
+  // This is deliberately synchronous in the Run click, just as Studio's play button is.
+  primePreviewPlayback(); running = true; update();
+  started = last = lastPaint = performance.now();
+  $("status").textContent = "Running real native media playback…"; $("result").textContent = "Running…";
+  $("summary").textContent = `Running ${query.has("baseline") ? "baseline" : "current"} with ${scheduler} scheduler. Timer callback cadence is not FPS.`;
+  $("run").disabled = true; $("stop").disabled = false; $("speed").disabled = true; $("start").disabled = true;
+  raf = schedule(tick);
+  stopTimer = setTimeout(() => finish("Timed out (tab may be backgrounded)"), 18000);
+};
+$("stop").onclick = () => finish("Stopped by operator");
+document.addEventListener("visibilitychange", () => { if (running && document.hidden) hidden = true; });
+window.addEventListener("beforeunload", () => sources.forEach(s => { s.transport.dispose(); URL.revokeObjectURL(s.url); }));
+
+const loaded = layout.map(async (config) => {
+  const el = document.createElement("audio"); el.preload = "auto"; el.playsInline = true;
+  const source = { ...config, el, url: wav(config.tone), count: {}, writes: {}, previous: undefined };
+  sources.push(source); el.src = source.url; document.body.append(el);
+  for (const property of ["currentTime", "playbackRate", "volume", "muted"]) instrument(source, property);
+  for (const name of eventNames) el.addEventListener(name, () => {
+    if (!running) return;
+    source.count[name] = (source.count[name] || 0) + 1;
+    if (name !== "timeupdate") trace.push({ wall: round((performance.now() - started) / 1000), source: source.name, event: name, position: round(el.currentTime), ready: el.readyState });
+  });
+  source.transport = new MediaPlayback(el, message => errors.push({ source: source.name, message, time: round(time) }));
+  await new Promise((resolve, reject) => {
+    if (el.readyState >= 3) return resolve();
+    el.addEventListener("canplay", resolve, { once: true });
+    el.addEventListener("error", () => reject(new Error(`Cannot decode ${source.name}`)), { once: true });
+  });
+});
+Promise.all(loaded).then(() => {
+  started = performance.now(); update(); paint();
+  $("status").textContent = "Six local WAV sources are ready. Click Run to grant playback permission.";
+  $("run").disabled = false;
+}).catch(error => { $("status").textContent = error.message; });
+</script>
+</html>

@@ -1,300 +1,495 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod client;
+use byori_studio::service::{Connection, Host, StudioService};
+use tauri::Manager;
 
-use client::{
-    test_connection as client_test_connection, ByoriDBClient, ClientError, ConnectionConfig,
-    QueryResult, SchemaInfo, SpaceInfo,
-};
-use serde::Serialize;
-use std::sync::Arc;
-use tauri::State;
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
-use tracing::info;
-
-struct AppState {
-    client: Arc<Mutex<Option<ByoriDBClient>>>,
-    /// Replaced each time a query starts; cancelled when the user requests abort.
-    query_cancel: Arc<Mutex<Option<CancellationToken>>>,
+#[tauri::command]
+fn studio_connection(state: tauri::State<'_, Connection>) -> Connection {
+    state.inner().clone()
 }
 
-/// Structured error returned to the frontend from every Tauri command.
+#[tauri::command]
+async fn studio_open_files(extensions: Option<Vec<String>>) -> Vec<String> {
+    let extensions = extensions.unwrap_or_else(|| {
+        [
+            "mp4", "mov", "mkv", "webm", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg",
+            "jpeg", "webp", "gif", "srt", "cube", "3dl",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    });
+    rfd::AsyncFileDialog::new()
+        .add_filter("파일", &extensions)
+        .pick_files()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.path().to_string_lossy().to_string())
+        .collect()
+}
+
+#[tauri::command]
+async fn studio_save_file(name: String, extension: Option<String>) -> Option<String> {
+    let mut dialog = rfd::AsyncFileDialog::new().set_file_name(&name);
+    if let Some(ext) = extension {
+        dialog = dialog.add_filter("파일", &[&ext]);
+    }
+    dialog
+        .save_file()
+        .await
+        .map(|f| f.path().to_string_lossy().to_string())
+}
+
+/// Shows a file the app wrote (an export) in Finder. Only an existing file with an
+/// absolute path is shown; nothing is opened or run, and the path is passed as one
+/// argument, never through a shell.
+#[tauri::command]
+async fn studio_reveal_file(path: String) -> Result<(), String> {
+    let file = std::path::PathBuf::from(&path);
+    if !file.is_absolute() || !file.is_file() {
+        return Err("파일을 찾을 수 없습니다. 이동했거나 삭제되었을 수 있습니다.".into());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command.arg("-R").arg(&file);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", file.display()));
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(file.parent().unwrap_or(&file));
+        command
+    };
+    let shown = tauri::async_runtime::spawn_blocking(move || command.status())
+        .await
+        .map_err(|error| error.to_string())?;
+    match shown {
+        // Explorer reports 1 even when it shows the file.
+        Ok(status) if status.success() || cfg!(target_os = "windows") => Ok(()),
+        Ok(_) => Err("파일 위치를 열지 못했습니다.".into()),
+        Err(error) => Err(format!("파일 위치를 열지 못했습니다: {error}")),
+    }
+}
+
+/// Self-diagnosis for a window nobody can look at (no screen recording permission):
+/// the webview inspects its own rendered state and this shell writes the findings to
+/// the file named by `BYORI_STUDIO_SELFTEST`, then quits.
 ///
-/// The `code` field carries a stable machine-readable tag (e.g.
-/// `SESSION_EXPIRED`) so the UI can react to specific failure modes
-/// (see `src/App.tsx`). `message` is the human-readable description.
-#[derive(Debug, Serialize)]
-struct TauriError {
-    code: String,
-    message: String,
-}
+/// Without that variable none of this is attached: no script is injected, the report
+/// route does not exist, and no command is added to the IPC surface either way.
+mod self_test {
+    use std::borrow::Cow;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tauri::http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode};
 
-impl TauriError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            code: code.to_string(),
-            message: message.into(),
+    use tauri::Manager;
+
+    const REPORT_PATH: &str = "/__selftest/report";
+    /// What the native window really is (sizes, focus) and where an export may be written.
+    const WINDOW_PATH: &str = "/__selftest/window";
+    /// `?w=<logical>&h=<logical>`: the diagnosis measures the layout at several window sizes.
+    const RESIZE_PATH: &str = "/__selftest/resize";
+    const DEFAULT_TIMEOUT_SECS: u64 = 240;
+
+    /// A window that is behind another one is "hidden" to WebKit: animation frames stop
+    /// and the playback clock cannot be checked. An app started by a background process
+    /// is not brought forward by macOS, so the diagnosis raises its own window.
+    pub fn bring_forward<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+        for (step, done) in [
+            ("always_on_top", window.set_always_on_top(true)),
+            ("show", window.show()),
+            ("set_focus", window.set_focus()),
+        ] {
+            if let Err(error) = done {
+                tracing::warn!("자가 진단 창을 앞으로 가져오지 못했습니다 ({step}): {error}");
+            }
         }
     }
-}
 
-impl From<ClientError> for TauriError {
-    fn from(err: ClientError) -> Self {
-        TauriError {
-            code: err.code().to_string(),
-            message: err.to_string(),
+    fn window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> serde_json::Value {
+        let Some(window) = handle.get_webview_window("main") else {
+            return serde_json::json!({ "present": false });
+        };
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let logical = |size: tauri::Result<tauri::PhysicalSize<u32>>| {
+            size.ok().map(|size| {
+                let size = size.to_logical::<f64>(scale);
+                serde_json::json!({ "width": size.width, "height": size.height })
+            })
+        };
+        let monitor = window.current_monitor().ok().flatten().map(|monitor| {
+            let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
+            serde_json::json!({
+                "width": size.width,
+                "height": size.height,
+                "scaleFactor": monitor.scale_factor(),
+            })
+        });
+        let exports = byori_studio::service::data_root().join("exports");
+        let configured = handle.config().app.windows.first().map(|window| {
+            serde_json::json!({
+                "width": window.width,
+                "height": window.height,
+                "minWidth": window.min_width,
+                "minHeight": window.min_height,
+            })
+        });
+        serde_json::json!({
+            "present": true,
+            "configured": configured,
+            "scaleFactor": scale,
+            "inner": logical(window.inner_size()),
+            "outer": logical(window.outer_size()),
+            "visible": window.is_visible().ok(),
+            "focused": window.is_focused().ok(),
+            "minimized": window.is_minimized().ok(),
+            "alwaysOnTop": window.is_always_on_top().ok(),
+            "monitor": monitor,
+            "exportDir": std::fs::create_dir_all(&exports).is_ok().then_some(exports),
+        })
+    }
+
+    fn resize<R: tauri::Runtime>(handle: &tauri::AppHandle<R>, query: &str) -> bool {
+        let number = |name: &str| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.parse::<f64>().ok())
+                .filter(|value| (320.0..=8192.0).contains(value))
+        };
+        let (Some(width), Some(height), Some(window)) =
+            (number("w"), number("h"), handle.get_webview_window("main"))
+        else {
+            return false;
+        };
+        // Not from inside the request callback: the resize re-enters the webview's layout.
+        std::thread::spawn(move || {
+            if let Err(error) = window.set_size(tauri::LogicalSize::new(width, height)) {
+                tracing::warn!("자가 진단 창 크기를 바꾸지 못했습니다: {error}");
+            }
+        });
+        true
+    }
+
+    /// Runs before any page script, so violations and errors during the first load are kept.
+    const COLLECTOR: &str = r#"(function () {
+  if (window.top !== window || window.__BYORI_SELFTEST__) return;
+  var clean = function (v) { return String(v == null ? "" : v).replace(/token=[^&#]+/g, "token=REDACTED").slice(0, 300); };
+  var c = { csp: [], errors: [], rejections: [] };
+  Object.defineProperty(window, "__BYORI_SELFTEST__", { value: c });
+  document.addEventListener("securitypolicyviolation", function (e) {
+    c.csp.push({ directive: e.violatedDirective, effective: e.effectiveDirective, blocked: clean(e.blockedURI), source: clean(e.sourceFile), line: e.lineNumber, sample: clean(e.sample), disposition: e.disposition });
+  });
+  window.addEventListener("error", function (e) {
+    var t = e.target;
+    if (t && t !== window && t.tagName) c.errors.push({ kind: "resource", tag: t.tagName.toLowerCase(), url: clean(t.currentSrc || t.src || t.href) });
+    else c.errors.push({ kind: "script", message: clean(e.message), source: clean(e.filename), line: e.lineno, column: e.colno });
+  }, true);
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e.reason;
+    c.rejections.push({ message: clean(r && r.message ? r.message : r), stack: clean(r && r.stack) });
+  });
+})();"#;
+
+    /// The output file, when this run is a self-diagnosis.
+    pub fn target() -> Option<PathBuf> {
+        std::env::var_os("BYORI_STUDIO_SELFTEST")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    #[derive(Default)]
+    struct Progress {
+        report: Option<serde_json::Value>,
+        received: u32,
+        finished: bool,
+    }
+
+    fn write(path: &Path, value: &serde_json::Value) {
+        let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into());
+        let partial = path.with_extension("json.partial");
+        if std::fs::write(&partial, text)
+            .and_then(|()| std::fs::rename(&partial, path))
+            .is_err()
+        {
+            tracing::error!("자가 진단 결과를 {} 에 쓰지 못했습니다", path.display());
         }
     }
-}
 
-impl From<anyhow::Error> for TauriError {
-    fn from(err: anyhow::Error) -> Self {
-        TauriError::new("TRANSPORT", err.to_string())
+    /// A startup failure has no window to report through.
+    pub fn startup_failure(path: &Path, message: &str) {
+        write(
+            path,
+            &serde_json::json!({ "final": true, "timedOut": false, "startupError": message, "report": null }),
+        );
+    }
+
+    pub fn attach<'a, R: tauri::Runtime>(
+        builder: tauri::WebviewWindowBuilder<'a, R, tauri::AppHandle<R>>,
+        handle: tauri::AppHandle<R>,
+        path: PathBuf,
+    ) -> tauri::WebviewWindowBuilder<'a, R, tauri::AppHandle<R>> {
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let timeout = std::env::var("BYORI_STUDIO_SELFTEST_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        {
+            // A locked screen can freeze the webview's timers; what arrived so far is still kept.
+            let (progress, handle, path) = (progress.clone(), handle.clone(), path.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(timeout));
+                let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
+                if state.finished {
+                    return;
+                }
+                state.finished = true;
+                write(
+                    &path,
+                    &serde_json::json!({
+                        "final": false,
+                        "timedOut": true,
+                        "timeoutSeconds": timeout,
+                        "receivedReports": state.received,
+                        "report": state.report,
+                    }),
+                );
+                drop(state);
+                handle.exit(2);
+            });
+        }
+        builder
+            .initialization_script(COLLECTOR)
+            .on_web_resource_request(move |request, response| {
+                if request.method() != Method::POST {
+                    return;
+                }
+                let answer = match request.uri().path() {
+                    WINDOW_PATH => Some(window_state(&handle)),
+                    RESIZE_PATH => Some(serde_json::json!({
+                        "accepted": resize(&handle, request.uri().query().unwrap_or_default()),
+                    })),
+                    _ => None,
+                };
+                if let Some(answer) = answer {
+                    *response.status_mut() = StatusCode::OK;
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    *response.body_mut() = Cow::Owned(answer.to_string().into_bytes());
+                    return;
+                }
+                if request.uri().path() != REPORT_PATH {
+                    return;
+                }
+                let last = request.uri().query().is_some_and(|q| q.contains("final=1"));
+                let body = request.body();
+                let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
+                if state.finished {
+                    return;
+                }
+                state.received += 1;
+                let parsed = serde_json::from_slice::<serde_json::Value>(body);
+                let mut output = serde_json::json!({
+                    "final": last,
+                    "timedOut": false,
+                    "receivedReports": state.received,
+                    "bodyBytes": body.len(),
+                });
+                match parsed {
+                    Ok(report) => state.report = Some(report),
+                    Err(error) => output["bodyError"] = error.to_string().into(),
+                }
+                output["report"] = state.report.clone().unwrap_or_default();
+                write(&path, &output);
+                *response.status_mut() = StatusCode::OK;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                *response.body_mut() = Cow::Borrowed(b"ok");
+                if last {
+                    state.finished = true;
+                    drop(state);
+                    handle.exit(0);
+                }
+            })
     }
 }
 
-#[tauri::command]
-async fn connect(config: ConnectionConfig, state: State<'_, AppState>) -> Result<(), TauriError> {
-    info!("Connecting to {}:{}", config.host, config.port);
+/// `kill`, a logout and a restart end the app with SIGTERM. It then leaves the way
+/// Quit does, so that the edits still waiting to be saved are written.
+///
+/// The handler is installed before anything else: until it is, SIGTERM kills the
+/// process outright, without the shutdown that saves and stops the child processes.
+#[cfg(unix)]
+mod termination {
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::signal::unix::{signal, SignalKind};
 
-    let client = ByoriDBClient::connect(config).await?;
+    struct State {
+        requested: bool,
+        app: Option<tauri::AppHandle>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State {
+        requested: false,
+        app: None,
+    });
+    /// How long a start-up that was told to stop may take to reach the event loop.
+    const STARTUP_GRACE: Duration = Duration::from_secs(10);
 
-    let mut guard = state.client.lock().await;
-    *guard = Some(client);
-
-    info!("Connected successfully");
-    Ok(())
-}
-
-#[tauri::command]
-async fn disconnect(state: State<'_, AppState>) -> Result<(), TauriError> {
-    info!("Disconnecting...");
-
-    let mut guard = state.client.lock().await;
-    if let Some(client) = guard.take() {
-        client.disconnect().await?;
+    fn state() -> std::sync::MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    info!("Disconnected");
-    Ok(())
-}
-
-#[tauri::command]
-async fn execute_query(
-    query: String,
-    state: State<'_, AppState>,
-) -> Result<QueryResult, TauriError> {
-    info!("Executing query: {}", query);
-
-    // Create a fresh cancellation token for this query
-    let token = CancellationToken::new();
-    {
-        let mut cancel_guard = state.query_cancel.lock().await;
-        *cancel_guard = Some(token.clone());
+    pub fn install() {
+        // Registered here, synchronously; only the waiting happens in the task.
+        let stream = tauri::async_runtime::block_on(async { signal(SignalKind::terminate()) });
+        let Ok(mut stream) = stream else {
+            return;
+        };
+        tauri::async_runtime::spawn(async move {
+            if stream.recv().await.is_none() {
+                return;
+            }
+            let app = {
+                let mut state = state();
+                state.requested = true;
+                state.app.clone()
+            };
+            if let Some(app) = app {
+                return app.exit(0);
+            }
+            // Still starting: `main` and `ready` leave as soon as they see the request.
+            // A start-up that hangs must not make the app immune to SIGTERM.
+            tokio::time::sleep(STARTUP_GRACE).await;
+            if state().app.is_none() {
+                byori_studio::runtime::kill_children_of(std::process::id());
+                byori_studio::render::remove_partial_outputs();
+                std::process::exit(0);
+            }
+        });
     }
 
-    let mut guard = state.client.lock().await;
-    let client = guard
-        .as_mut()
-        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
-
-    // Race the query against the cancellation token
-    let result = tokio::select! {
-        r = client.execute(&query) => r,
-        _ = token.cancelled() => Err(ClientError::Query("Query cancelled by user".to_string())),
-    };
-
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
+    pub fn requested() -> bool {
+        state().requested
     }
 
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn cancel_query(state: State<'_, AppState>) -> Result<(), TauriError> {
-    let mut cancel_guard = state.query_cancel.lock().await;
-    if let Some(token) = cancel_guard.take() {
-        token.cancel();
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, TauriError> {
-    let mut guard = state.client.lock().await;
-    let client = guard
-        .as_mut()
-        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
-
-    let result = client.get_spaces().await;
-
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn get_schema(state: State<'_, AppState>) -> Result<SchemaInfo, TauriError> {
-    let mut guard = state.client.lock().await;
-    let client = guard
-        .as_mut()
-        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
-
-    let result = client.get_schema().await;
-
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-
-    Ok(result?)
-}
-
-#[tauri::command]
-async fn test_connection(host: String, port: u32) -> Result<bool, TauriError> {
-    info!("Testing connection to {}:{}", host, port);
-    client_test_connection(&host, port)
-        .await
-        .map_err(Into::into)
-}
-
-/// Execute a DDL/DML statement that returns no rows (CREATE, DROP, ALTER, etc.)
-#[tauri::command]
-async fn execute_statement(
-    statement: String,
-    state: State<'_, AppState>,
-) -> Result<(), TauriError> {
-    info!("Executing statement: {}", statement);
-    let mut guard = state.client.lock().await;
-    let client = guard
-        .as_mut()
-        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
-    let result = client.execute(&statement).await;
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-    result?;
-    Ok(())
-}
-
-/// Get index list for a tag or edge: SHOW TAG/EDGE INDEXES
-#[tauri::command]
-async fn get_indexes(
-    kind: String, // "tag" or "edge"
-    name: String,
-    state: State<'_, AppState>,
-) -> Result<QueryResult, TauriError> {
-    let query = if kind == "tag" {
-        format!("SHOW TAG INDEXES ON {}", name)
-    } else {
-        format!("SHOW EDGE INDEXES ON {}", name)
-    };
-    let mut guard = state.client.lock().await;
-    let client = guard
-        .as_mut()
-        .ok_or_else(|| TauriError::from(ClientError::NotConnected))?;
-    let result = client.execute(&query).await;
-    if matches!(result, Err(ClientError::SessionExpired)) {
-        *guard = None;
-    }
-    Ok(result?)
-}
-
-/// Fetch Prometheus metrics text. Tauri WebView blocks cross-origin fetch on
-/// macOS WKWebView ("TypeError: Load failed"), so we proxy via Rust.
-#[tauri::command]
-async fn fetch_metrics(host: String, port: u32) -> Result<String, TauriError> {
-    let url = format!("http://{}:{}/metrics", host, port);
-    info!("Fetching metrics from {}", url);
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(TauriError::new(
-            "TRANSPORT",
-            format!("HTTP {}", resp.status().as_u16()),
-        ));
-    }
-    resp.text()
-        .await
-        .map_err(|e| TauriError::new("TRANSPORT", e.to_string()))
-}
-
-/// Service name under which connection passwords are stored in the OS keychain.
-const KEYRING_SERVICE: &str = "byoridb-studio";
-
-fn keyring_entry(key: &str) -> Result<keyring::Entry, TauriError> {
-    keyring::Entry::new(KEYRING_SERVICE, key)
-        .map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
-}
-
-/// Store a connection password in the OS keychain, keyed by `host:port:user`.
-#[tauri::command]
-fn save_password(key: String, password: String) -> Result<(), TauriError> {
-    keyring_entry(&key)?
-        .set_password(&password)
-        .map_err(|e| TauriError::new("KEYCHAIN", e.to_string()))
-}
-
-/// Retrieve a stored password, or `None` if nothing is saved for this key.
-#[tauri::command]
-fn get_password(key: String) -> Result<Option<String>, TauriError> {
-    match keyring_entry(&key)?.get_password() {
-        Ok(p) => Ok(Some(p)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(TauriError::new("KEYCHAIN", e.to_string())),
+    /// From here on the signal quits through the event loop (`RunEvent::Exit`).
+    pub fn ready(app: tauri::AppHandle) {
+        let mut state = state();
+        if state.requested {
+            app.exit(0);
+        }
+        state.app = Some(app);
     }
 }
 
-/// Remove a stored password. Treats "not found" as success (idempotent).
-#[tauri::command]
-fn delete_password(key: String) -> Result<(), TauriError> {
-    match keyring_entry(&key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(TauriError::new("KEYCHAIN", e.to_string())),
+/// Startup problems are shown to the user instead of crashing silently.
+fn fail(message: &str) -> ! {
+    tracing::error!("{message}");
+    // A diagnosis run has nobody to dismiss a dialog.
+    if let Some(path) = self_test::target() {
+        self_test::startup_failure(&path, message);
+        std::process::exit(1);
     }
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Byori Studio를 시작할 수 없습니다")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(1);
 }
 
 fn main() {
+    #[cfg(unix)]
+    termination::install();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("byoridb_studio=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "byori_studio=info".into()),
         )
         .init();
-
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .manage(AppState {
-            client: Arc::new(Mutex::new(None)),
-            query_cancel: Arc::new(Mutex::new(None)),
+    // An app opened from Finder has no shell PATH; FFmpeg and the CLIs must still be found.
+    byori_studio::runtime::extend_process_path();
+    let service = match tauri::async_runtime::block_on(StudioService::start(None, Host::App)) {
+        Ok(service) => service,
+        Err(error) => fail(&error),
+    };
+    // Told to stop while the service was starting: there is no window to open any more.
+    #[cfg(unix)]
+    if termination::requested() {
+        service.shutdown();
+        byori_studio::runtime::kill_children_of(std::process::id());
+        byori_studio::render::remove_partial_outputs();
+        std::process::exit(0);
+    }
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            let demo = app.path().resource_dir()?.join("demo");
+            if demo.is_dir() {
+                std::env::set_var("BYORI_STUDIO_DEMO_DIR", demo);
+            }
+            // The window is declared in tauri.conf.json with `create: false` and opened here,
+            // so a diagnosis run can attach its collector before the first page load.
+            let config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("tauri.conf.json에 창 설정이 없습니다")?;
+            let handle = app.handle().clone();
+            let mut window = tauri::WebviewWindowBuilder::from_config(&handle, &config)?;
+            let diagnosis = self_test::target();
+            if let Some(path) = diagnosis.clone() {
+                window = self_test::attach(window, handle.clone(), path);
+            }
+            let window = window.build()?;
+            if diagnosis.is_some() {
+                self_test::bring_forward(&window);
+                // Once more when the app has finished launching: an activation asked for
+                // during start-up is dropped when another app is in front.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    self_test::bring_forward(&window);
+                });
+            }
+            #[cfg(unix)]
+            termination::ready(handle);
+            Ok(())
         })
+        .manage(service.connection.clone())
+        .manage(service)
         .invoke_handler(tauri::generate_handler![
-            connect,
-            disconnect,
-            execute_query,
-            cancel_query,
-            get_spaces,
-            get_schema,
-            test_connection,
-            execute_statement,
-            get_indexes,
-            fetch_metrics,
-            save_password,
-            get_password,
-            delete_password,
+            studio_connection,
+            studio_open_files,
+            studio_save_file,
+            studio_reveal_file
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => app.run(|handle, event| {
+            // Agents, speech tools and a Studio-started database must not outlive the window.
+            if let tauri::RunEvent::Exit = event {
+                handle.state::<StudioService>().shutdown();
+                // A running FFmpeg export is a plain child that nothing drops at exit.
+                byori_studio::runtime::kill_children_of(std::process::id());
+                byori_studio::render::remove_partial_outputs();
+            }
+        }),
+        Err(error) => fail(&format!("Byori Studio 창을 열 수 없습니다: {error}")),
+    }
 }

@@ -5,51 +5,53 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
+  verify:
     runs-on: macos-latest
-
+    timeout-minutes: 60
+    env:
+      # brew: only install what is asked for.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-
-      - name: Install frontend deps
-        run: npm ci
-
-      - name: Lint (ESLint)
-        run: npm run lint
-
-      - name: Format check (Prettier)
-        run: npm run format:check
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: Test frontend
-        run: npm test
-
-      - name: Format check (rustfmt)
-        run: cargo fmt --check
-        working-directory: src-tauri
-
-      - name: Lint (clippy)
-        run: cargo clippy --all-targets --no-default-features -- -D clippy::correctness -W clippy::style -W clippy::perf
-        working-directory: src-tauri
-
-      - name: Test backend
-        run: cargo test --no-default-features
-        working-directory: src-tauri
+          # Keep the compiled dependencies when a test fails, so the next push to the
+          # same pull request does not rebuild them from nothing.
+          cache-on-failure: true
+      # The renderer and the integration tests run the real ffmpeg/ffprobe.
+      - name: Install FFmpeg
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          ffmpeg -hide_banner -version | head -n 1
+          ffprobe -hide_banner -version | head -n 1
+      - run: npm ci
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      # Frontend tests, Rust tests, the real-service integration tests and the production build.
+      # The tests start their own services on free ports with their own data folders; the
+      # variable keeps anything else away from the runner's home as well.
+      - name: Verify
+        run: npm run verify
+        env:
+          BYORI_STUDIO_HOME: ${{ runner.temp }}/byori-studio-home
+      # After verify: the desktop binary embeds the built frontend (dist/).
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

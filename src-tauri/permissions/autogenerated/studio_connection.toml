@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-studio-connection"
+description = "Enables the studio_connection command without any pre-configured scope."
+commands.allow = ["studio_connection"]
+
+[[permission]]
+identifier = "deny-studio-connection"
+description = "Denies the studio_connection command without any pre-configured scope."
+commands.deny = ["studio_connection"]

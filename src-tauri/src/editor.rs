@@ -1,0 +1,9600 @@
+use crate::{catalog, media, render};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Every edit is in the autosave (written beside it and renamed) before it is
+/// answered, so a killed process loses no answered edit. With deferred syncing
+/// (`Editor::defer_saves`) only the flush to the device waits (see `Unsynced`): this
+/// long after the last edit, so a burst of edits (a drag) is one flush once it
+/// pauses ...
+pub const SAVE_IDLE: Duration = Duration::from_millis(300);
+/// ... and no later than this after the first edit that is not flushed. This bounds
+/// what a power cut or a kernel panic can lose: the edits of about the last second.
+/// A normal quit, a project switch, `project.save`, the end of an agent job and the
+/// start of a command that keeps the editor busy (`SLOW_COMMANDS`) flush at once.
+pub const SAVE_LATEST: Duration = Duration::from_secs(1);
+/// Commands that probe or transcode files while they hold the editor; the edits
+/// before them are flushed to the device first.
+const SLOW_COMMANDS: [&str; 7] = [
+    "media.import",
+    "media.importAndAdd",
+    "media.reprobe",
+    "media.relink",
+    "project.demo",
+    "edit.freeze",
+    "color.importLut",
+];
+
+/// One undo/redo state: the project without its waveforms. A clip that is the same
+/// in neighbouring states is one allocation shared between them, so a history of a
+/// long timeline costs about one copy plus the clips each step changed.
+struct Snapshot {
+    /// The project without `clips`.
+    rest: Value,
+    clips: Vec<Arc<Value>>,
+}
+
+impl Snapshot {
+    fn of(mut project: Value, near: Option<&Snapshot>) -> Self {
+        let clips = match project.get_mut("clips").map(Value::take) {
+            Some(Value::Array(clips)) => clips,
+            _ => vec![],
+        };
+        let known: HashMap<&str, &Arc<Value>> = near
+            .into_iter()
+            .flat_map(|near| &near.clips)
+            .filter_map(|clip| Some((clip["id"].as_str()?, clip)))
+            .collect();
+        let clips = clips
+            .into_iter()
+            .map(
+                |clip| match clip["id"].as_str().and_then(|id| known.get(id)) {
+                    Some(shared) if ***shared == clip => Arc::clone(shared),
+                    _ => Arc::new(clip),
+                },
+            )
+            .collect();
+        Self {
+            rest: project,
+            clips,
+        }
+    }
+
+    fn project(&self) -> Value {
+        let mut project = self.rest.clone();
+        project["clips"] = Value::Array(self.clips.iter().map(|clip| (**clip).clone()).collect());
+        project
+    }
+}
+
+/// Replaces `path` whole: written beside it, then renamed. With `sync` the data is
+/// flushed to the device before the rename; without, it is in the system's cache,
+/// which a killed process keeps and a power cut may not.
+fn atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("저장 위치가 올바르지 않습니다.")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+        file.write_all(data).map_err(|e| e.to_string())?;
+        if sync {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&temporary, path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// What `atomic_write` left beside `current.json` and the stored projects when
+/// the process died between writing and renaming (`current.tmp-<uuid>`,
+/// `projects/<id>.tmp-<uuid>`): never a project, and nothing else removes it.
+/// For startup only, when this is the one process using `root`.
+fn remove_abandoned_writes(root: &Path) {
+    for folder in [root.to_path_buf(), root.join("projects")] {
+        for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let abandoned = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| extension.strip_prefix("tmp-"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+            if abandoned && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The latest state of the open project that is in its autosave (`current.json`)
+/// but not on the device yet. Shared with the service, which flushes it without
+/// waiting for the editor: a command that keeps the editor busy cannot hold a flush
+/// back, not even at shutdown.
+///
+/// Between two flushes only the autosave is replaced, without waiting for the
+/// device. The stored project file is replaced by a flush alone, and only by a copy
+/// that is on the device already. So a killed process finds every answered edit in
+/// the autosave, and after a power cut the stored file is whole and at most
+/// `SAVE_LATEST` old, whatever became of the autosave (`Editor::new` falls back to
+/// the stored projects when it cannot read the autosave).
+#[derive(Default)]
+pub struct Unsynced {
+    waiting: std::sync::Mutex<Option<Waiting>>,
+    /// Held while the files are replaced by a flush, so that two flushes cannot
+    /// leave the older state in them.
+    flushing: std::sync::Mutex<()>,
+    /// The last flush failed. Until one succeeds the editor flushes every edit
+    /// itself, so that an edit that cannot be stored is refused instead of piling up.
+    failed: std::sync::atomic::AtomicBool,
+}
+struct Waiting {
+    /// When the first and the latest write that is not flushed yet were made.
+    first: Instant,
+    latest: Instant,
+    /// The stored project file, the autosave, and what both are to hold.
+    stored: PathBuf,
+    autosave: PathBuf,
+    data: Vec<u8>,
+}
+impl Unsynced {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Option<Waiting>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn flushing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.flushing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Notes that `autosave` holds `data` now, and `stored` does not yet.
+    fn note(&self, stored: PathBuf, autosave: PathBuf, data: &[u8]) {
+        let now = Instant::now();
+        let mut waiting = self.waiting();
+        match waiting.as_mut() {
+            Some(entry) => {
+                entry.latest = now;
+                entry.stored = stored;
+                entry.autosave = autosave;
+                entry.data.clear();
+                entry.data.extend_from_slice(data);
+            }
+            None => {
+                *waiting = Some(Waiting {
+                    first: now,
+                    latest: now,
+                    stored,
+                    autosave,
+                    data: data.to_vec(),
+                })
+            }
+        }
+    }
+
+    /// Whether nothing waits for a flush and none is under way.
+    pub fn is_empty(&self) -> bool {
+        let _flushing = self.flushing();
+        self.waiting().is_none()
+    }
+
+    /// Whether writes are waiting and it is time to flush them.
+    pub fn due(&self) -> bool {
+        self.waiting().as_ref().is_some_and(|waiting| {
+            waiting.latest.elapsed() >= SAVE_IDLE || waiting.first.elapsed() >= SAVE_LATEST
+        })
+    }
+
+    /// Puts what waits on the device, if anything: the stored project file is
+    /// replaced by a flushed copy, then the autosave is flushed as it is now (it
+    /// holds this state or a later one). What could not be flushed keeps waiting.
+    pub fn sync(&self) -> Result<(), String> {
+        let _flushing = self.flushing();
+        let Some(taken) = self.waiting().take() else {
+            return Ok(());
+        };
+        let flushed = atomic_write(&taken.stored, &taken.data, true).and_then(|()| {
+            std::fs::File::open(&taken.autosave)
+                .and_then(|autosave| autosave.sync_all())
+                .map_err(|e| format!("{}: {e}", taken.autosave.display()))
+        });
+        self.failed
+            .store(flushed.is_err(), std::sync::atomic::Ordering::Relaxed);
+        if flushed.is_err() {
+            let mut waiting = self.waiting();
+            match waiting.as_mut() {
+                // An edit made meanwhile carries a later state of the same project.
+                Some(later) => later.first = later.first.min(taken.first),
+                None => *waiting = Some(taken),
+            }
+        }
+        flushed
+    }
+}
+
+pub struct Editor {
+    root: PathBuf,
+    project: Value,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    jobs: render::RenderJobs,
+    preview_assets: HashMap<String, PathBuf>,
+    notice: Option<String>,
+    file_path: Option<PathBuf>,
+    /// Waveforms by media path. History snapshots are stored without them.
+    waveforms: HashMap<String, Value>,
+    /// Derived media state (waveform, proxy, missing) changed without a revision.
+    derived_changed: bool,
+    /// Edits are written at once but flushed to the device by `flush` (the service
+    /// calls it when `save_due`). Off unless `defer_saves` was called.
+    deferred: bool,
+    /// What `flush` has to flush.
+    unsynced: Arc<Unsynced>,
+    /// The serialized project of the last write; kept for its allocation.
+    save_buffer: Vec<u8>,
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        // The last resort; the service flushes when it shuts down.
+        if let Err(error) = self.flush() {
+            tracing::error!("프로젝트를 저장하지 못했습니다: {error}");
+        }
+    }
+}
+
+pub const SCHEMA_VERSION: u64 = 3;
+const DEFAULT_PROJECT_NAME: &str = "새 프로젝트";
+/// The names a project has when the user did not give it one: this one and the
+/// one the home screen creates projects under.
+const UNNAMED_PROJECTS: [&str; 2] = [DEFAULT_PROJECT_NAME, "이름 없는 프로젝트"];
+const FILTERS: &[&str] = &["none", "cinematic", "warm", "cool", "mono", "vintage"];
+pub const TRANSITIONS: &[&str] = &[
+    "fade",
+    "dissolve",
+    "wipeLeft",
+    "wipeRight",
+    "wipeUp",
+    "wipeDown",
+    "slideLeft",
+    "slideRight",
+    "zoom",
+];
+pub const BLEND_MODES: &[&str] = &[
+    "normal", "multiply", "screen", "overlay", "darken", "lighten", "add",
+];
+pub const EASINGS: &[&str] = &["linear", "easeIn", "easeOut", "easeInOut", "hold"];
+const CLIP_FIELDS: &[&str] = &[
+    "name",
+    "trackId",
+    "mediaId",
+    "start",
+    "duration",
+    "sourceIn",
+    "speed",
+    "reverse",
+    "volume",
+    "fadeIn",
+    "fadeOut",
+    "audioFadeIn",
+    "audioFadeOut",
+    "transform",
+    "color",
+    "text",
+    "filter",
+    "transitionIn",
+    "transitionOut",
+    "keyframes",
+    "crop",
+    "mask",
+    "chromaKey",
+    "audio",
+    "stabilize",
+    "groupId",
+    "blendMode",
+];
+
+pub fn number(v: &Value, key: &str, fallback: f64) -> f64 {
+    v.get(key).and_then(Value::as_f64).unwrap_or(fallback)
+}
+pub fn string<'a>(v: &'a Value, key: &str, fallback: &'a str) -> &'a str {
+    v.get(key).and_then(Value::as_str).unwrap_or(fallback)
+}
+
+pub fn empty_project(name: &str, width: u64, height: u64, fps: f64) -> Value {
+    json!({"id":media::id("project"),"schemaVersion":SCHEMA_VERSION,"name":name,"revision":0,"width":width,"height":height,
+        "fps":fps,"background":"#111111","media":[],"clips":[],"markers":[],"notes":[],
+        "concept":{"audience":"","message":"","appeal":"","direction":""},
+        "tracks":[{"id":"video-1","name":"영상 1","kind":"video","muted":false,"hidden":false,"locked":false},
+          {"id":"audio-1","name":"오디오 1","kind":"audio","muted":false,"hidden":false,"locked":false},
+          {"id":"text-1","name":"텍스트 1","kind":"text","muted":false,"hidden":false,"locked":false}],
+        "updatedAt":media::now()})
+}
+
+/// Whether a project is still exactly what `project.new` made without a name of
+/// its own, whatever its size and frame rate (and its revision: an edit that was
+/// undone leaves it untouched too).
+fn untouched(p: &Value) -> bool {
+    if !UNNAMED_PROJECTS.contains(&string(p, "name", "")) {
+        return false;
+    }
+    let mut fresh = empty_project(DEFAULT_PROJECT_NAME, 1920, 1080, 30.0);
+    let mut p = p.clone();
+    for own in [
+        "id",
+        "name",
+        "revision",
+        "updatedAt",
+        "width",
+        "height",
+        "fps",
+    ] {
+        fresh[own] = Value::Null;
+        p[own] = Value::Null;
+    }
+    p == fresh
+}
+
+fn safe_project_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() < 100
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn load_project(path: &Path) -> Result<Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut project: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    migrate_project(&mut project)?;
+    validate_project(&project)?;
+    Ok(project)
+}
+
+fn recent_valid_project(root: &Path) -> Option<Value> {
+    std::fs::read_dir(root.join("projects"))
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter_map(|entry| load_project(&entry.path()).ok())
+        .max_by_key(|p| p["updatedAt"].as_u64().unwrap_or(0))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(from)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+// Deletes the freeze-frame stills in a project's asset folder whose name the
+// given project text does not mention.
+fn remove_unreferenced_frames(assets: &Path, references: &str) {
+    for entry in std::fs::read_dir(assets.join("frames"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        if path.extension().is_some_and(|e| e == "png") && !references.contains(&*stem) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+// edit.freeze stills that no saved project mentions any more (the freeze was
+// undone). For startup only, when there is no undo history that could bring one
+// back. Like the service's cleanup, an unreadable autosave that was set aside
+// still counts as a reference, and an unreadable file means nothing is deleted.
+fn remove_orphaned_frames(root: &Path) {
+    let listed = |folder: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect()
+    };
+    let stored = listed(&root.join("projects"));
+    let mut references = String::new();
+    for file in stored.iter().chain(&listed(root)).filter(|path| {
+        path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".json"))
+    }) {
+        match std::fs::read(file) {
+            Ok(bytes) => references.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(_) => return,
+        }
+    }
+    for assets in stored.iter().filter(|path| path.is_dir()) {
+        remove_unreferenced_frames(assets, &references);
+    }
+}
+
+// A waveform recorded as empty could not be decoded then (a slow disk, a
+// timeout); opening the project lets the background work try once more.
+fn retry_failed_waveforms(p: &mut Value) {
+    for item in p["media"].as_array_mut().into_iter().flatten() {
+        if item["waveform"].as_array().is_some_and(Vec::is_empty) {
+            item.as_object_mut().unwrap().remove("waveform");
+        } else if let Some(peaks) = item.get_mut("waveform").and_then(Value::as_array_mut) {
+            // Stored before peaks were rounded: a fifth of the text, the same bars.
+            for peak in peaks {
+                if let Some(level) = peak.as_f64() {
+                    *peak = json!(round_peak(level));
+                }
+            }
+        }
+    }
+}
+
+/// A waveform peak as it is stored: three decimals are more than a clip's bars can
+/// show, and a float's full expansion made waveforms most of a project's size.
+fn round_peak(level: f64) -> f64 {
+    (level * 1000.0).round() / 1000.0
+}
+
+/// Names the content of a waveform (FNV-1a over its peaks as stored, in
+/// thousandths): the same peaks always get the same name, in every process, and a
+/// file that was replaced by another of the same length gets a different one. A
+/// client that keeps fetched peaks knows by it whether they are still the ones.
+fn waveform_id(peaks: &[Value]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for peak in peaks {
+        let stored = (peak.as_f64().unwrap_or(0.0) * 1000.0).round() as i64;
+        for byte in stored.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+/// Takes the waveforms out of a reply that carries the project (`omitWaveforms`):
+/// each media item says how many peaks it has in `waveformPeaks` and which ones in
+/// `waveformId` instead, and `media.waveform` returns them.
+pub fn omit_waveforms(reply: &mut Value) {
+    fn strip(project: &mut Value) {
+        for item in project
+            .get_mut("media")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            if let Some(Value::Array(peaks)) = item.remove("waveform") {
+                item.insert("waveformPeaks".into(), json!(peaks.len()));
+                item.insert("waveformId".into(), json!(waveform_id(&peaks)));
+            }
+        }
+    }
+    if let Some(project) = reply.get_mut("project") {
+        strip(project);
+    }
+    strip(reply);
+}
+
+// Points LUT and still-frame paths inside one project's asset folder at another's.
+fn move_assets(p: &mut Value, from: &Path, to: &Path) {
+    for item in p["media"].as_array_mut().into_iter().flatten() {
+        if let Some(rest) = item["path"]
+            .as_str()
+            .and_then(|s| Path::new(s).strip_prefix(from).ok())
+        {
+            item["path"] = json!(to.join(rest));
+        }
+    }
+    for clip in p["clips"].as_array_mut().into_iter().flatten() {
+        if let Some(path) = clip.pointer_mut("/color/lut/path") {
+            if let Some(rest) = path
+                .as_str()
+                .and_then(|s| Path::new(s).strip_prefix(from).ok())
+            {
+                *path = json!(to.join(rest));
+            }
+        }
+    }
+}
+
+// The same project apart from what is recomputed from disk for each media item.
+fn same_content(a: &Value, b: &Value) -> bool {
+    let strip = |p: &Value| {
+        let mut p = p.clone();
+        for item in p["media"].as_array_mut().into_iter().flatten() {
+            if let Some(item) = item.as_object_mut() {
+                for derived in ["missing", "proxy", "waveform"] {
+                    item.remove(derived);
+                }
+            }
+        }
+        // Opening a project bumps these without changing its content.
+        for stamp in ["revision", "updatedAt"] {
+            p[stamp] = Value::Null;
+        }
+        p
+    };
+    strip(a) == strip(b)
+}
+
+/// Upgrades a stored project in place to the current schema. Files written
+/// before schemaVersion existed are version 1.
+pub fn migrate_project(p: &mut Value) -> Result<(), String> {
+    if !p.is_object() {
+        return Err("프로젝트 파일 형식이 올바르지 않습니다.".into());
+    }
+    let version = match p.get("schemaVersion") {
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .filter(|v| *v >= 1)
+            .ok_or("프로젝트 버전 정보가 올바르지 않습니다.")?,
+    };
+    if version > SCHEMA_VERSION {
+        return Err("더 새로운 버전의 Byori Studio에서 만든 프로젝트입니다. 앱을 업데이트한 뒤 열어 주세요.".into());
+    }
+    if version < 2 {
+        migrate_v1(p);
+    }
+    if version < 3 {
+        migrate_v2(p);
+    }
+    p["schemaVersion"] = json!(SCHEMA_VERSION);
+    Ok(())
+}
+
+// Older UI builds sent their own filter ids; map them to the built-in ones.
+// `original`, `vivid` and `soft` carried their look in the colour values only.
+pub(crate) fn legacy_filter(filter: &Value) -> &'static str {
+    match filter.as_str().unwrap_or("") {
+        "cinema" => "cinematic",
+        id => FILTERS
+            .iter()
+            .find(|f| **f == id)
+            .copied()
+            .unwrap_or("none"),
+    }
+}
+
+// Cuts a display name to the size short_text accepts, on a character boundary.
+fn shorten(name: &mut Value) {
+    if let Some(text) = name.as_str().filter(|s| s.len() > 1000) {
+        let mut end = 1000;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        *name = json!(text[..end]);
+    }
+}
+
+// v1 files were never checked for filter ids, transitions, markers or notes, and
+// older builds omitted some clip defaults. Repair what has an obvious meaning.
+fn migrate_v1(p: &mut Value) {
+    for key in ["markers", "notes"] {
+        if !p[key].is_array() {
+            p[key] = json!([]);
+        }
+    }
+    if !p["concept"].is_object() {
+        p["concept"] = json!({"audience":"","message":"","appeal":"","direction":""});
+    }
+    let markers = p["markers"].as_array_mut().unwrap();
+    markers.retain(|m| {
+        m.is_object()
+            && m["time"]
+                .as_f64()
+                .is_some_and(|t| (0.0..=86400.0).contains(&t))
+    });
+    for marker in markers {
+        if marker["id"].as_str().is_none_or(|id| id.is_empty()) {
+            marker["id"] = json!(media::id("marker"));
+        }
+        if !marker["label"].is_string() {
+            marker["label"] = json!("마커");
+        }
+        shorten(&mut marker["label"]);
+    }
+    p["notes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|note| note["body"].is_string());
+    for track in p["tracks"].as_array_mut().into_iter().flatten() {
+        if !track.is_object() {
+            continue;
+        }
+        for flag in ["muted", "hidden", "locked"] {
+            if !track[flag].is_boolean() {
+                track[flag] = json!(false);
+            }
+        }
+        if !track["name"].is_string() {
+            track["name"] = track["kind"].clone();
+        }
+        shorten(&mut track["name"]);
+    }
+    for clip in p["clips"].as_array_mut().into_iter().flatten() {
+        if !clip.is_object() {
+            continue;
+        }
+        let defaults = default_clip("", "클립", "", 0.0, 0.0);
+        for field in ["sourceIn", "speed", "volume", "fadeIn", "fadeOut"] {
+            if !clip[field].is_number() {
+                clip[field] = defaults[field].clone();
+            }
+        }
+        if !clip["reverse"].is_boolean() {
+            clip["reverse"] = json!(false);
+        }
+        if !clip["name"].is_string() {
+            clip["name"] = defaults["name"].clone();
+        }
+        shorten(&mut clip["name"]);
+        if !clip["keyframes"].is_array() {
+            clip["keyframes"] = json!([]);
+        }
+        for group in ["transform", "color"] {
+            if !clip[group].is_object() {
+                clip[group] = json!({});
+            }
+            for (key, value) in defaults[group].as_object().unwrap() {
+                if !clip[group][key].is_number() {
+                    clip[group][key] = value.clone();
+                }
+            }
+        }
+        // The UI used to store its own filter ids next to the colour values.
+        if let Some(filter) = clip.get_mut("filter") {
+            *filter = json!(legacy_filter(filter));
+        }
+        for transition in ["transitionIn", "transitionOut"] {
+            if clip.get(transition).is_some() && clip[transition]["type"] != "fade" {
+                clip[transition] = Value::Null;
+            }
+        }
+        fit_clip_fades(clip);
+    }
+}
+
+// Version 3 gave a video clip's sound its own fade (audioFadeIn/audioFadeOut).
+// A clip without them keeps fading its sound with fadeIn/fadeOut, which is what
+// every version 2 project did, so their output does not change. Nothing before
+// version 3 wrote the two fields; one found in an older file has no meaning.
+fn migrate_v2(p: &mut Value) {
+    for clip in p["clips"].as_array_mut().into_iter().flatten() {
+        if let Some(clip) = clip.as_object_mut() {
+            clip.remove(AUDIO_FADES[0].0);
+            clip.remove(AUDIO_FADES[1].0);
+        }
+    }
+}
+
+impl Editor {
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(root.join("projects")).map_err(|e| e.to_string())?;
+        let root = root.canonicalize().map_err(|e| e.to_string())?;
+        remove_abandoned_writes(&root);
+        let current = root.join("current.json");
+        let mut notice = None;
+        let project = match load_project(&current) {
+            Ok(project) => project,
+            Err(_) if std::fs::symlink_metadata(&current).is_err() => {
+                empty_project(DEFAULT_PROJECT_NAME, 1920, 1080, 30.0)
+            }
+            Err(error) => {
+                // Never start from, or silently discard, an unreadable autosave.
+                let kept = format!("current.json.corrupt-{}", media::now());
+                let kept = match std::fs::rename(&current, root.join(&kept)) {
+                    Ok(()) => format!("읽지 못한 파일은 {kept}(으)로 보관했습니다."),
+                    Err(e) => format!("읽지 못한 파일을 보관하지 못했습니다: {e}"),
+                };
+                let recovered = recent_valid_project(&root);
+                notice = Some(match &recovered {
+                    Some(p) => format!(
+                        "저장된 작업을 읽지 못해 가장 최근 프로젝트 '{}'(으)로 복구했습니다. {kept} ({error})",
+                        string(p, "name", "")
+                    ),
+                    None => format!(
+                        "저장된 작업을 읽지 못해 새 프로젝트로 시작했습니다. {kept} ({error})"
+                    ),
+                });
+                recovered.unwrap_or_else(|| empty_project(DEFAULT_PROJECT_NAME, 1920, 1080, 30.0))
+            }
+        };
+        let mut project = project;
+        retry_failed_waveforms(&mut project);
+        let mut editor = Self {
+            root,
+            project,
+            undo: vec![],
+            redo: vec![],
+            jobs: render::RenderJobs::default(),
+            preview_assets: HashMap::new(),
+            notice,
+            file_path: None,
+            waveforms: HashMap::new(),
+            derived_changed: false,
+            deferred: false,
+            unsynced: Arc::default(),
+            save_buffer: Vec::new(),
+        };
+        editor.write(true)?;
+        remove_orphaned_frames(&editor.root);
+        editor.refresh_missing();
+        Ok(editor)
+    }
+
+    /// Flags media whose source file is gone and media that have a proxy file.
+    /// Derived state: no revision change.
+    fn refresh_missing(&mut self) -> bool {
+        let mut changed = false;
+        for item in self.project["media"].as_array_mut().into_iter().flatten() {
+            let missing = !Path::new(string(item, "path", "")).is_file();
+            let id = string(item, "id", "");
+            // The service notes beside a proxy which file it shows; after a relink
+            // the old proxy does not count until it has been rebuilt. Without the
+            // note it does not count either: the service deletes such a proxy.
+            let proxy_file = media::proxy_path(&self.root, id);
+            let proxy =
+                safe_project_id(id) && media::proxy_is_of(&proxy_file, string(item, "path", ""));
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            for (flag, on) in [("missing", missing), ("proxy", proxy)] {
+                if on != (object.get(flag) == Some(&json!(true))) {
+                    changed = true;
+                }
+                if on {
+                    object.insert(flag.into(), json!(true));
+                } else {
+                    object.remove(flag);
+                }
+            }
+        }
+        self.derived_changed |= changed;
+        changed
+    }
+
+    /// Where the proxy of a media item of the open project lives, whether or not
+    /// it has been made yet. Write it under another name and rename it into place.
+    pub fn proxy_path(&self, media_id: &str) -> Option<PathBuf> {
+        let known = self.project["media"]
+            .as_array()?
+            .iter()
+            .any(|m| m["id"] == media_id);
+        (known && safe_project_id(media_id)).then(|| media::proxy_path(&self.root, media_id))
+    }
+
+    /// Media with sound whose waveform has not been computed: (id, path, duration).
+    /// Compute it outside the editor lock and hand it to `set_waveform`.
+    pub fn pending_waveforms(&self) -> Vec<(String, PathBuf, f64)> {
+        self.project["media"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["hasAudio"] == true && !m["waveform"].is_array() && m["missing"] != true)
+            .map(|m| {
+                (
+                    string(m, "id", "").to_owned(),
+                    PathBuf::from(string(m, "path", "")),
+                    number(m, "duration", 0.0),
+                )
+            })
+            .collect()
+    }
+
+    /// Fills in a waveform computed in the background: no revision, no undo entry.
+    /// `None` (nothing could be decoded) is recorded as empty so it is not retried.
+    /// Returns false when that media item is gone or now points at another file.
+    pub fn set_waveform(
+        &mut self,
+        media_id: &str,
+        path: &Path,
+        waveform: impl Into<Option<Vec<f32>>>,
+    ) -> Result<bool, String> {
+        let waveform: Vec<f64> = waveform
+            .into()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peak| round_peak(f64::from(peak)))
+            .collect();
+        let Some(item) = self.project["media"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .find(|m| m["id"] == media_id && Path::new(string(m, "path", "")) == path)
+        else {
+            return Ok(false);
+        };
+        let previous = std::mem::replace(&mut item["waveform"], json!(waveform));
+        if let Err(error) = self.persist() {
+            let item = self.project["media"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|m| m["id"] == media_id)
+                .unwrap();
+            if previous.is_null() {
+                item.as_object_mut().unwrap().remove("waveform");
+            } else {
+                item["waveform"] = previous;
+            }
+            return Err(error);
+        }
+        // History snapshots take their waveforms from here when they are restored.
+        self.waveforms
+            .insert(path.to_string_lossy().into_owned(), json!(waveform));
+        self.derived_changed = true;
+        Ok(true)
+    }
+
+    // Undo/redo snapshots would otherwise each hold a copy of every waveform.
+    fn without_waveforms(&mut self, mut snapshot: Value) -> Value {
+        for item in snapshot["media"].as_array_mut().into_iter().flatten() {
+            let path = string(item, "path", "").to_owned();
+            if let Some(waveform) = item.as_object_mut().and_then(|m| m.remove("waveform")) {
+                self.waveforms.insert(path, waveform);
+            }
+        }
+        snapshot
+    }
+
+    fn with_waveforms(&self, mut snapshot: Value) -> Value {
+        for item in snapshot["media"].as_array_mut().into_iter().flatten() {
+            if let Some(waveform) = self.waveforms.get(string(item, "path", "")) {
+                item["waveform"] = waveform.clone();
+            }
+        }
+        snapshot
+    }
+
+    fn project_file(&self, id: &str) -> PathBuf {
+        self.root.join("projects").join(format!("{id}.json"))
+    }
+
+    fn assets_dir(&self, id: &str) -> PathBuf {
+        self.root.join("projects").join(format!("{id}-assets"))
+    }
+
+    fn stored_project(&self, params: &Value) -> Result<(String, Value), String> {
+        let id = string(params, "id", "");
+        if !safe_project_id(id) {
+            return Err("프로젝트를 선택해 주세요.".into());
+        }
+        if self.project["id"] == id {
+            return Ok((id.to_owned(), self.project.clone()));
+        }
+        let bytes = std::fs::read(self.project_file(id))
+            .map_err(|_| "프로젝트를 찾을 수 없습니다.".to_string())?;
+        let mut project: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("프로젝트 파일을 읽을 수 없습니다: {e}"))?;
+        migrate_project(&mut project)?;
+        Ok((id.to_owned(), project))
+    }
+
+    /// The id of a stored project that is still exactly what `project.new` made
+    /// without a name of its own (whatever its size and frame rate): the open one
+    /// first, else the most recently touched.
+    fn untouched_project(&self) -> Option<String> {
+        if untouched(&self.project) {
+            return Some(self.project_id().to_owned());
+        }
+        // The open project was judged above as it is in memory. Its file may still
+        // hold what it was before edits that are waiting to be written.
+        let open = self.project_id().to_owned();
+        std::fs::read_dir(self.root.join("projects"))
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter_map(|entry| {
+                let mut p: Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                migrate_project(&mut p).ok()?;
+                let id = p["id"].as_str()?.to_owned();
+                // The file must be the one `replace` will write over.
+                (id != open
+                    && untouched(&p)
+                    && safe_project_id(&id)
+                    && entry.path() == self.project_file(&id))
+                .then(|| (p["updatedAt"].as_u64().unwrap_or(0), id))
+            })
+            .max()
+            .map(|(_, id)| id)
+    }
+
+    /// The stored projects that hold nothing: still exactly what `project.new` made
+    /// without a name of its own. Their revision does not matter: a new project
+    /// starts one past the project that was open before it, and an edit that was
+    /// undone leaves nothing behind either. Never the open one. As (id, bytes of
+    /// its file); for `storage.usage` and `storage.clean`.
+    pub fn empty_unnamed_projects(&self) -> Vec<(String, u64)> {
+        let open = self.project_id();
+        let mut found: Vec<(String, u64)> = std::fs::read_dir(self.root.join("projects"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter_map(|entry| {
+                let bytes = std::fs::read(entry.path()).ok()?;
+                let mut p: Value = serde_json::from_slice(&bytes).ok()?;
+                migrate_project(&mut p).ok()?;
+                let id = p["id"].as_str()?.to_owned();
+                (id != open
+                    && untouched(&p)
+                    && safe_project_id(&id)
+                    && entry.path() == self.project_file(&id))
+                .then_some((id, bytes.len() as u64))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Deletes the projects `empty_unnamed_projects` names, each looked at again
+    /// first. Returns how many were deleted and the bytes of their files.
+    pub fn delete_empty_unnamed_projects(&self) -> (u64, u64) {
+        let mut removed = (0, 0);
+        for (id, bytes) in self.empty_unnamed_projects() {
+            if std::fs::remove_file(self.project_file(&id)).is_ok() {
+                let _ = std::fs::remove_dir_all(self.assets_dir(&id));
+                removed = (removed.0 + 1, removed.1 + bytes);
+            }
+        }
+        removed
+    }
+
+    fn list_projects(&self) -> Result<Value, String> {
+        let mut list = vec![];
+        for entry in std::fs::read_dir(self.root.join("projects"))
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                if let Ok(stored) = serde_json::from_slice::<Value>(&bytes) {
+                    // The open project as it is now, saved yet or not.
+                    let p = if stored["id"] == self.project["id"] {
+                        &self.project
+                    } else {
+                        &stored
+                    };
+                    let mut item =
+                        json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]});
+                    if let Some((media_id, path)) = self.cover(p) {
+                        item["thumbnail"] = json!({"mediaId":media_id,"path":path});
+                    }
+                    // Nothing in it yet: the home screen leaves out the unnamed ones.
+                    let none = |key: &str| p[key].as_array().is_none_or(|list| list.is_empty());
+                    if none("clips") && none("media") {
+                        item["empty"] = json!(true);
+                    }
+                    list.push(item);
+                }
+            }
+        }
+        list.sort_by_key(|p| std::cmp::Reverse(p["updatedAt"].as_u64().unwrap_or(0)));
+        Ok(json!(list))
+    }
+
+    /// A thumbnail this app made: only files in the store's thumbnail folder are
+    /// offered for a project that is not open.
+    fn stored_thumbnail(&self, item: &Value) -> Option<PathBuf> {
+        let path = PathBuf::from(item["thumbnail"].as_str()?);
+        let ours = path.starts_with(self.root.join("thumbnails"))
+            && !path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir);
+        (ours && path.is_file()).then_some(path)
+    }
+
+    /// The picture that stands for a project: the earliest video or image clip whose
+    /// media already has a thumbnail. Nothing is generated here.
+    fn cover(&self, p: &Value) -> Option<(String, PathBuf)> {
+        let mut clips: Vec<&Value> = p["clips"]
+            .as_array()?
+            .iter()
+            .filter(|c| matches!(string(c, "kind", ""), "video" | "image"))
+            .collect();
+        clips.sort_by(|a, b| number(a, "start", 0.0).total_cmp(&number(b, "start", 0.0)));
+        let media = p["media"].as_array()?;
+        clips.iter().find_map(|clip| {
+            let item = media.iter().find(|m| m["id"] == clip["mediaId"])?;
+            Some((
+                item["id"].as_str()?.to_owned(),
+                self.stored_thumbnail(item)?,
+            ))
+        })
+    }
+
+    /// The thumbnail of a media item of any stored project, open or not, so a
+    /// project list can show the covers `project.list` names.
+    pub fn project_thumbnail(&self, project_id: &str, media_id: &str) -> Option<PathBuf> {
+        if !safe_project_id(project_id) {
+            return None;
+        }
+        let stored;
+        let project = if self.project["id"] == project_id {
+            &self.project
+        } else {
+            stored = serde_json::from_slice::<Value>(
+                &std::fs::read(self.project_file(project_id)).ok()?,
+            )
+            .ok()?;
+            &stored
+        };
+        let item = project["media"]
+            .as_array()?
+            .iter()
+            .find(|m| m["id"] == media_id)?;
+        self.stored_thumbnail(item)
+    }
+
+    /// App state lives in the store; its `exports` folder is ordinary output space
+    /// (it is where agents are told to write).
+    fn in_store(&self, path: &Path) -> bool {
+        // The target and some of its folders may not exist yet.
+        let path = path
+            .ancestors()
+            .find_map(|base| {
+                let resolved = base.canonicalize().ok()?;
+                Some(resolved.join(path.strip_prefix(base).ok()?))
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+        path.starts_with(&self.root) && !path.starts_with(self.root.join("exports"))
+    }
+
+    /// Files written on request must never replace app state or source assets.
+    fn guard_output(&self, path: &Path, params: &Value, known: bool) -> Result<(), String> {
+        if self.in_store(path) {
+            return Err("앱 저장소 안에는 저장할 수 없습니다. 다른 위치를 선택해 주세요.".into());
+        }
+        let media = self.project["media"].as_array().into_iter().flatten();
+        let clips = self.project["clips"].as_array().into_iter().flatten();
+        let mut sources = media.filter_map(|m| m["path"].as_str()).chain(
+            clips
+                .flat_map(|c| {
+                    [
+                        c["text"]["fontPath"].as_str(),
+                        c["color"]["lut"]["path"].as_str(),
+                    ]
+                })
+                .flatten(),
+        );
+        if sources.any(|source| media::same_path(Path::new(source), path)) {
+            return Err("원본 미디어·글꼴·LUT 파일은 덮어쓸 수 없습니다.".into());
+        }
+        if !known && params["overwrite"] != true && std::fs::symlink_metadata(path).is_ok() {
+            return Err(
+                "같은 이름의 파일이 이미 있습니다. 덮어쓰려면 확인이 필요합니다. (FILE_EXISTS)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn asset_path(&self, id: &str, thumbnail: bool) -> Option<PathBuf> {
+        if !thumbnail {
+            if let Some(path) = catalog::font_asset_path(&self.root, id) {
+                return Some(path);
+            }
+        }
+        if let Some(path) = self.preview_assets.get(id) {
+            return path.is_file().then(|| path.clone());
+        }
+        self.project["media"]
+            .as_array()?
+            .iter()
+            .find(|m| m["id"] == id)?
+            .get(if thumbnail { "thumbnail" } else { "path" })?
+            .as_str()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+    }
+
+    pub fn preview_snapshot(
+        &self,
+        params: &Value,
+        project_id: Option<&str>,
+    ) -> Result<(Value, PathBuf), String> {
+        self.expected(params)?;
+        if project_id.is_some_and(|id| self.project["id"].as_str() != Some(id)) {
+            return Err("미리보기 중 프로젝트가 변경되었습니다. (PREVIEW_STALE)".into());
+        }
+        Ok((self.project.clone(), self.root.clone()))
+    }
+
+    /// Files the editor is serving as preview assets (frames and precise-playback
+    /// videos); the storage cleaner leaves them alone.
+    pub fn preview_asset_paths(&self) -> Vec<PathBuf> {
+        self.preview_assets.values().cloned().collect()
+    }
+
+    pub fn register_preview_asset(&mut self, id: String, path: PathBuf) {
+        self.preview_assets.insert(id, path);
+    }
+
+    pub fn forget_preview_asset(&mut self, id: &str) {
+        self.preview_assets.remove(id);
+    }
+
+    /// Records a change of the open project in its files before the change is
+    /// answered. The flush to the device is left to `flush` when saves are deferred,
+    /// unless the last flush failed.
+    fn persist(&mut self) -> Result<(), String> {
+        let failing = self
+            .unsynced
+            .failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.write(!self.deferred || failing)
+    }
+
+    /// Writes the open project, each file replaced whole (written beside it, renamed):
+    /// with `sync` to its stored file and the autosave, both flushed to the device;
+    /// without, to the autosave alone and without waiting for the device.
+    fn write(&mut self, sync: bool) -> Result<(), String> {
+        let id = string(&self.project, "id", "");
+        if !safe_project_id(id) {
+            return Err("프로젝트 ID가 올바르지 않습니다.".into());
+        }
+        let (stored, autosave) = (self.project_file(id), self.root.join("current.json"));
+        let mut data = std::mem::take(&mut self.save_buffer);
+        data.clear();
+        let written = serde_json::to_writer(&mut data, &self.project)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                if !sync {
+                    // In the autosave before the answer; the stored file follows
+                    // with the flush (see `Unsynced`).
+                    atomic_write(&autosave, &data, false)?;
+                    self.unsynced.note(stored, autosave, &data);
+                    return Ok(());
+                }
+                // No flush of an earlier state may land in the files after this one.
+                let _flushing = self.unsynced.flushing();
+                atomic_write(&stored, &data, true)?;
+                atomic_write(&autosave, &data, true)?;
+                // What waited is an earlier state of this project: the project that
+                // was open before was flushed when it was left.
+                *self.unsynced.waiting() = None;
+                self.unsynced
+                    .failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            });
+        self.save_buffer = data;
+        written
+    }
+
+    /// Edits still reach the project's files before they are answered, but return
+    /// without waiting for the device. The caller must call `flush` (or the shared
+    /// `unsynced().sync()`) whenever `save_due`; see `SAVE_IDLE` and `SAVE_LATEST`
+    /// for what is at stake.
+    pub fn defer_saves(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Whether written changes are waiting and it is time to flush them.
+    pub fn save_due(&self) -> bool {
+        self.unsynced.due()
+    }
+
+    /// The files that wait for a flush, to flush them without holding the editor.
+    pub fn unsynced(&self) -> Arc<Unsynced> {
+        self.unsynced.clone()
+    }
+
+    /// Flushes the changes that are in the files but not on the device yet, if any.
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.unsynced.sync()
+    }
+
+    fn expected(&self, params: &Value) -> Result<(), String> {
+        if params.get("expectedRevision").is_some() && params["expectedRevision"].as_u64().is_none()
+        {
+            return Err("expectedRevision 값은 0 이상의 정수여야 합니다.".into());
+        }
+        if let Some(expected) = params.get("expectedRevision").and_then(Value::as_u64) {
+            if self.project["revision"].as_u64() != Some(expected) {
+                return Err("프로젝트가 다른 작업에 의해 변경되었습니다. 최신 상태를 불러온 뒤 다시 시도해 주세요. (REVISION_CONFLICT)".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, next: Value) -> Result<Value, String> {
+        validate_project(&next)?;
+        self.commit_valid(next)
+    }
+
+    /// `commit` for a project that `mutate` returned just now: it validated it.
+    fn commit_valid(&mut self, mut next: Value) -> Result<Value, String> {
+        next["revision"] = json!(self.project["revision"].as_u64().unwrap_or(0) + 1);
+        next["updatedAt"] = json!(media::now());
+        let before = std::mem::replace(&mut self.project, next);
+        if let Err(error) = self.persist() {
+            self.project = before;
+            return Err(error);
+        }
+        let before = self.without_waveforms(before);
+        // A waveform this edit dropped (reprobe, relink) is stale: history must not
+        // bring it back for that file.
+        for item in self.project["media"].as_array().into_iter().flatten() {
+            if !item["waveform"].is_array() {
+                self.waveforms.remove(string(item, "path", ""));
+            }
+        }
+        let before = Snapshot::of(before, self.undo.last());
+        self.undo.push(before);
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.refresh_missing();
+        Ok(self.project.clone())
+    }
+
+    fn replace(&mut self, mut project: Value) -> Result<Value, String> {
+        validate_project(&project)?;
+        // The project being left keeps its last edits, or stays open.
+        self.flush()?;
+        retry_failed_waveforms(&mut project);
+        project["revision"] = json!(self.project["revision"].as_u64().unwrap_or(0) + 1);
+        project["updatedAt"] = json!(media::now());
+        let before = std::mem::replace(&mut self.project, project);
+        if let Err(e) = self.write(true) {
+            self.project = before;
+            return Err(e);
+        }
+        self.undo.clear();
+        self.redo.clear();
+        self.waveforms.clear();
+        self.file_path = None;
+        self.derived_changed = false;
+        self.refresh_missing();
+        Ok(self.project.clone())
+    }
+
+    /// Runs one command. With `omitWaveforms: true` a reply that carries the project
+    /// leaves the waveforms out (see `omit_waveforms`).
+    pub async fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let slim = params["omitWaveforms"] == true;
+        let mut reply = self.run(method, params).await?;
+        if slim {
+            omit_waveforms(&mut reply);
+        }
+        Ok(reply)
+    }
+
+    /// The id of the open project.
+    pub fn project_id(&self) -> &str {
+        string(&self.project, "id", "")
+    }
+
+    async fn run(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.expected(&params)?;
+        if SLOW_COMMANDS.contains(&method) {
+            self.flush()?;
+        }
+        match method {
+            "media.waveform" => {
+                let id = required(&params, "id")?;
+                let item = self.project["media"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|m| m["id"] == id)
+                    .ok_or("소재를 찾을 수 없습니다.")?;
+                // null until the background work has filled it in.
+                let mut reply = json!({"id":id,"waveform":item["waveform"]});
+                if let Some(peaks) = item["waveform"].as_array() {
+                    reply["waveformId"] = json!(waveform_id(peaks));
+                }
+                Ok(reply)
+            }
+            "project.get" => {
+                self.refresh_missing();
+                // Only a polling client's read counts as having seen derived changes.
+                let conditional = params.get("ifRevision").is_some();
+                if !self.derived_changed
+                    && params["ifProjectId"].as_str() == self.project["id"].as_str()
+                    && conditional
+                    && params["ifRevision"].as_u64() == self.project["revision"].as_u64()
+                {
+                    let flagged = |flag: &str| -> Vec<&Value> {
+                        self.project["media"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|m| m[flag] == true)
+                            .map(|m| &m["id"])
+                            .collect()
+                    };
+                    let mut reply = json!({"unchanged":true,"id":self.project["id"],"revision":self.project["revision"],"missing":flagged("missing")});
+                    let proxy = flagged("proxy");
+                    if !proxy.is_empty() {
+                        reply["proxy"] = json!(proxy);
+                    }
+                    return Ok(reply);
+                }
+                if conditional {
+                    self.derived_changed = false;
+                }
+                Ok(self.project.clone())
+            }
+            "project.list" => self.list_projects(),
+            "project.notice" => Ok(json!({"notice":self.notice})),
+            "project.noticeDismiss" => {
+                self.notice = None;
+                Ok(json!({"notice":null}))
+            }
+            "project.delete" => {
+                let id = string(&params, "id", "");
+                if !safe_project_id(id) {
+                    return Err("프로젝트를 선택해 주세요.".into());
+                }
+                if self.project["id"] == id {
+                    return Err("열려 있는 프로젝트는 삭제할 수 없습니다. 다른 프로젝트를 연 뒤 삭제해 주세요.".into());
+                }
+                std::fs::remove_file(self.project_file(id))
+                    .map_err(|_| "프로젝트를 찾을 수 없습니다.".to_string())?;
+                let _ = std::fs::remove_dir_all(self.assets_dir(id));
+                self.list_projects()
+            }
+            "project.duplicate" => {
+                let (id, mut p) = self.stored_project(&params)?;
+                let new_id = media::id("project");
+                p["id"] = json!(new_id);
+                p["name"] = json!(format!("{} 사본", string(&p, "name", "프로젝트")));
+                p["revision"] = json!(0);
+                p["updatedAt"] = json!(media::now());
+                let (from, to) = (self.assets_dir(&id), self.assets_dir(&new_id));
+                move_assets(&mut p, &from, &to);
+                validate_project(&p)?;
+                if from.is_dir() {
+                    copy_dir(&from, &to)?;
+                    remove_unreferenced_frames(&to, &p.to_string());
+                }
+                media::atomic_json(&self.project_file(&new_id), &p)?;
+                Ok(json!({"id":p["id"],"name":p["name"],"updatedAt":p["updatedAt"]}))
+            }
+            "project.rename" => {
+                let (id, mut p) = self.stored_project(&params)?;
+                p["name"] = json!(required(&params, "name")?.trim());
+                if self.project["id"] == id.as_str() {
+                    self.commit(p)?;
+                } else {
+                    validate_project(&p)?;
+                    media::atomic_json(&self.project_file(&id), &p)?;
+                }
+                self.list_projects()
+            }
+            "project.new" => {
+                let mut p = empty_project(
+                    string(&params, "name", DEFAULT_PROJECT_NAME),
+                    params["width"].as_u64().unwrap_or(1920),
+                    params["height"].as_u64().unwrap_or(1080),
+                    number(&params, "fps", 30.0),
+                );
+                // An untouched project without a name of its own is used again instead of
+                // leaving one more empty project in the store.
+                if UNNAMED_PROJECTS.contains(&string(&p, "name", "")) {
+                    if let Some(id) = self.untouched_project() {
+                        p["id"] = json!(id);
+                    }
+                }
+                self.replace(p)
+            }
+            "project.open" => {
+                // The file read below may be the open project's own.
+                self.flush()?;
+                let path = if let Some(path) = params["path"].as_str() {
+                    PathBuf::from(path)
+                } else {
+                    let id = string(&params, "id", "");
+                    if !safe_project_id(id) {
+                        return Err("프로젝트를 선택해 주세요.".into());
+                    }
+                    self.project_file(id)
+                };
+                let mut p: Value = serde_json::from_slice(
+                    &std::fs::read(&path).map_err(|e| format!("프로젝트 열기 실패: {e}"))?,
+                )
+                .map_err(|e| format!("프로젝트 파일을 읽을 수 없습니다: {e}"))?;
+                migrate_project(&mut p)?;
+                // Portable project files may keep paths relative to themselves.
+                if let Some(items) = p["media"].as_array_mut() {
+                    for item in items {
+                        for field in ["path", "thumbnail"] {
+                            if let Some(s) = item[field].as_str() {
+                                let asset = PathBuf::from(s);
+                                if asset.is_relative() {
+                                    item[field] =
+                                        json!(path.parent().unwrap_or(Path::new(".")).join(asset));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(clips) = p["clips"].as_array_mut() {
+                    for clip in clips {
+                        for pointer in ["/text/fontPath", "/color/lut/path"] {
+                            if let Some(value) = clip.pointer_mut(pointer) {
+                                if let Some(relative) = value
+                                    .as_str()
+                                    .map(PathBuf::from)
+                                    .filter(|p| p.is_relative())
+                                {
+                                    *value = json!(path
+                                        .parent()
+                                        .unwrap_or(Path::new("."))
+                                        .join(relative));
+                                }
+                            }
+                        }
+                    }
+                }
+                // A file from elsewhere must not replace a different stored project
+                // that happens to have the same id (a copy, or an older export).
+                if params["path"].is_string() && !self.in_store(&path) {
+                    let id = string(&p, "id", "").to_owned();
+                    let stored = if self.project["id"] == id.as_str() {
+                        Some(self.project.clone())
+                    } else if safe_project_id(&id) {
+                        std::fs::read(self.project_file(&id))
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .map(|mut stored| {
+                                let _ = migrate_project(&mut stored);
+                                stored
+                            })
+                    } else {
+                        None
+                    };
+                    if stored.is_some_and(|stored| !same_content(&stored, &p)) {
+                        let new_id = media::id("project");
+                        let (from, to) = (self.assets_dir(&id), self.assets_dir(&new_id));
+                        move_assets(&mut p, &from, &to);
+                        validate_project(&p)?;
+                        if from.is_dir() {
+                            copy_dir(&from, &to)?;
+                            remove_unreferenced_frames(&to, &p.to_string());
+                        }
+                        p["id"] = json!(new_id);
+                    }
+                }
+                let opened = self.replace(p)?;
+                if params["path"].is_string() && !self.in_store(&path) {
+                    self.file_path = Some(path);
+                }
+                Ok(opened)
+            }
+            "project.save" => {
+                self.write(true)?;
+                let explicit = params["path"].as_str().map(PathBuf::from);
+                let Some(path) = explicit.or_else(|| self.file_path.clone()) else {
+                    let path = self.project_file(string(&self.project, "id", ""));
+                    return Ok(json!({"path":path,"project":self.project}));
+                };
+                // The file this project was opened from or last saved to is ours to update.
+                let known = self.file_path.as_deref() == Some(path.as_path());
+                self.guard_output(&path, &params, known)?;
+                media::atomic_json(&path, &self.project)?;
+                self.file_path = Some(path.clone());
+                Ok(json!({"path":path,"project":self.project}))
+            }
+            "project.update" => {
+                let patch = params["patch"]
+                    .as_object()
+                    .ok_or("프로젝트 변경 내용이 없습니다.")?;
+                let mut p = self.project.clone();
+                for (key, value) in patch {
+                    if ![
+                        "name",
+                        "width",
+                        "height",
+                        "fps",
+                        "background",
+                        "concept",
+                        "notes",
+                        "markers",
+                    ]
+                    .contains(&key.as_str())
+                    {
+                        return Err(format!("프로젝트 속성을 변경할 수 없습니다: {key}"));
+                    }
+                    merge(&mut p[key], value);
+                }
+                self.commit(p)
+            }
+            "project.demo" => self.demo().await,
+            "assets.list" => catalog::list(&self.root),
+            "fonts.import" => catalog::import_font(
+                &self.root,
+                Path::new(required(&params, "path")?),
+                params["name"].as_str(),
+            ),
+            "fonts.remove" => catalog::remove(&self.root, "fonts", required(&params, "id")?),
+            "fonts.apply" => {
+                let font = catalog::find(&self.root, "fonts", required(&params, "id")?)?;
+                let id = required(&params, "clipId")?;
+                let clip = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == id)
+                    .ok_or("텍스트 클립을 선택해 주세요.")?;
+                if clip["kind"] != "text" {
+                    return Err("글꼴은 텍스트 클립에 적용할 수 있습니다.".into());
+                }
+                if catalog::font_asset_path(&self.root, required(&font, "id")?).is_none() {
+                    return Err("추가한 글꼴 파일이 없습니다. 다시 가져와 주세요.".into());
+                }
+                let mut p = self.project.clone();
+                mutate(
+                    &mut p,
+                    "edit.update",
+                    &json!({"id":id,"patch":{"text":{"fontId":font["id"],"fontPath":font["path"],"fontFamily":font["family"]}}}),
+                )?;
+                self.commit(p)
+            }
+            "presets.save" => {
+                let clip = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == params["clipId"])
+                    .ok_or("프리셋으로 저장할 클립을 선택해 주세요.")?;
+                catalog::save_preset(
+                    &self.root,
+                    clip,
+                    required(&params, "name")?,
+                    required(&params, "kind")?,
+                )
+                .await
+            }
+            "presets.import" => {
+                catalog::import_preset(&self.root, Path::new(required(&params, "path")?)).await
+            }
+            "presets.remove" => catalog::remove(&self.root, "presets", required(&params, "id")?),
+            "presets.export" => {
+                let path = Path::new(required(&params, "path")?);
+                if self.project["media"].as_array().unwrap().iter().any(|m| {
+                    m["path"]
+                        .as_str()
+                        .is_some_and(|p| media::same_path(Path::new(p), path))
+                }) || media::same_path(&self.root.join("current.json"), path)
+                    || media::same_path(
+                        &self
+                            .root
+                            .join("projects")
+                            .join(format!("{}.json", string(&self.project, "id", ""))),
+                        path,
+                    )
+                    || media::same_path(&self.root.join("catalog/index.json"), path)
+                {
+                    return Err("프로젝트·목록·원본 파일을 프리셋으로 덮어쓸 수 없습니다.".into());
+                }
+                // Agents always send overwrite:false; the UI picks the path in a save dialog.
+                if params["overwrite"] == false && std::fs::symlink_metadata(path).is_ok() {
+                    return Err("같은 이름의 파일이 이미 있습니다. (FILE_EXISTS)".into());
+                }
+                catalog::export_preset(&self.root, required(&params, "id")?, path)
+            }
+            "presets.apply" => {
+                let preset = catalog::find(&self.root, "presets", required(&params, "id")?)?;
+                let id = required(&params, "clipId")?;
+                let clip = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == id)
+                    .ok_or("프리셋을 적용할 클립을 선택해 주세요.")?;
+                validate_preset(&preset)?;
+                if (clip["kind"] == "audio") != (preset["target"] == "audio") {
+                    return Err("프리셋과 클립 종류가 맞지 않습니다. 영상용 또는 오디오용 프리셋을 선택해 주세요.".into());
+                }
+                let mut patch = preset_patch(&preset);
+                let ratio = number(clip, "duration", 1.0) / number(&preset, "sourceDuration", 1.0);
+                if let Some(frames) = patch.get_mut("keyframes").and_then(Value::as_array_mut) {
+                    for frame in frames {
+                        frame["time"] = json!(number(frame, "time", 0.0) * ratio);
+                    }
+                }
+                for field in ["fadeIn", "fadeOut", "audioFadeIn", "audioFadeOut"] {
+                    if let Some(value) = patch[field].as_f64() {
+                        patch[field] = json!(value * ratio);
+                    }
+                }
+                // Only a video clip has a sound fade apart from the picture's: on an
+                // image or a text the rest of the effect applies without it.
+                if clip["kind"] != "video" {
+                    if let Some(patch) = patch.as_object_mut() {
+                        for (audio, _) in AUDIO_FADES {
+                            patch.remove(audio);
+                        }
+                    }
+                }
+                for field in ["transitionIn", "transitionOut"] {
+                    if let Some(transition) = patch.get_mut(field).filter(|v| v.is_object()) {
+                        transition["duration"] = json!(number(transition, "duration", 0.0) * ratio);
+                    }
+                }
+                let mut p = self.project.clone();
+                mutate(&mut p, "edit.update", &json!({"id":id,"patch":patch}))?;
+                self.commit(p)
+            }
+            "color.importLut" => {
+                let id = required(&params, "id")?;
+                let index = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|c| c["id"] == id)
+                    .ok_or("클립을 선택해 주세요.")?;
+                ensure_unlocked(
+                    &self.project,
+                    string(&self.project["clips"][index], "trackId", ""),
+                )?;
+                if self.project["clips"][index]["kind"] == "audio" {
+                    return Err("LUT는 영상·이미지·텍스트 클립에 적용할 수 있습니다.".into());
+                }
+                let directory = self
+                    .root
+                    .join("projects")
+                    .join(format!("{}-assets", string(&self.project, "id", "")))
+                    .join("luts");
+                let lut =
+                    media::import_lut(Path::new(required(&params, "path")?), &directory).await?;
+                let mut p = self.project.clone();
+                p["clips"][index]["color"]["lut"] = lut;
+                self.commit(p)
+            }
+            "media.import" | "media.importAndAdd" => {
+                let paths = params["paths"]
+                    .as_array()
+                    .ok_or("가져올 파일이 없습니다.")?;
+                if paths.is_empty() || paths.len() > 100 {
+                    return Err("한 번에 1~100개 파일을 가져올 수 있습니다.".into());
+                }
+                let mut p = self.project.clone();
+                let mut insertion = params.get("start").and_then(Value::as_f64);
+                for path in paths {
+                    let path = Path::new(path.as_str().ok_or("파일 경로가 올바르지 않습니다.")?);
+                    let mut asset = media::probe_info(path, &self.root).await?;
+                    if let Some(name) = uploaded_name(path, &self.root) {
+                        asset["name"] = json!(name);
+                    }
+                    let existing = p["media"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|m| {
+                            media::same_path(
+                                Path::new(string(m, "path", "")),
+                                Path::new(string(&asset, "path", "")),
+                            )
+                        })
+                        .cloned();
+                    let item = if let Some(existing) = existing {
+                        refresh_media_metadata(&mut p, required(&existing, "id")?, asset)?
+                    } else {
+                        p["media"].as_array_mut().unwrap().push(asset.clone());
+                        asset
+                    };
+                    if method == "media.importAndAdd" {
+                        let mut args = json!({"mediaId":item["id"]});
+                        if let Some(start) = insertion {
+                            args["start"] = json!(start);
+                        }
+                        if let Some(track) = params.get("trackId") {
+                            args["trackId"] = track.clone();
+                        }
+                        if let Some(duration) = params.get("duration") {
+                            args["duration"] = duration.clone();
+                        }
+                        mutate(&mut p, "edit.add", &args)?;
+                        let added = p["clips"].as_array().unwrap().last().unwrap();
+                        insertion =
+                            Some(number(added, "start", 0.0) + number(added, "duration", 0.0));
+                    }
+                }
+                self.commit(p)
+            }
+            "media.reprobe" => {
+                let ids = params["ids"]
+                    .as_array()
+                    .ok_or("다시 확인할 소재 ID 목록이 필요합니다.")?;
+                if ids.is_empty()
+                    || ids.len() > 100
+                    || ids.iter().any(|id| id.as_str().is_none())
+                    || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+                {
+                    return Err("중복되지 않는 소재 ID 1~100개가 필요합니다.".into());
+                }
+                let assets: Vec<Value> = ids
+                    .iter()
+                    .map(|id| {
+                        self.project["media"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|asset| asset["id"] == *id)
+                            .cloned()
+                            .ok_or_else(|| "소재를 찾을 수 없습니다.".to_string())
+                    })
+                    .collect::<Result<_, _>>()?;
+                let mut p = self.project.clone();
+                for asset in assets {
+                    let refreshed =
+                        media::probe_info(Path::new(required(&asset, "path")?), &self.root).await?;
+                    let id = required(&asset, "id")?;
+                    refresh_media_metadata(&mut p, id, refreshed)?;
+                    // The file may have changed in place: compute its waveform again.
+                    drop_waveform(&mut p, id);
+                }
+                self.commit(p)
+            }
+            "media.relink" => {
+                let id = required(&params, "id")?;
+                let asset =
+                    media::probe_info(Path::new(required(&params, "path")?), &self.root).await?;
+                let mut p = self.project.clone();
+                if p["media"].as_array().unwrap().iter().any(|m| {
+                    m["id"] != id
+                        && media::same_path(
+                            Path::new(string(m, "path", "")),
+                            Path::new(string(&asset, "path", "")),
+                        )
+                }) {
+                    return Err("이미 프로젝트에 있는 소재 파일입니다.".into());
+                }
+                // Only media.reprobe may turn a mislabelled video into audio.
+                if p["media"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["id"] == id && m["kind"] != asset["kind"])
+                {
+                    return Err("소재 종류가 다릅니다. 같은 종류의 파일을 선택해 주세요.".into());
+                }
+                let path = asset["path"].clone();
+                refresh_media_metadata(&mut p, id, asset)?;
+                let item = p["media"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|m| m["id"] == id)
+                    .unwrap();
+                item["path"] = path;
+                item.as_object_mut().unwrap().remove("missing");
+                // Also for the same path: the file there may have been replaced.
+                drop_waveform(&mut p, id);
+                self.commit(p)
+            }
+            "media.remove" => {
+                let id = required(&params, "id")?;
+                if self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["mediaId"] == id)
+                {
+                    return Err(
+                        "타임라인에서 사용 중인 소재입니다. 클립을 먼저 삭제해 주세요.".into(),
+                    );
+                }
+                let mut p = self.project.clone();
+                let media = p["media"].as_array_mut().unwrap();
+                if !media.iter().any(|m| m["id"] == id) {
+                    return Err("소재를 찾을 수 없습니다.".into());
+                }
+                media.retain(|m| m["id"] != id);
+                self.commit(p)
+            }
+            "history.status" => {
+                Ok(json!({"canUndo":!self.undo.is_empty(),"canRedo":!self.redo.is_empty()}))
+            }
+            "history.undo" | "history.redo" => {
+                let is_undo = method == "history.undo";
+                let old = if is_undo {
+                    self.undo.pop()
+                } else {
+                    self.redo.pop()
+                };
+                let original = old.ok_or(if is_undo {
+                    "실행 취소할 작업이 없습니다."
+                } else {
+                    "다시 실행할 작업이 없습니다."
+                })?;
+                let mut next = self.with_waveforms(original.project());
+                next["revision"] = json!(self.project["revision"].as_u64().unwrap_or(0) + 1);
+                next["updatedAt"] = json!(media::now());
+                let before = std::mem::replace(&mut self.project, next);
+                if let Err(e) = self.persist() {
+                    self.project = before;
+                    if is_undo {
+                        self.undo.push(original)
+                    } else {
+                        self.redo.push(original)
+                    };
+                    return Err(e);
+                }
+                let before = Snapshot::of(self.without_waveforms(before), Some(&original));
+                if is_undo {
+                    self.redo.push(before)
+                } else {
+                    self.undo.push(before)
+                };
+                self.refresh_missing();
+                Ok(self.project.clone())
+            }
+            "edit.freeze" => {
+                let id = required(&params, "id")?;
+                let time = params["time"]
+                    .as_f64()
+                    .ok_or("정지 프레임 위치가 필요합니다.")?;
+                let fps = number(&self.project, "fps", 30.0);
+                let hold = match params.get("duration") {
+                    None => 2.0,
+                    Some(value) => value
+                        .as_f64()
+                        .filter(|d| (1.0 / fps..=3600.0).contains(d))
+                        .ok_or("정지 프레임 길이는 1프레임 이상 1시간 이하여야 합니다.")?,
+                };
+                let hold = snap_length(hold, fps);
+                let clip = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == id)
+                    .cloned()
+                    .ok_or("클립을 찾을 수 없습니다.")?;
+                if clip["kind"] != "video" {
+                    return Err("정지 프레임은 동영상 클립에서 만들 수 있습니다.".into());
+                }
+                // Splitting first checks the position and the lock before any file work.
+                let mut p = self.project.clone();
+                mutate(&mut p, "edit.split", &json!({"id":id,"time":time}))?;
+                // The frame the split really landed on.
+                let time = split_time(&self.project, &clip, time)?;
+                let source = p["media"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["id"] == clip["mediaId"])
+                    .cloned()
+                    .ok_or("클립 원본을 찾을 수 없습니다.")?;
+                let relative = time - number(&clip, "start", 0.0);
+                let offset = if clip["reverse"] == true {
+                    number(&clip, "duration", 0.0) - relative
+                } else {
+                    relative
+                };
+                let last_frame = number(&source, "duration", 0.0) - 1.0 / number(&p, "fps", 30.0);
+                let source_time = (number(&clip, "sourceIn", 0.0)
+                    + offset * number(&clip, "speed", 1.0))
+                .min(last_frame)
+                .max(0.0);
+                let frames = self
+                    .assets_dir(string(&self.project, "id", ""))
+                    .join("frames");
+                std::fs::create_dir_all(&frames).map_err(|e| e.to_string())?;
+                let png = frames.join(format!("{}.png", media::id("freeze")));
+                media::extract_frame(Path::new(required(&source, "path")?), source_time, &png)
+                    .await?;
+                // Probing only reads the still and makes its thumbnail.
+                let result = match media::probe_info(&png, &self.root).await {
+                    Ok(still) => {
+                        insert_freeze(p, still, &clip, time, hold).and_then(|p| self.commit(p))
+                    }
+                    Err(error) => Err(error),
+                };
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&png);
+                }
+                result
+            }
+            "edit.batch" => {
+                let commands = params["commands"]
+                    .as_array()
+                    .ok_or("편집 명령 목록이 없습니다.")?;
+                if commands.is_empty() || commands.len() > 500 {
+                    return Err("배치 명령은 1~500개여야 합니다.".into());
+                }
+                let mut list = Vec::with_capacity(commands.len());
+                for command in commands {
+                    list.push((required(command, "method")?, &command["params"]));
+                }
+                let p = mutate_all(&self.project, list.into_iter())?;
+                self.commit_valid(p)
+            }
+            m if m.starts_with("edit.") => {
+                let mut p = self.project.clone();
+                mutate(&mut p, m, &params)?;
+                self.commit_valid(p)
+            }
+            "export.start" => {
+                self.jobs
+                    .start(self.project.clone(), params, self.root.clone())
+                    .await
+            }
+            "export.status" => self.jobs.status(required(&params, "id")?),
+            "export.cancel" => self.jobs.cancel(required(&params, "id")?),
+            "preview.frame" => {
+                let mut result = render::preview_frame(&self.project, &params, &self.root).await?;
+                let asset_id = media::id("preview-frame");
+                self.preview_assets
+                    .insert(asset_id.clone(), PathBuf::from(required(&result, "path")?));
+                result["assetId"] = json!(asset_id);
+                Ok(result)
+            }
+            "preview.start" => {
+                let width = (number(&params, "width", 960.0).clamp(64.0, 960.0) as u32 / 2) * 2;
+                let height = ((width as f64 * number(&self.project, "height", 1080.0)
+                    / number(&self.project, "width", 1920.0)) as u32
+                    / 2)
+                    * 2;
+                let asset_id = media::id("preview-video");
+                let path = self.root.join("previews").join(format!("{asset_id}.mp4"));
+                let mut result=self.jobs.start(self.project.clone(),json!({"path":path,"format":"mp4","width":width,"height":height.max(16),"fps":self.project["fps"],"crf":23,"preview":true}),self.root.clone()).await?;
+                self.preview_assets.insert(asset_id.clone(), path);
+                result["assetId"] = json!(asset_id);
+                result["revision"] = self.project["revision"].clone();
+                Ok(result)
+            }
+            "captions.import" => {
+                let path = required(&params, "path")?;
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| format!("자막 파일 읽기 실패: {e}"))?;
+                let captions = parse_srt(&content)?;
+                let mut p = self.project.clone();
+                // Checked once, by commit: a long subtitle file is many commands.
+                for (start, end, text) in captions {
+                    apply(
+                        &mut p,
+                        "edit.add",
+                        &json!({"start":start,"duration":end-start,"text":{"content":text}}),
+                    )?;
+                }
+                self.commit(p)
+            }
+            "captions.export" => {
+                let path = PathBuf::from(required(&params, "path")?);
+                self.guard_output(&path, &params, false)?;
+                let mut clips: Vec<&Value> = self.project["clips"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c["kind"] == "text")
+                    .collect();
+                clips.sort_by(|a, b| number(a, "start", 0.0).total_cmp(&number(b, "start", 0.0)));
+                if clips.is_empty() {
+                    return Err("내보낼 자막이 없습니다.".into());
+                }
+                let content = clips
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        format!(
+                            "{}\n{} --> {}\n{}\n",
+                            i + 1,
+                            srt_time(number(c, "start", 0.0)),
+                            srt_time(number(c, "start", 0.0) + number(c, "duration", 0.0)),
+                            string(&c["text"], "content", "")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let temporary = path.with_extension(format!("tmp-{}", media::id("srt")));
+                std::fs::write(&temporary, content)
+                    .and_then(|_| std::fs::rename(&temporary, &path))
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&temporary);
+                        format!("자막 파일 저장 실패: {e}")
+                    })?;
+                Ok(json!({"path":path}))
+            }
+            _ => Err(format!("지원하지 않는 편집 명령입니다: {method}")),
+        }
+    }
+
+    async fn demo(&mut self) -> Result<Value, String> {
+        let path = std::env::var_os("BYORI_STUDIO_DEMO_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../public/demo"));
+        if !path.is_dir() {
+            return Err("예제 미디어를 찾을 수 없습니다. 미디어를 직접 가져와 주세요.".into());
+        }
+        let mut paths: Vec<_> = std::fs::read_dir(&path)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(
+                    p.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .as_str(),
+                    "jpg" | "jpeg" | "png" | "mp4" | "mov" | "wav" | "mp3" | "webm"
+                )
+            })
+            .collect();
+        paths.sort();
+        let mut p = empty_project("잠시, 멈추는 여행 · 예제", 1920, 1080, 30.0);
+        p["concept"] = json!({"audience":"여행과 일상의 여유를 좋아하는 사람","message":"잠시 속도를 늦추면 보이는 것들","appeal":"공간의 분위기와 자연스러운 호흡","direction":"차분한 색감, 여유 있는 컷, 간결한 자막"});
+        let mut cursor = 0.0;
+        for path in paths.into_iter().take(8) {
+            let m = media::probe_info(&path, &self.root).await?;
+            let audio = m["kind"] == "audio";
+            let id = m["id"].clone();
+            let duration = if audio {
+                number(&m, "duration", 12.0).min(12.0)
+            } else {
+                number(&m, "duration", 5.0).min(4.0)
+            };
+            p["media"].as_array_mut().unwrap().push(m);
+            mutate(
+                &mut p,
+                "edit.add",
+                &json!({"mediaId":id,"start":if audio{0.0}else{cursor},"duration":duration,"trackId":if audio{"audio-1"}else{"video-1"}}),
+            )?;
+            if !audio {
+                cursor += duration;
+            }
+        }
+        if p["media"].as_array().unwrap().is_empty() {
+            return Err("예제 폴더에 미디어가 없습니다.".into());
+        }
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"잠시, 멈춰도 괜찮아","fontSize":72,"color":"#ffffff","bold":true},"start":0.0,"duration":4.0}),
+        )?;
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"A little room to breathe","fontSize":44,"color":"#ffffff"},"start":4.0,"duration":4.0}),
+        )?;
+        p["notes"] = json!([{"id":media::id("note"),"body":"직접 편집하거나 에이전트에게 컷 순서와 자막 수정을 요청해 보세요. 이 프로젝트는 예제입니다.","kind":"context","createdAt":media::now()}]);
+        self.replace(p)
+    }
+}
+
+fn required<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
+    v[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{key} 값이 필요합니다."))
+}
+
+fn merge(target: &mut Value, patch: &Value) {
+    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            merge(t.entry(k).or_insert(Value::Null), v);
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+fn ensure_unlocked(project: &Value, track_id: &str) -> Result<(), String> {
+    let track = project["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == track_id)
+        .ok_or("트랙을 찾을 수 없습니다.")?;
+    if track["locked"].as_bool().unwrap_or(false) {
+        return Err("잠긴 트랙입니다. 잠금을 해제한 뒤 편집해 주세요.".into());
+    }
+    Ok(())
+}
+
+/// Where new text stands, as a share of the project height from the centre: the lower
+/// third, unless other text is shown there during that time; then the centre, then the
+/// upper third (the emptiest of the three when all are taken). The library (UI), the
+/// CLI and MCP all add text through this, so none of them covers a caption.
+fn free_text_row(p: &Value, start: f64, duration: f64) -> f64 {
+    const ROWS: [f64; 3] = [0.32, 0.0, -0.32];
+    let height = number(p, "height", 1080.0).max(1.0);
+    let taken: Vec<f64> = p["clips"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| {
+            c["kind"] == "text"
+                && number(c, "start", 0.0) < start + duration - 1e-6
+                && number(c, "start", 0.0) + number(c, "duration", 0.0) > start + 1e-6
+        })
+        .map(|c| number(&c["transform"], "y", 0.0) / height)
+        .collect();
+    let distance = |row: f64| {
+        taken
+            .iter()
+            .map(|y| (y - row).abs())
+            .fold(f64::INFINITY, f64::min)
+    };
+    ROWS.into_iter()
+        .find(|row| distance(*row) > 0.16)
+        .unwrap_or_else(|| {
+            ROWS.into_iter()
+                .max_by(|a, b| distance(*a).total_cmp(&distance(*b)))
+                .unwrap_or(ROWS[0])
+        })
+}
+fn default_clip(kind: &str, name: &str, track: &str, start: f64, duration: f64) -> Value {
+    json!({"id":media::id("clip"),"name":name,"kind":kind,"trackId":track,"start":start,"duration":duration,
+        "sourceIn":0.0,"speed":1.0,"reverse":false,"volume":1.0,"fadeIn":0.0,"fadeOut":0.0,
+        "transform":{"x":0.0,"y":0.0,"scale":1.0,"rotation":0.0,"opacity":1.0},
+        "color":{"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0},"keyframes":[]})
+}
+
+/// Portable presets contain only supported editing values, never scripts or
+/// FFmpeg expressions. Relative keyframe/fade timing is retained via sourceDuration.
+pub(crate) fn capture_preset(clip: &Value, kind: &str) -> Result<Value, String> {
+    let audio = clip["kind"] == "audio";
+    if !["filter", "effect"].contains(&kind) || (kind == "filter" && audio) {
+        return Err("영상·이미지·텍스트의 필터 또는 클립 효과를 선택해 주세요.".into());
+    }
+    let mut patch = if kind == "filter" {
+        json!({"filter":"none","color":{"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0,"hue":0.0,
+            "hsl":{"red":{"hue":0.0,"saturation":0.0,"lightness":0.0},"yellow":{"hue":0.0,"saturation":0.0,"lightness":0.0},"green":{"hue":0.0,"saturation":0.0,"lightness":0.0},"cyan":{"hue":0.0,"saturation":0.0,"lightness":0.0},"blue":{"hue":0.0,"saturation":0.0,"lightness":0.0},"magenta":{"hue":0.0,"saturation":0.0,"lightness":0.0}},
+            "curves":{"preset":"none","master":[],"red":[],"green":[],"blue":[]},"lut":{"enabled":false}}})
+    } else if audio {
+        json!({"volume":1.0,"fadeIn":0.0,"fadeOut":0.0,"keyframes":[],"audio":{"normalize":false,"denoise":false,"voiceEnhance":false,"eq":{"bass":0.0,"mid":0.0,"treble":0.0}}})
+    } else {
+        json!({"transform":{"x":0.0,"y":0.0,"scale":1.0,"rotation":0.0,"opacity":1.0,"flipX":false,"flipY":false},
+            "crop":{"x":0.0,"y":0.0,"width":1.0,"height":1.0},"mask":{"type":"none","x":0.5,"y":0.5,"width":1.0,"height":1.0,"feather":0.0},
+            "chromaKey":{"enabled":false,"color":"#00ff00","similarity":0.1,"blend":0.1},"stabilize":{"enabled":false,"strength":1},
+            "fadeIn":0.0,"fadeOut":0.0,"transitionIn":null,"transitionOut":null,"blendMode":"normal","keyframes":[]})
+    };
+    // A video clip's sound fade is part of its effect: its own lengths, or null
+    // where the sound follows the picture. Other clips have none to capture.
+    if kind == "effect" && clip["kind"] == "video" {
+        for (audio, _) in AUDIO_FADES {
+            patch[audio] = Value::Null;
+        }
+    }
+    for (field, value) in patch.as_object_mut().unwrap() {
+        if let Some(selected) = clip.get(field) {
+            merge(value, selected);
+        }
+    }
+    if kind == "filter" && patch["color"]["lut"]["enabled"] == false {
+        patch["color"]["lut"] = json!({"enabled":false});
+    }
+    if kind == "effect" && !audio {
+        for (transition, fade) in [("transitionIn", "fadeIn"), ("transitionOut", "fadeOut")] {
+            let duration = number(&patch, fade, 0.0);
+            patch[transition] = if duration > 0.0 {
+                json!({"type":string(&patch[transition], "type", "fade"),"duration":duration})
+            } else {
+                Value::Null
+            };
+        }
+    }
+    Ok(
+        json!({"version":1,"name":"프리셋","kind":kind,"target":if audio {"audio"} else {"visual"},"sourceDuration":number(clip,"duration",1.0),"patch":patch}),
+    )
+}
+
+pub(crate) fn validate_preset(preset: &Value) -> Result<(), String> {
+    let kind = string(preset, "kind", "");
+    let target = string(preset, "target", "");
+    if !["filter", "effect"].contains(&kind)
+        || !["visual", "audio"].contains(&target)
+        || (kind == "filter" && target != "visual")
+    {
+        return Err("프리셋 종류 또는 적용 대상이 올바르지 않습니다.".into());
+    }
+    bounded(preset, "sourceDuration", 0.01, 86400.0)?;
+    let allowed: &[&str] = if kind == "filter" {
+        &["color", "filter"]
+    } else if target == "audio" {
+        &["volume", "fadeIn", "fadeOut", "keyframes", "audio"]
+    } else {
+        &[
+            "transform",
+            "crop",
+            "mask",
+            "chromaKey",
+            "stabilize",
+            "fadeIn",
+            "fadeOut",
+            "audioFadeIn",
+            "audioFadeOut",
+            "transitionIn",
+            "transitionOut",
+            "blendMode",
+            "keyframes",
+        ]
+    };
+    optional_fields(&preset["patch"], allowed, "preset patch")?;
+    if preset["patch"].as_object().unwrap().is_empty() {
+        return Err("프리셋의 편집 값이 비어 있습니다.".into());
+    }
+    for field in ["transitionIn", "transitionOut"] {
+        if let Some(transition) = preset["patch"].get(field).filter(|v| !v.is_null()) {
+            optional_fields(transition, &["type", "duration"], "preset transition")?;
+            if !TRANSITIONS.contains(&string(transition, "type", "")) {
+                return Err("프리셋에 지원하지 않는 전환 종류가 있습니다.".into());
+            }
+            bounded(transition, "duration", 0.0, 86400.0)?;
+        }
+    }
+    if preset["patch"]["keyframes"]
+        .as_array()
+        .is_some_and(|frames| frames.len() > 1000)
+    {
+        return Err("프리셋 키프레임은 1,000개까지 지원합니다.".into());
+    }
+    let mut project = empty_project("preset validation", 1920, 1080, 30.0);
+    let clip_kind = if target == "audio" { "audio" } else { "video" };
+    let track = if target == "audio" {
+        "audio-1"
+    } else {
+        "video-1"
+    };
+    let mut clip = default_clip(
+        clip_kind,
+        "preset",
+        track,
+        0.0,
+        number(preset, "sourceDuration", 1.0),
+    );
+    clip["id"] = json!("preset-validation");
+    clip["mediaId"] = json!("preset-media");
+    project["media"] = json!([{"id":"preset-media","path":"preset-validation.mp4","kind":"video","duration":86400.0,"hasAudio":true}]);
+    project["clips"] = json!([clip]);
+    mutate(
+        &mut project,
+        "edit.update",
+        &json!({"id":"preset-validation","patch":preset_patch(preset)}),
+    )
+}
+
+// Presets saved by older builds may carry a legacy filter id.
+fn preset_patch(preset: &Value) -> Value {
+    let mut patch = preset["patch"].clone();
+    if let Some(filter) = patch.get_mut("filter") {
+        *filter = json!(legacy_filter(filter));
+    }
+    patch
+}
+
+pub fn keyframe_property(property: &str) -> &str {
+    property.strip_prefix("transform.").unwrap_or(property)
+}
+
+/// Progress 0..1 between two keyframes, shaped by the first one's easing.
+pub fn ease(easing: &str, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    match easing {
+        "easeIn" => t * t,
+        "easeOut" => 1.0 - (1.0 - t) * (1.0 - t),
+        "easeInOut" => t * t * (3.0 - 2.0 * t),
+        "hold" => {
+            if t >= 1.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => t,
+    }
+}
+
+/// Keyframes of one property as (time, value, easing towards the next one),
+/// sorted, starting at time 0 with the clip's static value when none is there.
+pub fn keyframe_frames(clip: &Value, property: &str) -> Vec<(f64, f64, String)> {
+    let property = keyframe_property(property);
+    let base = if property == "volume" {
+        number(clip, "volume", 1.0)
+    } else {
+        number(
+            &clip["transform"],
+            property,
+            if property == "opacity" || property == "scale" {
+                1.0
+            } else {
+                0.0
+            },
+        )
+    };
+    let mut points: Vec<_> = clip["keyframes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|k| keyframe_property(string(k, "property", "")) == property)
+        .map(|k| {
+            (
+                number(k, "time", 0.0),
+                number(k, "value", base),
+                string(k, "easing", "linear").to_owned(),
+            )
+        })
+        .collect();
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if points.first().is_none_or(|p| p.0 > 0.0) {
+        points.insert(0, (0.0, base, "linear".into()));
+    }
+    points
+}
+
+pub fn keyframe_points(clip: &Value, property: &str) -> Vec<(f64, f64)> {
+    keyframe_frames(clip, property)
+        .into_iter()
+        .map(|(time, value, _)| (time, value))
+        .collect()
+}
+
+pub fn keyframe_value(clip: &Value, property: &str, time: f64) -> f64 {
+    let points = keyframe_frames(clip, property);
+    if time <= points[0].0 {
+        return points[0].1;
+    }
+    for pair in points.windows(2) {
+        if time <= pair[1].0 {
+            let ratio = (time - pair[0].0) / (pair[1].0 - pair[0].0).max(f64::EPSILON);
+            return pair[0].1 + (pair[1].1 - pair[0].1) * ease(&pair[0].2, ratio);
+        }
+    }
+    points.last().unwrap().1
+}
+
+fn keyframe(property: &str, time: f64, value: f64, easing: &str) -> Value {
+    let mut frame = json!({"property":property,"time":time,"value":value});
+    if easing != "linear" {
+        frame["easing"] = json!(easing);
+    }
+    frame
+}
+
+// Easing of the segment that contains `time`: a keyframe added there continues it.
+fn easing_at(frames: &[(f64, f64, String)], time: f64) -> &str {
+    frames
+        .iter()
+        .rev()
+        .find(|frame| frame.0 <= time)
+        .map_or("linear", |frame| frame.2.as_str())
+}
+
+fn keyframe_properties(clip: &Value) -> std::collections::BTreeSet<String> {
+    clip["keyframes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| keyframe_property(string(k, "property", "")).to_owned())
+        .collect()
+}
+
+fn split_keyframes(clip: &Value, time: f64) -> (Value, Value) {
+    let mut left = vec![];
+    let mut right = vec![];
+    for property in keyframe_properties(clip) {
+        let frames = keyframe_frames(clip, &property);
+        let value = keyframe_value(clip, &property, time);
+        right.push(keyframe(&property, 0.0, value, easing_at(&frames, time)));
+        for (t, v, easing) in &frames {
+            if *t < time {
+                left.push(keyframe(&property, *t, *v, easing));
+            }
+            if *t > time {
+                right.push(keyframe(&property, t - time, *v, easing));
+            }
+        }
+        left.push(keyframe(&property, time, value, "linear"));
+    }
+    (json!(left), json!(right))
+}
+
+// Keep animation tied to its original timeline positions, including eased
+// values at the new edges. Extending an edge holds the nearest original value.
+fn trim_keyframes(clip: &Value, start: f64, duration: f64) -> Value {
+    let end = start + duration;
+    let mut result = vec![];
+    for property in keyframe_properties(clip) {
+        let frames = keyframe_frames(clip, &property);
+        result.push(keyframe(
+            &property,
+            0.0,
+            keyframe_value(clip, &property, start),
+            easing_at(&frames, start),
+        ));
+        for (time, value, easing) in &frames {
+            if *time > start && *time < end {
+                result.push(keyframe(&property, time - start, *value, easing));
+            }
+        }
+        result.push(keyframe(
+            &property,
+            duration,
+            keyframe_value(clip, &property, end),
+            "linear",
+        ));
+    }
+    json!(result)
+}
+
+/// A video clip's own sound fade and the picture fade it follows while unset.
+const AUDIO_FADES: [(&str, &str); 2] = [("audioFadeIn", "fadeIn"), ("audioFadeOut", "fadeOut")];
+
+// The sound fades of a video clip obey the rule of the picture fades: neither
+// outlasts the clip, and together they are no longer than it. Two fades of the
+// sound's own shrink by the same ratio; one beside a fade that still follows the
+// picture gives way to it, because that one is the picture's to set.
+fn fit_audio_fades(clip: &mut Value) {
+    let duration = number(clip, "duration", 0.0);
+    // Anything but a number is left for validation to refuse.
+    let own = |clip: &Value, key: &str| clip.get(key).and_then(Value::as_f64).filter(|v| *v >= 0.0);
+    for (audio, _) in AUDIO_FADES {
+        if own(clip, audio).is_some_and(|length| length > duration) {
+            clip[audio] = json!(duration);
+        }
+    }
+    let [(fade_in, picture_in), (fade_out, picture_out)] = AUDIO_FADES;
+    let following = |clip: &Value, key: &str| number(clip, key, 0.0).clamp(0.0, duration.max(0.0));
+    match (own(clip, fade_in), own(clip, fade_out)) {
+        (Some(a), Some(b)) if a + b > duration => {
+            let a = a * duration / (a + b);
+            clip[fade_in] = json!(a);
+            clip[fade_out] = json!(duration - a);
+        }
+        (Some(a), None) if a + following(clip, picture_out) > duration => {
+            clip[fade_in] = json!(duration - following(clip, picture_out));
+        }
+        (None, Some(b)) if b + following(clip, picture_in) > duration => {
+            clip[fade_out] = json!(duration - following(clip, picture_in));
+        }
+        _ => {}
+    }
+}
+
+// No fade or transition outlasts its clip, and the two never overlap: each is
+// first limited to the clip's length, and if together they are still longer than
+// the clip, both shrink by the same ratio so that they meet.
+fn fit_clip_fades(clip: &mut Value) {
+    let duration = number(clip, "duration", 0.0);
+    // Anything but a number is left for validation to refuse.
+    for fade in ["fadeIn", "fadeOut"] {
+        if clip[fade].as_f64().is_some_and(|length| length > duration) {
+            clip[fade] = json!(duration);
+        }
+    }
+    if let (Some(fade_in), Some(fade_out)) = (clip["fadeIn"].as_f64(), clip["fadeOut"].as_f64()) {
+        if fade_in >= 0.0 && fade_out >= 0.0 && fade_in + fade_out > duration {
+            let fade_in = fade_in * duration / (fade_in + fade_out);
+            clip["fadeIn"] = json!(fade_in);
+            clip["fadeOut"] = json!(duration - fade_in);
+        }
+    }
+    sync_transition(clip, "fadeIn", "transitionIn");
+    sync_transition(clip, "fadeOut", "transitionOut");
+    fit_audio_fades(clip);
+}
+
+// New edits place clips on the project's frame grid. Stored projects are never
+// migrated, so every helper below tolerates clips that are off the grid.
+fn snap(time: f64, fps: f64) -> f64 {
+    (time * fps).round() / fps
+}
+
+/// A whole number of frames, at least one.
+fn snap_length(length: f64, fps: f64) -> f64 {
+    (length * fps).round().max(1.0) / fps
+}
+
+/// Removes float noise from arithmetic on grid values; off-grid values are kept.
+fn settle(time: f64, fps: f64) -> f64 {
+    let snapped = snap(time, fps);
+    if (snapped - time).abs() < 1e-6 {
+        snapped
+    } else {
+        time
+    }
+}
+
+/// Snaps a clip's length to whole frames. A media clip that rounding pushed past
+/// the end of its source gives the partial frame back; keyframes that rounding
+/// left just past the end move to it.
+fn snap_clip_length(p: &Value, clip: &mut Value) {
+    if let Some(length) = clip["duration"].as_f64().filter(|d| d.is_finite()) {
+        let snapped = snap_length(length, number(p, "fps", 30.0));
+        set_clip_length(p, clip, length, snapped);
+    }
+}
+
+/// Gives a clip the whole-frame length `snapped`, chosen for a requested `length`.
+fn set_clip_length(p: &Value, clip: &mut Value, length: f64, mut snapped: f64) {
+    let fps = number(p, "fps", 30.0);
+    if snapped > length
+        && snapped > 1.5 / fps
+        && matches!(string(clip, "kind", ""), "video" | "audio")
+    {
+        let available = p["media"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["id"] == clip["mediaId"])
+            .map(|m| number(m, "duration", 0.0) - number(clip, "sourceIn", 0.0));
+        if available.is_some_and(|a| snapped * number(clip, "speed", 1.0) > a + 1e-6) {
+            snapped -= 1.0 / fps;
+            snapped = snap(snapped, fps);
+        }
+    }
+    clip["duration"] = json!(snapped);
+    if let Some(frames) = clip["keyframes"].as_array_mut() {
+        for frame in frames.iter_mut().filter_map(Value::as_object_mut) {
+            let time = frame.get("time").and_then(Value::as_f64).unwrap_or(0.0);
+            if time > snapped && time < snapped + 1.0 / fps {
+                frame.insert("time".into(), json!(snapped));
+            }
+        }
+    }
+}
+
+/// A negative start is left as it is, for validation to refuse: rounding must not
+/// turn a position before the timeline into frame 0 (or into -0.0).
+fn snap_clip_start(p: &Value, clip: &mut Value) {
+    if let Some(start) = clip["start"]
+        .as_f64()
+        .filter(|s| s.is_finite() && *s >= 0.0)
+    {
+        clip["start"] = json!(snap(start, number(p, "fps", 30.0)) + 0.0);
+    }
+}
+
+/// Snaps a clip given by start and length: both ends go to their nearest frame,
+/// so clips that touched before rounding still touch after it. Rounding the
+/// length on its own could move the end one frame away from where it was asked.
+fn snap_clip_span(p: &Value, clip: &mut Value) {
+    let fps = number(p, "fps", 30.0);
+    let finite = |key: &str| clip[key].as_f64().filter(|value| value.is_finite());
+    let (Some(start), Some(length)) = (finite("start").filter(|s| *s >= 0.0), finite("duration"))
+    else {
+        snap_clip_start(p, clip);
+        snap_clip_length(p, clip);
+        return;
+    };
+    let first = (start * fps).round();
+    let frames = (((start + length) * fps).round() - first).max(1.0);
+    clip["start"] = json!(first / fps + 0.0);
+    set_clip_length(p, clip, length, frames / fps);
+}
+
+/// The stretch of source a speed change keeps. A clip remembers it (`sourceSpan`)
+/// from its last speed change, because its whole-frame length no longer tells it
+/// exactly; the memory counts only while it still accounts for the clip's length,
+/// so any later trim, split or resize makes the length the reference again.
+fn source_span(p: &Value, clip: &Value) -> f64 {
+    let length = number(clip, "duration", 1.0);
+    let speed = number(clip, "speed", 1.0);
+    clip["sourceSpan"]
+        .as_f64()
+        .filter(|span| span.is_finite() && *span > 0.0)
+        .filter(|span| {
+            let mut probe = clip.clone();
+            probe["duration"] = json!(span / speed);
+            snap_clip_length(p, &mut probe);
+            (number(&probe, "duration", 0.0) - length).abs() < 1e-6
+        })
+        .unwrap_or(length * speed)
+}
+
+/// Where a split of `clip` at `time` lands: the nearest frame that leaves both
+/// halves at least one frame long (an off-grid legacy clip may keep `time` itself).
+fn split_time(p: &Value, clip: &Value, time: f64) -> Result<f64, String> {
+    let fps = number(p, "fps", 30.0);
+    let start = number(clip, "start", 0.0);
+    let duration = number(clip, "duration", 0.0);
+    let fits = |time: &f64| {
+        let relative = time - start;
+        relative + 1e-8 >= 1.0 / fps && duration - relative + 1e-8 >= 1.0 / fps
+    };
+    if !time.is_finite() || !fits(&time) {
+        return Err(
+            "분할한 두 클립의 길이가 각각 최소 1프레임이 되도록 위치를 선택해 주세요.".into(),
+        );
+    }
+    Ok(Some(snap(time, fps)).filter(fits).unwrap_or(time))
+}
+
+/// Moves every clip on `track` that starts at or after `from` by `delta` seconds.
+/// Grouped clips on other tracks follow, so a group is not pulled apart: all of
+/// them when the whole group moves, and those at or after `from` when the group
+/// has a clip that stays on `track`. A locked track with such a clip refuses.
+fn shift_track(p: &mut Value, track: &Value, from: f64, delta: f64) -> Result<(), String> {
+    let fps = number(p, "fps", 30.0);
+    let clips = p["clips"].as_array().unwrap();
+    let after = |clip: &Value| number(clip, "start", 0.0) >= from - 1e-6;
+    let (mut moving, mut staying) = (HashSet::new(), HashSet::new());
+    for clip in clips.iter().filter(|clip| clip["trackId"] == *track) {
+        if let Some(group) = clip["groupId"].as_str() {
+            let side = if after(clip) {
+                &mut moving
+            } else {
+                &mut staying
+            };
+            side.insert(group);
+        }
+    }
+    let mut moved = Vec::new();
+    for (index, clip) in clips.iter().enumerate() {
+        if clip["trackId"] == *track {
+            if after(clip) {
+                moved.push(index);
+            }
+        } else if clip["groupId"].as_str().is_some_and(|group| {
+            moving.contains(group) && (after(clip) || !staying.contains(group))
+        }) {
+            ensure_unlocked(p, string(clip, "trackId", ""))?;
+            moved.push(index);
+        }
+    }
+    for index in moved {
+        let clip = &mut p["clips"][index];
+        let start = settle(number(clip, "start", 0.0) + delta, fps);
+        if start < -1e-6 {
+            return Err("클립을 타임라인 시작보다 앞으로 옮길 수 없습니다.".into());
+        }
+        clip["start"] = json!(start.max(0.0));
+    }
+    Ok(())
+}
+
+// fadeIn/fadeOut time the picture's fade (for fade/dissolve/zoom) and, unless the
+// clip has audioFadeIn/audioFadeOut of its own, the sound's;
+// a transition object keeps its type and always has the same length.
+fn sync_transition(clip: &mut Value, fade: &str, transition: &str) {
+    if clip.get(transition).is_some_and(Value::is_object) {
+        let length = number(clip, fade, 0.0);
+        if length > 0.0 {
+            clip[transition]["duration"] = json!(length);
+        } else {
+            clip[transition] = Value::Null;
+        }
+    }
+}
+
+fn filter_color(filter: &str) -> Option<Value> {
+    let (brightness, contrast, saturation, temperature) = match filter {
+        "none" => (0.0, 1.0, 1.0, 0.0),
+        "cinematic" => (-0.02, 1.15, 0.85, 0.0),
+        "warm" => (0.02, 1.03, 1.05, 0.5),
+        "cool" => (0.0, 1.05, 0.95, -0.5),
+        "mono" => (0.0, 1.1, 0.0, 0.0),
+        "vintage" => (0.03, 0.9, 0.75, 0.3),
+        _ => return None,
+    };
+    Some(
+        json!({"brightness":brightness,"contrast":contrast,"saturation":saturation,"temperature":temperature}),
+    )
+}
+
+/// One edit command on `p`, which is valid again afterwards or the command failed.
+fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
+    apply(p, method, args)?;
+    validate_project(p)
+}
+
+/// A list of edit commands on `project` as one change: the valid project they
+/// lead to, or the error and nothing changed. Checking the whole project after
+/// every command made a batch cost commands x clips (200 commands on 2000 clips:
+/// 0.44 s), so the project is checked once, after the last one. A command still
+/// fails at once for what it refuses itself (an unknown clip, a locked track).
+/// When the result is not valid the list runs again one checked command at a time
+/// to report the error of the first command that broke the project.
+fn mutate_all<'a>(
+    project: &Value,
+    commands: impl Iterator<Item = (&'a str, &'a Value)> + Clone,
+) -> Result<Value, String> {
+    // Between two commands the project has not been checked, so a later command
+    // may meet a shape it never sees otherwise (a keyframe that is a number). It
+    // must not bring the request down: whatever goes wrong in this pass, a panic
+    // included, is settled by the checked pass below.
+    let unchecked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut p = project.clone();
+        for (method, args) in commands.clone() {
+            // What a command refuses itself is the batch's answer at once.
+            if let Err(error) = apply(&mut p, method, args) {
+                return Err((error, true));
+            }
+        }
+        validate_project(&p).map(|()| p).map_err(|e| (e, false))
+    }));
+    let error = match unchecked {
+        Ok(Ok(p)) => return Ok(p),
+        Ok(Err((error, true))) => return Err(error),
+        Ok(Err((error, false))) => error,
+        Err(_) => "편집을 적용하지 못했습니다.".to_owned(),
+    };
+    let mut replay = project.clone();
+    for (method, args) in commands {
+        mutate(&mut replay, method, args)?;
+    }
+    Err(error)
+}
+
+// The command itself; what it leaves is checked by `mutate` or `mutate_all`.
+fn apply(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
+    match method {
+        "edit.add" => {
+            let is_text = args.get("text").is_some();
+            let media = if is_text {
+                None
+            } else {
+                Some(
+                    p["media"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|m| m["id"] == args["mediaId"])
+                        .cloned()
+                        .ok_or("소재를 찾을 수 없습니다.")?,
+                )
+            };
+            let mut kind = if is_text {
+                "text"
+            } else {
+                string(media.as_ref().unwrap(), "kind", "video")
+            };
+            let wanted = if kind == "text" {
+                "text"
+            } else if kind == "audio" {
+                "audio"
+            } else {
+                "video"
+            };
+            // `newTrack` (its name) puts the clip on a track made for it, so that the
+            // track and the clip are one undo step.
+            let new_track = match args.get("newTrack") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(name)) if !name.trim().is_empty() => {
+                    if args.get("trackId").is_some_and(|id| !id.is_null()) {
+                        return Err("trackId와 newTrack은 함께 쓸 수 없습니다.".into());
+                    }
+                    Some(insert_track(p, wanted, name.trim()))
+                }
+                Some(_) => return Err("새 트랙 이름이 올바르지 않습니다.".into()),
+            };
+            let named = new_track.as_deref().or(args["trackId"].as_str());
+            let on = |flag: &str, track: &Value| track[flag].as_bool().unwrap_or(false);
+            let found = p["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| match named {
+                    Some(id) => t["id"] == id,
+                    // Where the clip can be put, seen and heard: never a locked or
+                    // hidden track, nor a muted audio track.
+                    None => {
+                        let unusable = on("locked", t)
+                            || on("hidden", t)
+                            || (wanted == "audio" && on("muted", t));
+                        t["kind"] == wanted && !unusable
+                    }
+                })
+                .cloned();
+            let track = match found {
+                Some(track) => track,
+                None if named.is_some() => return Err("사용할 수 있는 트랙이 없습니다.".into()),
+                // Every track of that kind is locked, hidden or muted: the clip gets
+                // a track of its own, in the same undo step.
+                None => {
+                    let label = match wanted {
+                        "text" => "텍스트",
+                        "audio" => "오디오",
+                        _ => "영상",
+                    };
+                    let count = p["tracks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|t| t["kind"] == wanted)
+                        .count();
+                    let id = insert_track(p, wanted, &format!("{label} {}", count + 1));
+                    p["tracks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|t| t["id"] == id.as_str())
+                        .cloned()
+                        .unwrap()
+                }
+            };
+            let track_id = required(&track, "id")?;
+            ensure_unlocked(p, track_id)?;
+            if track["kind"] == "audio" && media.as_ref().is_some_and(|m| m["hasAudio"] == true) {
+                kind = "audio";
+            }
+            if (kind == "text" && track["kind"] != "text")
+                || (kind == "audio" && track["kind"] != "audio")
+                || (matches!(kind, "video" | "image") && track["kind"] != "video")
+            {
+                return Err("소재와 트랙 종류가 맞지 않습니다.".into());
+            }
+            let fps = number(p, "fps", 30.0);
+            let default_start = p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["trackId"] == track_id)
+                .map(|c| number(c, "start", 0.0) + number(c, "duration", 0.0))
+                .fold(0.0, f64::max);
+            // After an off-grid legacy clip, the next frame rather than an overlap.
+            let default_start = (default_start * fps - 1e-6).ceil().max(0.0) / fps;
+            let duration = number(
+                args,
+                "duration",
+                media
+                    .as_ref()
+                    .map(|m| number(m, "duration", 5.0))
+                    .unwrap_or(3.0),
+            );
+            let mut clip = default_clip(
+                kind,
+                if is_text {
+                    "텍스트"
+                } else {
+                    string(media.as_ref().unwrap(), "name", "클립")
+                },
+                track_id,
+                number(args, "start", default_start),
+                duration,
+            );
+            if let Some(m) = media.as_ref() {
+                clip["mediaId"] = m["id"].clone();
+            }
+            if is_text {
+                clip["text"] = json!({"content":"텍스트를 입력하세요","fontSize":64,"color":"#ffffff","fontFamily":"sans-serif","bold":false,"align":"center","background":"transparent"});
+                if args["text"].is_string() {
+                    clip["text"]["content"] = args["text"].clone();
+                } else {
+                    merge(&mut clip["text"], &args["text"]);
+                }
+                clip["name"] = clip["text"]["content"].clone();
+                shorten(&mut clip["name"]);
+                clip["transform"]["y"] = json!(
+                    number(p, "height", 1080.0)
+                        * free_text_row(p, number(&clip, "start", 0.0), duration)
+                );
+            }
+            if let Some(source) = args.get("sourceIn") {
+                clip["sourceIn"] = source.clone();
+            }
+            // Lets one command place an overlay (a sticker) already named and sized.
+            if args["name"].is_string() {
+                clip["name"] = args["name"].clone();
+                shorten(&mut clip["name"]);
+            }
+            if args["transform"].is_object() {
+                merge(&mut clip["transform"], &args["transform"]);
+            }
+            snap_clip_span(p, &mut clip);
+            p["clips"].as_array_mut().unwrap().push(clip);
+        }
+        "edit.update" => {
+            let id = required(args, "id")?;
+            let index = p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|c| c["id"] == id)
+                .ok_or("클립을 찾을 수 없습니다.")?;
+            ensure_unlocked(p, string(&p["clips"][index], "trackId", ""))?;
+            let patch = args["patch"]
+                .as_object()
+                .ok_or("클립 변경 내용이 없습니다.")?;
+            let original = p["clips"][index].clone();
+            if let Some(track) = patch.get("trackId").and_then(Value::as_str) {
+                ensure_unlocked(p, track)?;
+            }
+            for (key, value) in patch {
+                if !CLIP_FIELDS.contains(&key.as_str()) {
+                    return Err(format!("클립 속성을 변경할 수 없습니다: {key}"));
+                }
+                merge(&mut p["clips"][index][key], value);
+            }
+            // Choosing a system family must release a previously installed font.
+            if let Some(text) = patch.get("text") {
+                if text.get("fontFamily").is_some()
+                    && text["fontFamily"] != original["text"]["fontFamily"]
+                    && text.get("fontPath").is_none()
+                {
+                    if let Some(style) = p["clips"][index]["text"].as_object_mut() {
+                        style.remove("fontId");
+                        style.remove("fontPath");
+                    }
+                }
+            }
+            // A filter sets only the basic grade; hue, HSL, curves and LUT stay.
+            if patch.contains_key("filter") && !patch.contains_key("color") {
+                let color = filter_color(string(&p["clips"][index], "filter", "none"))
+                    .ok_or("지원하지 않는 필터 프리셋입니다.")?;
+                merge(&mut p["clips"][index]["color"], &color);
+            }
+            for (transition, fade) in [("transitionIn", "fadeIn"), ("transitionOut", "fadeOut")] {
+                if patch.contains_key(transition) {
+                    let clip = &mut p["clips"][index];
+                    clip[fade] = if clip[transition].is_null() {
+                        json!(0.0)
+                    } else {
+                        clip[transition]["duration"].clone()
+                    };
+                }
+                sync_transition(&mut p["clips"][index], fade, transition);
+            }
+            // The sound fade of a video clip: a whole number of frames of its own,
+            // or null to follow the picture again. An audio clip has one fade only,
+            // so there the same name sets fadeIn/fadeOut.
+            let fps = number(p, "fps", 30.0);
+            for (audio, fade) in AUDIO_FADES {
+                if !patch.contains_key(audio) {
+                    continue;
+                }
+                let clip = &mut p["clips"][index];
+                let kind = string(clip, "kind", "").to_owned();
+                let on_grid = |value: &Value| match value.as_f64() {
+                    Some(length) if length.is_finite() && length >= 0.0 => {
+                        json!(snap(length, fps) + 0.0)
+                    }
+                    _ => value.clone(),
+                };
+                match kind.as_str() {
+                    "video" if clip[audio].is_null() => {
+                        clip.as_object_mut().unwrap().remove(audio);
+                    }
+                    "video" => clip[audio] = on_grid(&clip[audio]),
+                    "audio" => {
+                        let value = clip.as_object_mut().unwrap().remove(audio);
+                        // As with fadeIn/fadeOut, a transition given in the same
+                        // patch sets the length. One that is only removed (null)
+                        // has no length to give: the fade asked for stays.
+                        let transition = if fade == "fadeIn" {
+                            "transitionIn"
+                        } else {
+                            "transitionOut"
+                        };
+                        let timed = patch.get(transition).is_some_and(Value::is_object);
+                        if let Some(value) = value.filter(|value| !value.is_null() && !timed) {
+                            clip[fade] = on_grid(&value);
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "소리 페이드(audioFadeIn/audioFadeOut)는 영상·오디오 클립에만 쓸 수 있습니다."
+                                .into(),
+                        )
+                    }
+                }
+            }
+            // A speed change keeps the clip's source span. It comes either alone or
+            // with the length that follows from it (what older inspectors sent): the
+            // two are one command with one result. Any other length given with a
+            // speed is a resize and is taken as given.
+            let speed = number(&p["clips"][index], "speed", 1.0);
+            let length = number(&original, "duration", 1.0);
+            let retimed = patch.contains_key("speed")
+                && speed.is_finite()
+                && speed > 0.0
+                && patch.get("duration").is_none_or(|wanted| {
+                    wanted.as_f64().is_some_and(|wanted| {
+                        // From the clip's length, from its remembered span, or either
+                        // already rounded to the frame the editor will choose.
+                        let mut probe = original.clone();
+                        [
+                            length * number(&original, "speed", 1.0),
+                            source_span(p, &original),
+                        ]
+                        .into_iter()
+                        .any(|span| {
+                            probe["speed"] = json!(speed);
+                            probe["duration"] = json!(span / speed);
+                            snap_clip_length(p, &mut probe);
+                            (wanted - span / speed).abs() < 1e-6
+                                || (wanted - number(&probe, "duration", 0.0)).abs() < 1e-6
+                        })
+                    })
+                });
+            let mut clip = p["clips"][index].take();
+            match (
+                patch.contains_key("start"),
+                patch.contains_key("duration") && !retimed,
+            ) {
+                (true, true) => snap_clip_span(p, &mut clip),
+                (true, false) => snap_clip_start(p, &mut clip),
+                (false, true) => snap_clip_length(p, &mut clip),
+                (false, false) => {}
+            }
+            p["clips"][index] = clip;
+            if retimed {
+                let span = source_span(p, &original);
+                let mut clip = p["clips"][index].take();
+                clip["duration"] = json!(span / speed);
+                snap_clip_length(p, &mut clip);
+                clip["sourceSpan"] = json!(span);
+                p["clips"][index] = clip;
+                // Keyframes follow the length the clip really got.
+                let ratio = number(&p["clips"][index], "duration", length) / length;
+                if !patch.contains_key("keyframes") {
+                    if let Some(frames) = p["clips"][index]["keyframes"].as_array_mut() {
+                        // Inside a batch an earlier command may have left a keyframe
+                        // that is not an object; the check after the batch refuses it.
+                        for frame in frames.iter_mut().filter_map(Value::as_object_mut) {
+                            let time = frame.get("time").and_then(Value::as_f64).unwrap_or(0.0);
+                            frame.insert("time".into(), json!(time * ratio));
+                        }
+                    }
+                }
+            }
+            if patch.contains_key("duration") && !retimed && !patch.contains_key("keyframes") {
+                let length = number(&p["clips"][index], "duration", 0.0);
+                if length > 0.0 && length < number(&original, "duration", 0.0) {
+                    let (left, _) = split_keyframes(&original, length);
+                    p["clips"][index]["keyframes"] = left;
+                }
+            }
+            if [
+                "speed",
+                "duration",
+                "fadeIn",
+                "fadeOut",
+                "audioFadeIn",
+                "audioFadeOut",
+                "transitionIn",
+                "transitionOut",
+            ]
+            .iter()
+            .any(|key| patch.contains_key(*key))
+            {
+                fit_clip_fades(&mut p["clips"][index]);
+            }
+            if patch.contains_key("text")
+                && p["clips"][index]["kind"] == "text"
+                && !patch.contains_key("name")
+            {
+                p["clips"][index]["name"] = p["clips"][index]["text"]["content"].clone();
+                shorten(&mut p["clips"][index]["name"]);
+            }
+        }
+        "edit.trim" => {
+            let id = required(args, "id")?;
+            let index = p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|c| c["id"] == id)
+                .ok_or("클립을 찾을 수 없습니다.")?;
+            let original = p["clips"][index].clone();
+            ensure_unlocked(p, string(&original, "trackId", ""))?;
+            if args.get("start").is_none() && args.get("end").is_none() {
+                return Err("트림할 시작 또는 끝 위치가 필요합니다.".into());
+            }
+            let old_start = number(&original, "start", 0.0);
+            let old_end = old_start + number(&original, "duration", 0.0);
+            let boundary = |key: &str, fallback: f64| -> Result<f64, String> {
+                match args.get(key) {
+                    None => Ok(fallback),
+                    Some(value) => value
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| format!("트림 {key} 위치는 유효한 숫자여야 합니다.")),
+                }
+            };
+            let raw = (boundary("start", old_start)?, boundary("end", old_end)?);
+            const TIME_EPSILON: f64 = 1e-8;
+            let fps = number(p, "fps", 30.0);
+            let long_enough =
+                |(start, end): (f64, f64)| start >= 0.0 && end - start + TIME_EPSILON >= 1.0 / fps;
+            if !long_enough(raw) {
+                return Err(
+                    "트림 시작 위치는 0 이상이고 클립 길이는 최소 1프레임이어야 합니다.".into(),
+                );
+            }
+            let media_duration = if matches!(string(&original, "kind", ""), "video" | "audio") {
+                Some(
+                    p["media"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|m| m["id"] == original["mediaId"])
+                        .map(|m| number(m, "duration", 0.0))
+                        .ok_or("클립 원본을 찾을 수 없습니다.")?,
+                )
+            } else {
+                None
+            };
+            let speed = number(&original, "speed", 1.0);
+            let source_in = |(start, end): (f64, f64)| {
+                let offset = if original["reverse"] == true {
+                    old_end - end
+                } else {
+                    start - old_start
+                };
+                number(&original, "sourceIn", 0.0) + offset * speed
+            };
+            let in_source = |range: (f64, f64)| {
+                media_duration.is_none_or(|media_duration| {
+                    let source = source_in(range);
+                    source >= -TIME_EPSILON
+                        && source + (range.1 - range.0) * speed <= media_duration + TIME_EPSILON
+                })
+            };
+            if !in_source(raw) {
+                return Err("트림 범위가 원본 미디어 길이를 벗어납니다.".into());
+            }
+            // A given boundary goes to the nearest frame, or to the frame inside the
+            // requested range when the nearest one is past the source. A boundary that
+            // was not given stays where it is.
+            let pick = |key: &str, value: f64, snapped: f64| {
+                if args.get(key).is_some() {
+                    snapped
+                } else {
+                    value
+                }
+            };
+            let nearest = (
+                pick("start", raw.0, snap(raw.0, fps)),
+                pick("end", raw.1, snap(raw.1, fps)),
+            );
+            let inward = (
+                pick("start", raw.0, (raw.0 * fps - 1e-6).ceil() / fps),
+                pick("end", raw.1, (raw.1 * fps + 1e-6).floor() / fps),
+            );
+            let (start, end) = [nearest, inward]
+                .into_iter()
+                .find(|range| long_enough(*range) && in_source(*range))
+                .unwrap_or(raw);
+            let duration = settle(end - start, fps);
+            let mut trimmed = original.clone();
+            if media_duration.is_some() {
+                trimmed["sourceIn"] = json!(source_in((start, end)).max(0.0));
+            }
+            trimmed["start"] = json!(start);
+            trimmed["duration"] = json!(duration);
+            trimmed["keyframes"] = trim_keyframes(&original, start - old_start, duration);
+            fit_clip_fades(&mut trimmed);
+            p["clips"][index] = trimmed;
+        }
+        "edit.split" => {
+            let id = required(args, "id")?;
+            let i = p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|c| c["id"] == id)
+                .ok_or("클립을 찾을 수 없습니다.")?;
+            let clip = p["clips"][i].clone();
+            ensure_unlocked(p, string(&clip, "trackId", ""))?;
+            let time = args["time"].as_f64().ok_or("분할 위치가 필요합니다.")?;
+            let time = split_time(p, &clip, time)?;
+            let fps = number(p, "fps", 30.0);
+            let start = number(&clip, "start", 0.0);
+            let duration = number(&clip, "duration", 0.0);
+            let relative = settle(time - start, fps);
+            let mut right = clip.clone();
+            right["id"] = json!(media::id("clip"));
+            right["start"] = json!(time);
+            right["duration"] = json!(settle(duration - relative, fps));
+            let speed = number(&clip, "speed", 1.0);
+            let source = number(&clip, "sourceIn", 0.0);
+            if matches!(string(&clip, "kind", ""), "video" | "audio") {
+                if clip["reverse"] == true {
+                    p["clips"][i]["sourceIn"] = json!(source + (duration - relative) * speed);
+                } else {
+                    right["sourceIn"] = json!(source + relative * speed);
+                }
+            }
+            p["clips"][i]["duration"] = json!(relative);
+            p["clips"][i]["fadeOut"] = json!(0.0);
+            right["fadeIn"] = json!(0.0);
+            // A sound fade of the clip's own ends at the cut as well.
+            if p["clips"][i].get("audioFadeOut").is_some() {
+                p["clips"][i]["audioFadeOut"] = json!(0.0);
+            }
+            if right.get("audioFadeIn").is_some() {
+                right["audioFadeIn"] = json!(0.0);
+            }
+            fit_clip_fades(&mut p["clips"][i]);
+            fit_clip_fades(&mut right);
+            let (left_keys, right_keys) = split_keyframes(&clip, relative);
+            p["clips"][i]["keyframes"] = left_keys;
+            right["keyframes"] = right_keys;
+            p["clips"].as_array_mut().unwrap().insert(i + 1, right);
+        }
+        "edit.duplicate" => {
+            let selected = selected_clips(p, args)?;
+            let start = selected
+                .iter()
+                .map(|c| number(c, "start", 0.0))
+                .fold(f64::INFINITY, f64::min);
+            let end = selected
+                .iter()
+                .map(|c| number(c, "start", 0.0) + number(c, "duration", 0.0))
+                .fold(0.0, f64::max);
+            let mut groups = HashMap::new();
+            for mut c in selected {
+                c["id"] = json!(media::id("clip"));
+                c["start"] = json!(settle(
+                    number(&c, "start", 0.0) + end - start,
+                    number(p, "fps", 30.0)
+                ));
+                if let Some(group) = c["groupId"].as_str() {
+                    let new = groups
+                        .entry(group.to_owned())
+                        .or_insert_with(|| media::id("group"))
+                        .clone();
+                    c["groupId"] = json!(new);
+                }
+                p["clips"].as_array_mut().unwrap().push(c);
+            }
+        }
+        "edit.group" | "edit.ungroup" => {
+            let selected = selected_clips(p, args)?;
+            if method == "edit.group" && selected.len() < 2 {
+                return Err("그룹으로 묶을 클립을 두 개 이상 선택해 주세요.".into());
+            }
+            let ids: HashSet<_> = selected.iter().map(|c| string(c, "id", "")).collect();
+            let group = media::id("group");
+            for c in p["clips"].as_array_mut().unwrap() {
+                if ids.contains(string(c, "id", "")) {
+                    if method == "edit.group" {
+                        c["groupId"] = json!(group);
+                    } else {
+                        c.as_object_mut().unwrap().remove("groupId");
+                    }
+                }
+            }
+        }
+        "edit.delete" => {
+            let ids = args["ids"]
+                .as_array()
+                .ok_or("삭제할 클립 목록이 필요합니다.")?;
+            if ids.is_empty() {
+                return Err("삭제할 클립을 선택해 주세요.".into());
+            }
+            let removed: Vec<Value> = p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| ids.contains(&c["id"]))
+                .cloned()
+                .collect();
+            if removed.len() != ids.iter().collect::<HashSet<_>>().len() {
+                return Err("삭제할 클립을 찾을 수 없습니다.".into());
+            }
+            for c in &removed {
+                ensure_unlocked(p, string(c, "trackId", ""))?;
+            }
+            let ripple = args["ripple"].as_bool().unwrap_or(false);
+            let fps = number(p, "fps", 30.0);
+            let clips = p["clips"].as_array_mut().unwrap();
+            clips.retain(|c| !ids.contains(&c["id"]));
+            if ripple {
+                // Close only the time the removed clips held alone: a clip that
+                // overlapped one (a transition) keeps its place relative to the rest.
+                let range = |c: &Value| {
+                    let start = number(c, "start", 0.0);
+                    (start, start + number(c, "duration", 0.0))
+                };
+                let tracks: HashSet<&str> =
+                    removed.iter().map(|r| string(r, "trackId", "")).collect();
+                let mut freed: HashMap<&str, Vec<(f64, f64)>> = HashMap::new();
+                for track in tracks {
+                    let on_track = |c: &&Value| c["trackId"] == track;
+                    let mut gaps: Vec<(f64, f64)> =
+                        removed.iter().filter(on_track).map(range).collect();
+                    for (from, to) in clips.iter().filter(on_track).map(range) {
+                        gaps = gaps
+                            .into_iter()
+                            .flat_map(|(a, b)| [(a, b.min(from)), (a.max(to), b)])
+                            .filter(|(a, b)| b > a)
+                            .collect();
+                    }
+                    // Removed clips may overlap each other; count shared time once.
+                    gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let mut merged: Vec<(f64, f64)> = vec![];
+                    for (a, b) in gaps {
+                        match merged.last_mut() {
+                            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                            _ => merged.push((a, b)),
+                        }
+                    }
+                    freed.insert(track, merged);
+                }
+                for c in clips {
+                    let start = number(c, "start", 0.0);
+                    let shift: f64 = freed
+                        .get(string(c, "trackId", ""))
+                        .into_iter()
+                        .flatten()
+                        .map(|(a, b)| (b.min(start + 0.0001) - a).max(0.0))
+                        .sum();
+                    if shift > 0.0 {
+                        c["start"] = json!(settle(start - shift, fps).max(0.0));
+                    }
+                }
+            }
+        }
+        "edit.track" => {
+            if let Some(id) = args["id"].as_str() {
+                let track = p["tracks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|t| t["id"] == id)
+                    .ok_or("트랙을 찾을 수 없습니다.")?;
+                let patch = args["patch"]
+                    .as_object()
+                    .ok_or("트랙 변경 내용이 없습니다.")?;
+                for (key, value) in patch {
+                    if !["name", "muted", "hidden", "locked"].contains(&key.as_str()) {
+                        return Err(format!("트랙 속성을 변경할 수 없습니다: {key}"));
+                    }
+                    track[key] = value.clone();
+                }
+            } else {
+                let kind = string(args, "kind", "video");
+                if !["video", "audio", "text"].contains(&kind) {
+                    return Err("트랙 종류가 올바르지 않습니다.".into());
+                }
+                let clips = if args.get("clipIds").is_some() {
+                    selected_clips(p, &json!({"ids":args["clipIds"]}))?
+                } else {
+                    Vec::new()
+                };
+                if clips.iter().any(|clip| match kind {
+                    "video" => !matches!(string(clip, "kind", ""), "video" | "image"),
+                    _ => clip["kind"] != kind,
+                }) {
+                    return Err("선택한 클립과 새 트랙 종류가 맞지 않습니다.".into());
+                }
+                let track_id = insert_track(p, kind, string(args, "name", kind));
+                for clip in p["clips"].as_array_mut().unwrap() {
+                    if clips.iter().any(|selected| selected["id"] == clip["id"]) {
+                        clip["trackId"] = json!(track_id);
+                    }
+                }
+            }
+        }
+        "edit.marker" => {
+            let time = args["time"].as_f64().ok_or("마커 위치가 필요합니다.")?;
+            if !time.is_finite() || time < 0.0 {
+                return Err("마커 위치가 올바르지 않습니다.".into());
+            }
+            p["markers"].as_array_mut().unwrap().push(
+                json!({"id":media::id("marker"),"time":time,"label":string(args,"label","마커")}),
+            );
+        }
+        "edit.markerUpdate" => {
+            let id = required(args, "id")?;
+            let marker = p["markers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|m| m["id"] == id)
+                .ok_or("마커를 찾을 수 없습니다.")?;
+            for key in ["time", "label"] {
+                if let Some(value) = args.get(key) {
+                    marker[key] = value.clone();
+                }
+            }
+        }
+        "edit.markerDelete" => {
+            let id = required(args, "id")?;
+            let markers = p["markers"].as_array_mut().unwrap();
+            let count = markers.len();
+            markers.retain(|m| m["id"] != id);
+            if markers.len() == count {
+                return Err("마커를 찾을 수 없습니다.".into());
+            }
+        }
+        "edit.trackDelete" => {
+            let id = required(args, "id")?;
+            ensure_unlocked(p, id)?;
+            p["tracks"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| t["id"] != id);
+            p["clips"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|c| c["trackId"] != id);
+        }
+        "edit.trackMove" => {
+            let id = required(args, "id")?;
+            let tracks = p["tracks"].as_array_mut().unwrap();
+            let from = tracks
+                .iter()
+                .position(|t| t["id"] == id)
+                .ok_or("트랙을 찾을 수 없습니다.")?;
+            let index = args["index"]
+                .as_u64()
+                .filter(|index| (*index as usize) < tracks.len())
+                .ok_or("트랙을 옮길 위치가 올바르지 않습니다.")? as usize;
+            let track = tracks.remove(from);
+            tracks.insert(index, track);
+        }
+        "edit.paste" => {
+            let clips = args["clips"]
+                .as_array()
+                .filter(|clips| !clips.is_empty() && clips.len() <= 1000)
+                .ok_or("붙여넣을 클립 1~1,000개가 필요합니다.")?;
+            let at = args["at"]
+                .as_f64()
+                .filter(|at| at.is_finite() && *at >= 0.0)
+                .ok_or("붙여넣을 위치가 올바르지 않습니다.")?;
+            let earliest = clips
+                .iter()
+                .map(|c| number(c, "start", 0.0))
+                .fold(f64::INFINITY, f64::min);
+            let mut groups = HashMap::new();
+            for source in clips {
+                let fields = source
+                    .as_object()
+                    .ok_or("붙여넣을 클립 형식이 올바르지 않습니다.")?;
+                let mut clip = json!({});
+                for (key, value) in fields {
+                    if key == "kind" || CLIP_FIELDS.contains(&key.as_str()) {
+                        clip[key] = value.clone();
+                    }
+                }
+                let wanted = match string(&clip, "kind", "") {
+                    "text" => "text",
+                    "audio" => "audio",
+                    "video" | "image" => "video",
+                    _ => return Err("붙여넣을 클립 종류가 올바르지 않습니다.".into()),
+                };
+                let usable = |t: &&Value| t["kind"] == wanted && t["locked"] != true;
+                let tracks = p["tracks"].as_array().unwrap();
+                let track = tracks
+                    .iter()
+                    .filter(usable)
+                    .find(|t| t["id"] == clip["trackId"])
+                    .or_else(|| tracks.iter().find(usable))
+                    .ok_or(
+                        "붙여넣을 수 있는 트랙이 없습니다. 트랙을 추가하거나 잠금을 해제해 주세요.",
+                    )?;
+                clip["trackId"] = track["id"].clone();
+                clip["id"] = json!(media::id("clip"));
+                clip["start"] = json!(at + number(&clip, "start", 0.0) - earliest);
+                snap_clip_span(p, &mut clip);
+                fit_clip_fades(&mut clip);
+                if let Some(group) = clip["groupId"].as_str() {
+                    let new = groups
+                        .entry(group.to_owned())
+                        .or_insert_with(|| media::id("group"))
+                        .clone();
+                    clip["groupId"] = json!(new);
+                }
+                p["clips"].as_array_mut().unwrap().push(clip);
+            }
+        }
+        // One command for a ripple: every clip on the track that starts at or after
+        // `from` moves by `delta` (whole frames), however many clips that is.
+        "edit.shift" => {
+            let track = required(args, "trackId")?;
+            ensure_unlocked(p, track)?;
+            let finite = |key: &str| args[key].as_f64().filter(|value| value.is_finite());
+            let from = finite("from").ok_or("이동을 시작할 위치(from)가 필요합니다.")?;
+            let delta = snap(
+                finite("delta").ok_or("이동할 길이(delta)가 필요합니다.")?,
+                number(p, "fps", 30.0),
+            );
+            if delta == 0.0 {
+                return Err("이동할 길이는 최소 1프레임이어야 합니다.".into());
+            }
+            shift_track(p, &json!(track), from, delta)?;
+        }
+        _ => return Err(format!("배치에서 지원하지 않는 편집 명령입니다: {method}")),
+    }
+    Ok(())
+}
+
+// `p` already has `clip` split at `time`: open a gap there and hold `still` in it.
+fn insert_freeze(
+    mut p: Value,
+    mut still: Value,
+    clip: &Value,
+    time: f64,
+    hold: f64,
+) -> Result<Value, String> {
+    still["name"] = json!(format!("{} 정지 프레임", string(clip, "name", "클립")));
+    shorten(&mut still["name"]);
+    let media_id = still["id"].clone();
+    p["media"].as_array_mut().unwrap().push(still);
+    shift_track(&mut p, &clip["trackId"], time, hold)?;
+    mutate(
+        &mut p,
+        "edit.add",
+        &json!({"mediaId":media_id,"trackId":clip["trackId"],"start":time,"duration":hold}),
+    )?;
+    // The held frame keeps the look the clip had at that moment.
+    let relative = time - number(clip, "start", 0.0);
+    let frozen = p["clips"].as_array_mut().unwrap().last_mut().unwrap();
+    for field in [
+        "transform",
+        "color",
+        "filter",
+        "crop",
+        "mask",
+        "chromaKey",
+        "blendMode",
+    ] {
+        if let Some(value) = clip.get(field) {
+            frozen[field] = value.clone();
+        }
+    }
+    for property in keyframe_properties(clip) {
+        if property != "volume" {
+            frozen["transform"][&property] = json!(keyframe_value(clip, &property, relative));
+        }
+    }
+    validate_project(&p)?;
+    Ok(p)
+}
+
+/// The service stores an uploaded file in its imports folder as `<uuid>-<name>`;
+/// the library shows the name the file came with.
+fn uploaded_name(path: &Path, root: &Path) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    let (prefix, name) = (file.get(..36)?, file.get(37..)?);
+    let stored = media::same_path(path.parent()?, &root.join("imports"));
+    (stored
+        && file.as_bytes()[36] == b'-'
+        && !name.is_empty()
+        && uuid::Uuid::parse_str(prefix).is_ok())
+    .then(|| name.to_string())
+}
+
+fn insert_track(p: &mut Value, kind: &str, name: &str) -> String {
+    let id = media::id("track");
+    let tracks = p["tracks"].as_array_mut().unwrap();
+    let after_same_kind = tracks
+        .iter()
+        .rposition(|track| track["kind"] == kind)
+        .map(|index| index + 1)
+        .unwrap_or(tracks.len());
+    let index = if kind == "video" {
+        // Later visual tracks composite on top. Keep newly added footage below captions.
+        after_same_kind.min(
+            tracks
+                .iter()
+                .position(|track| track["kind"] == "text")
+                .unwrap_or(tracks.len()),
+        )
+    } else {
+        after_same_kind
+    };
+    tracks.insert(
+        index,
+        json!({"id":id,"kind":kind,"name":name,"muted":false,"hidden":false,"locked":false}),
+    );
+    id
+}
+
+fn drop_waveform(p: &mut Value, media_id: &str) {
+    for item in p["media"].as_array_mut().into_iter().flatten() {
+        if item["id"] == media_id {
+            item.as_object_mut().unwrap().remove("waveform");
+        }
+    }
+}
+
+fn refresh_media_metadata(p: &mut Value, id: &str, asset: Value) -> Result<Value, String> {
+    let index = p["media"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|item| item["id"] == id)
+        .ok_or("소재를 찾을 수 없습니다.")?;
+    let referencing: Vec<Value> = p["clips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|clip| clip["mediaId"] == id)
+        .cloned()
+        .collect();
+    for clip in &referencing {
+        ensure_unlocked(p, string(clip, "trackId", ""))?;
+    }
+    if p["media"][index]["kind"] == "video" && asset["kind"] == "audio" {
+        let mut audio_tracks: HashMap<String, String> = HashMap::new();
+        for clip in referencing.iter().filter(|clip| clip["kind"] == "video") {
+            let old_track_id = required(clip, "trackId")?;
+            if !audio_tracks.contains_key(old_track_id) {
+                let source_track = p["tracks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|track| track["id"] == old_track_id)
+                    .cloned()
+                    .ok_or("클립의 트랙을 찾을 수 없습니다.")?;
+                let track_id = insert_track(
+                    p,
+                    "audio",
+                    &format!("{} 오디오", string(&source_track, "name", "복구된")),
+                );
+                let track = p["tracks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|track| track["id"] == track_id)
+                    .unwrap();
+                track["muted"] = source_track["muted"].clone();
+                track["hidden"] = source_track["hidden"].clone();
+                audio_tracks.insert(old_track_id.to_owned(), track_id);
+            }
+        }
+        for clip in p["clips"].as_array_mut().unwrap() {
+            if clip["mediaId"] == id && clip["kind"] == "video" {
+                clip["trackId"] = json!(audio_tracks[required(clip, "trackId")?]);
+                clip["kind"] = json!("audio");
+                if clip["stabilize"]["enabled"] == true {
+                    clip["stabilize"]["enabled"] = json!(false);
+                }
+                // Audio clips only fade and have no blend mode. Their one fade is
+                // the sound's: a fade the sound had of its own becomes it.
+                for (audio, fade) in AUDIO_FADES {
+                    if let Some(length) = clip.as_object_mut().unwrap().remove(audio) {
+                        clip[fade] = length;
+                    }
+                }
+                for (transition, fade) in [("transitionIn", "fadeIn"), ("transitionOut", "fadeOut")]
+                {
+                    if clip[transition].is_object() {
+                        clip[transition]["type"] = json!("fade");
+                    }
+                    sync_transition(clip, fade, transition);
+                }
+                clip.as_object_mut().unwrap().remove("blendMode");
+            }
+        }
+    }
+    // The known waveform stays only for what still looks like the same file.
+    let same_file = ["path", "duration", "hasAudio"]
+        .iter()
+        .all(|field| p["media"][index].get(*field) == asset.get(*field));
+    // Preserve identity, the user's name, paths, and any future/custom metadata.
+    for field in [
+        "kind",
+        "duration",
+        "width",
+        "height",
+        "hasAudio",
+        "thumbnail",
+    ] {
+        p["media"][index][field] = asset[field].clone();
+    }
+    // A probe without a waveform leaves it to be computed in the background.
+    let item = p["media"][index].as_object_mut().unwrap();
+    for field in ["codec", "fps"] {
+        match asset.get(field) {
+            Some(value) => item.insert(field.into(), value.clone()),
+            None => item.remove(field),
+        };
+    }
+    if asset["waveform"].is_array() {
+        item.insert("waveform".into(), asset["waveform"].clone());
+    } else if !same_file {
+        item.remove("waveform");
+    }
+    Ok(p["media"][index].clone())
+}
+
+fn selected_clips(p: &Value, args: &Value) -> Result<Vec<Value>, String> {
+    let ids = if let Some(ids) = args["ids"].as_array() {
+        ids.clone()
+    } else {
+        vec![json!(required(args, "id")?)]
+    };
+    if ids.is_empty()
+        || ids.iter().any(|v| v.as_str().is_none())
+        || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+    {
+        return Err("중복되지 않는 클립 ID 목록이 필요합니다.".into());
+    }
+    let selected: Vec<_> = p["clips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| ids.contains(&c["id"]))
+        .cloned()
+        .collect();
+    if selected.len() != ids.len() {
+        return Err("선택한 클립을 찾을 수 없습니다.".into());
+    }
+    for c in &selected {
+        ensure_unlocked(p, string(c, "trackId", ""))?;
+    }
+    Ok(selected)
+}
+
+fn bounded(v: &Value, key: &str, min: f64, max: f64) -> Result<(), String> {
+    let n = v[key]
+        .as_f64()
+        .ok_or_else(|| format!("{key} 값은 숫자여야 합니다."))?;
+    if !n.is_finite() || n < min || n > max {
+        return Err(format!("{key} 값은 {min}~{max} 범위여야 합니다."));
+    }
+    Ok(())
+}
+
+pub fn validate_project(p: &Value) -> Result<(), String> {
+    if !safe_project_id(required(p, "id")?) {
+        return Err("프로젝트 ID가 올바르지 않습니다.".into());
+    }
+    let name = required(p, "name")?;
+    if name.len() > 1000 {
+        return Err("프로젝트 이름이 너무 깁니다.".into());
+    }
+    if p.get("schemaVersion").is_some_and(|v| {
+        !v.as_u64()
+            .is_some_and(|v| (1..=SCHEMA_VERSION).contains(&v))
+    }) {
+        return Err("지원하지 않는 프로젝트 버전입니다.".into());
+    }
+    bounded(p, "width", 16.0, 8192.0)?;
+    bounded(p, "height", 16.0, 8192.0)?;
+    bounded(p, "fps", 1.0, 120.0)?;
+    if p["width"].as_u64().is_none() || p["height"].as_u64().is_none() {
+        return Err("화면 크기는 정수여야 합니다.".into());
+    }
+    if !valid_color(string(p, "background", "")) {
+        return Err("배경 색상 형식이 올바르지 않습니다.".into());
+    }
+    let tracks = p["tracks"].as_array().ok_or("트랙 목록이 없습니다.")?;
+    let clips = p["clips"].as_array().ok_or("클립 목록이 없습니다.")?;
+    let assets = p["media"].as_array().ok_or("소재 목록이 없습니다.")?;
+    if tracks.len() > 128 || clips.len() > 10000 || assets.len() > 10000 {
+        return Err("프로젝트 크기 제한을 초과했습니다.".into());
+    }
+    for list in [tracks, clips, assets] {
+        let mut ids = HashSet::new();
+        for item in list {
+            if !ids.insert(required(item, "id")?) {
+                return Err("중복된 항목 ID가 있습니다.".into());
+            }
+        }
+    }
+    for t in tracks {
+        if !["video", "audio", "text"].contains(&string(t, "kind", "")) {
+            return Err("트랙 종류가 올바르지 않습니다.".into());
+        }
+        for field in ["muted", "hidden", "locked"] {
+            if !t[field].is_boolean() {
+                return Err(format!("트랙 {field} 값이 올바르지 않습니다."));
+            }
+        }
+        if !short_text(t.get("name")) {
+            return Err("트랙 이름이 올바르지 않습니다.".into());
+        }
+    }
+    for asset in assets {
+        for flag in ["missing", "proxy"] {
+            if asset.get(flag).is_some_and(|v| !v.is_boolean()) {
+                return Err(format!("소재 {flag} 표시 값이 올바르지 않습니다."));
+            }
+        }
+        required(asset, "path")?;
+        bounded(asset, "duration", 0.001, 86400.0)?;
+        if !["video", "audio", "image"].contains(&string(asset, "kind", "")) {
+            return Err("소재 종류가 올바르지 않습니다.".into());
+        }
+    }
+    for c in clips {
+        let track = tracks
+            .iter()
+            .find(|t| t["id"] == c["trackId"])
+            .ok_or("클립의 트랙을 찾을 수 없습니다.")?;
+        let kind = string(c, "kind", "");
+        if !["video", "audio", "image", "text"].contains(&kind) {
+            return Err("클립 종류가 올바르지 않습니다.".into());
+        }
+        if (kind == "text" && track["kind"] != "text")
+            || (kind == "audio" && track["kind"] != "audio")
+            || (matches!(kind, "video" | "image") && track["kind"] != "video")
+        {
+            return Err("클립과 트랙 종류가 맞지 않습니다.".into());
+        }
+        bounded(c, "start", 0.0, 86400.0)?;
+        // Preserve legacy sub-frame clips while allowing a full frame at 120fps.
+        bounded(
+            c,
+            "duration",
+            (1.0 / number(p, "fps", 30.0)).min(0.01) - 1e-8,
+            86400.0,
+        )?;
+        bounded(c, "sourceIn", 0.0, 86400.0)?;
+        bounded(c, "speed", 0.1, 16.0)?;
+        bounded(c, "volume", 0.0, 4.0)?;
+        bounded(c, "fadeIn", 0.0, 86400.0)?;
+        bounded(c, "fadeOut", 0.0, 86400.0)?;
+        for (audio, _) in AUDIO_FADES {
+            if c.get(audio).is_some() {
+                if kind != "video" {
+                    return Err(
+                        "소리 페이드(audioFadeIn/audioFadeOut)는 영상 클립에만 따로 둘 수 있습니다."
+                            .into(),
+                    );
+                }
+                bounded(c, audio, 0.0, 86400.0)?;
+            }
+        }
+        if !short_text(c.get("name")) {
+            return Err("클립 이름이 올바르지 않습니다.".into());
+        }
+        if c.get("reverse").is_some_and(|v| !v.is_boolean()) {
+            return Err("역재생 값은 true 또는 false여야 합니다.".into());
+        }
+        if let Some(filter) = c.get("filter").filter(|v| !v.is_null()) {
+            if !filter.as_str().is_some_and(|id| FILTERS.contains(&id)) {
+                return Err("지원하지 않는 필터 프리셋입니다.".into());
+            }
+        }
+        for field in ["transitionIn", "transitionOut"] {
+            if let Some(transition) = c.get(field).filter(|v| !v.is_null()) {
+                optional_fields(transition, &["type", "duration"], "transition")?;
+                let name = string(transition, "type", "");
+                if !TRANSITIONS.contains(&name) {
+                    return Err("지원하지 않는 전환 종류입니다.".into());
+                }
+                if kind == "audio" && name != "fade" {
+                    return Err("오디오 클립의 전환은 fade만 지원합니다.".into());
+                }
+                bounded(transition, "duration", 0.0, 86400.0)?;
+            }
+        }
+        if let Some(mode) = c.get("blendMode").filter(|v| !v.is_null()) {
+            if !mode.as_str().is_some_and(|m| BLEND_MODES.contains(&m)) {
+                return Err("지원하지 않는 블렌드 모드입니다.".into());
+            }
+            if kind == "audio" && mode != "normal" {
+                return Err("블렌드 모드는 영상·이미지·텍스트 클립에 적용할 수 있습니다.".into());
+            }
+        }
+        if kind != "text" {
+            let m = assets
+                .iter()
+                .find(|m| m["id"] == c["mediaId"])
+                .ok_or("클립 원본을 찾을 수 없습니다.")?;
+            if kind == "audio" && m["hasAudio"] != true {
+                return Err("이 소재에는 오디오가 없습니다.".into());
+            }
+            if (kind == "video" && m["kind"] != "video")
+                || (kind == "image" && m["kind"] != "image")
+            {
+                return Err("클립과 원본 소재 종류가 맞지 않습니다.".into());
+            }
+            if matches!(kind, "video" | "audio")
+                && number(c, "sourceIn", 0.0) + number(c, "duration", 0.0) * number(c, "speed", 1.0)
+                    > number(m, "duration", 0.0) + 0.05
+            {
+                return Err(
+                    "클립이 원본 미디어 길이를 초과합니다. 길이 또는 속도를 조정해 주세요.".into(),
+                );
+            }
+        } else {
+            optional_fields(
+                &c["text"],
+                &[
+                    "content",
+                    "fontSize",
+                    "color",
+                    "fontFamily",
+                    "fontId",
+                    "fontPath",
+                    "bold",
+                    "align",
+                    "background",
+                    "italic",
+                    "letterSpacing",
+                    "lineHeight",
+                    "outline",
+                    "shadow",
+                ],
+                "text",
+            )?;
+            let text = c["text"]["content"]
+                .as_str()
+                .ok_or("텍스트 내용은 문자열이어야 합니다.")?;
+            if text.len() > 20000 {
+                return Err("텍스트가 너무 깁니다.".into());
+            }
+            bounded(&c["text"], "fontSize", 8.0, 500.0)?;
+            if let Some(path) = c["text"].get("fontPath") {
+                let path = path
+                    .as_str()
+                    .filter(|s| !s.is_empty() && s.len() < 4096 && !s.chars().any(char::is_control))
+                    .ok_or("추가 글꼴 경로가 올바르지 않습니다.")?;
+                if !["ttf", "otf"].contains(
+                    &Path::new(path)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .as_str(),
+                ) {
+                    return Err("추가 글꼴 경로는 .ttf 또는 .otf 파일이어야 합니다.".into());
+                }
+                if !c["text"]["fontId"].as_str().is_some_and(safe_project_id) {
+                    return Err("추가 글꼴 ID가 올바르지 않습니다.".into());
+                }
+            }
+            if !valid_color(string(&c["text"], "color", "")) {
+                return Err("텍스트 색상 형식이 올바르지 않습니다.".into());
+            }
+            if !["left", "center", "right"].contains(&string(&c["text"], "align", "center")) {
+                return Err("텍스트 정렬이 올바르지 않습니다.".into());
+            }
+            for flag in ["bold", "italic"] {
+                if c["text"].get(flag).is_some() && !c["text"][flag].is_boolean() {
+                    return Err(format!("텍스트 {flag} 값은 true 또는 false여야 합니다."));
+                }
+            }
+            for (field, min, max) in [("letterSpacing", -5.0, 50.0), ("lineHeight", 0.8, 3.0)] {
+                if c["text"].get(field).is_some() {
+                    bounded(&c["text"], field, min, max)?;
+                }
+            }
+            // null clears an outline or shadow.
+            for (field, numbers) in [
+                ("outline", &[("width", 0.0, 20.0)][..]),
+                (
+                    "shadow",
+                    &[
+                        ("x", -200.0, 200.0),
+                        ("y", -200.0, 200.0),
+                        ("blur", 0.0, 40.0),
+                    ][..],
+                ),
+            ] {
+                let Some(style) = c["text"].get(field).filter(|v| !v.is_null()) else {
+                    continue;
+                };
+                let mut allowed = vec!["color"];
+                allowed.extend(numbers.iter().map(|n| n.0));
+                optional_fields(style, &allowed, field)?;
+                if !valid_color(string(style, "color", "")) {
+                    return Err(format!("텍스트 {field} 색상 형식이 올바르지 않습니다."));
+                }
+                for (key, min, max) in numbers {
+                    bounded(style, key, *min, *max)?;
+                }
+            }
+            let background = string(&c["text"], "background", "transparent");
+            if background != "transparent" && !valid_color(background) {
+                return Err("텍스트 배경 색상이 올바르지 않습니다.".into());
+            }
+        }
+        optional_fields(
+            &c["transform"],
+            &["x", "y", "scale", "rotation", "opacity", "flipX", "flipY"],
+            "transform",
+        )?;
+        optional_fields(
+            &c["color"],
+            &[
+                "brightness",
+                "contrast",
+                "saturation",
+                "temperature",
+                "hue",
+                "hsl",
+                "curves",
+                "lut",
+            ],
+            "color",
+        )?;
+        for (field, min, max) in [
+            ("x", -20000.0, 20000.0),
+            ("y", -20000.0, 20000.0),
+            ("scale", 0.01, 20.0),
+            ("rotation", -3600.0, 3600.0),
+            ("opacity", 0.0, 1.0),
+        ] {
+            bounded(&c["transform"], field, min, max)?;
+        }
+        for flag in ["flipX", "flipY"] {
+            if c["transform"].get(flag).is_some() && !c["transform"][flag].is_boolean() {
+                return Err(format!("{flag} 값은 true 또는 false여야 합니다."));
+            }
+        }
+        validate_options(c)?;
+        validate_color(&c["color"])?;
+        if c.get("sourceSpan").is_some_and(|v| !v.is_null()) {
+            bounded(c, "sourceSpan", 0.0, 86400.0 * 16.0)?;
+        }
+        if let Some(group) = c.get("groupId").filter(|v| !v.is_null()) {
+            if !group.as_str().is_some_and(safe_project_id) {
+                return Err("그룹 ID가 올바르지 않습니다.".into());
+            }
+        }
+        for (field, min, max) in [
+            ("brightness", -1.0, 1.0),
+            ("contrast", 0.0, 3.0),
+            ("saturation", 0.0, 3.0),
+            ("temperature", -1.0, 1.0),
+        ] {
+            bounded(&c["color"], field, min, max)?;
+        }
+        let kfs = c["keyframes"]
+            .as_array()
+            .ok_or("키프레임 목록이 올바르지 않습니다.")?;
+        for k in kfs {
+            let property = required(k, "property")?;
+            let bounds = match property {
+                "transform.x" | "transform.y" | "x" | "y" => (-20000.0, 20000.0),
+                "transform.scale" | "scale" => (0.01, 20.0),
+                "transform.rotation" | "rotation" => (-3600.0, 3600.0),
+                "transform.opacity" | "opacity" => (0.0, 1.0),
+                "volume" => (0.0, 4.0),
+                _ => return Err(format!("지원하지 않는 키프레임 속성입니다: {property}")),
+            };
+            bounded(k, "time", 0.0, number(c, "duration", 1.0))?;
+            bounded(k, "value", bounds.0, bounds.1)?;
+            if let Some(easing) = k.get("easing") {
+                if !easing.as_str().is_some_and(|e| EASINGS.contains(&e)) {
+                    return Err("지원하지 않는 키프레임 보간 방식입니다.".into());
+                }
+            }
+        }
+    }
+    let (Some(notes), Some(markers), true) = (
+        p["notes"].as_array(),
+        p["markers"].as_array(),
+        p["concept"].is_object(),
+    ) else {
+        return Err("프로젝트 메모/마커/컨셉 형식이 올바르지 않습니다.".into());
+    };
+    if notes.len() > 10000 || markers.len() > 10000 {
+        return Err("프로젝트 크기 제한을 초과했습니다.".into());
+    }
+    let mut marker_ids = HashSet::new();
+    for marker in markers {
+        if !marker.is_object()
+            || !marker_ids.insert(required(marker, "id")?)
+            || !short_text(marker.get("label"))
+        {
+            return Err("마커 형식이 올바르지 않습니다.".into());
+        }
+        bounded(marker, "time", 0.0, 86400.0)?;
+    }
+    for note in notes {
+        if note["body"].as_str().is_none_or(|body| body.len() > 20000)
+            || note.get("id").is_some_and(|id| !id.is_string())
+        {
+            return Err("메모 형식이 올바르지 않습니다.".into());
+        }
+    }
+    Ok(())
+}
+
+// An optional display name: absent, or a string of bounded size.
+fn short_text(value: Option<&Value>) -> bool {
+    value.is_none_or(|v| v.as_str().is_some_and(|s| s.len() <= 1000))
+}
+
+fn optional_fields(value: &Value, allowed: &[&str], name: &str) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{name} 값은 객체여야 합니다."))?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("지원하지 않는 {name} 속성입니다: {key}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_options(c: &Value) -> Result<(), String> {
+    if let Some(stabilize) = c.get("stabilize") {
+        optional_fields(stabilize, &["enabled", "strength"], "stabilize")?;
+        if stabilize.get("enabled").is_some() && !stabilize["enabled"].is_boolean() {
+            return Err("안정화 사용 여부가 올바르지 않습니다.".into());
+        }
+        if stabilize["enabled"] == true && c["kind"] != "video" {
+            return Err("안정화는 동영상 클립에 적용할 수 있습니다.".into());
+        }
+        if let Some(strength) = stabilize.get("strength") {
+            if !strength.as_u64().is_some_and(|s| (1..=3).contains(&s)) {
+                return Err("안정화 강도는 1, 2, 3 중에서 선택해 주세요.".into());
+            }
+        }
+    }
+    if let Some(crop) = c.get("crop") {
+        optional_fields(crop, &["x", "y", "width", "height"], "crop")?;
+        for (key, default, min) in [
+            ("x", 0.0, 0.0),
+            ("y", 0.0, 0.0),
+            ("width", 1.0, 0.01),
+            ("height", 1.0, 0.01),
+        ] {
+            if crop.get(key).is_some() {
+                bounded(crop, key, min, 1.0)?;
+            } else if default < min {
+                return Err("크롭 범위가 올바르지 않습니다.".into());
+            }
+        }
+        if number(crop, "x", 0.0) + number(crop, "width", 1.0) > 1.00001
+            || number(crop, "y", 0.0) + number(crop, "height", 1.0) > 1.00001
+        {
+            return Err("크롭 영역이 원본 범위를 벗어납니다.".into());
+        }
+    }
+    if let Some(mask) = c.get("mask") {
+        optional_fields(
+            mask,
+            &["type", "x", "y", "width", "height", "feather"],
+            "mask",
+        )?;
+        if !["none", "circle", "rectangle"].contains(&string(mask, "type", "none")) {
+            return Err("지원하지 않는 마스크 종류입니다.".into());
+        }
+        for (key, min, max) in [
+            ("x", 0.0, 1.0),
+            ("y", 0.0, 1.0),
+            ("width", 0.01, 2.0),
+            ("height", 0.01, 2.0),
+            ("feather", 0.0, 1.0),
+        ] {
+            if mask.get(key).is_some() {
+                bounded(mask, key, min, max)?;
+            }
+        }
+    }
+    if let Some(chroma) = c.get("chromaKey") {
+        optional_fields(
+            chroma,
+            &["enabled", "color", "similarity", "blend"],
+            "chromaKey",
+        )?;
+        if chroma.get("enabled").is_some() && !chroma["enabled"].is_boolean() {
+            return Err("크로마키 사용 여부가 올바르지 않습니다.".into());
+        }
+        if chroma.get("color").is_some() && !valid_color(string(chroma, "color", "")) {
+            return Err("크로마키 색상이 올바르지 않습니다.".into());
+        }
+        for (key, min) in [("similarity", 0.01), ("blend", 0.0)] {
+            if chroma.get(key).is_some() {
+                bounded(chroma, key, min, 1.0)?;
+            }
+        }
+    }
+    if let Some(audio) = c.get("audio") {
+        optional_fields(
+            audio,
+            &["normalize", "denoise", "voiceEnhance", "eq"],
+            "audio",
+        )?;
+        for key in ["normalize", "denoise", "voiceEnhance"] {
+            if audio.get(key).is_some() && !audio[key].is_boolean() {
+                return Err(format!("오디오 {key} 값이 올바르지 않습니다."));
+            }
+        }
+        if let Some(eq) = audio.get("eq") {
+            optional_fields(eq, &["bass", "mid", "treble"], "eq")?;
+            for band in ["bass", "mid", "treble"] {
+                if eq.get(band).is_some() {
+                    bounded(eq, band, -20.0, 20.0)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub const CURVE_PRESETS: &[&str] = &[
+    "none",
+    "color_negative",
+    "cross_process",
+    "darker",
+    "increase_contrast",
+    "lighter",
+    "linear_contrast",
+    "medium_contrast",
+    "negative",
+    "strong_contrast",
+    "vintage",
+];
+
+fn validate_color(color: &Value) -> Result<(), String> {
+    if color.get("hue").is_some() {
+        bounded(color, "hue", -180.0, 180.0)?;
+    }
+    if let Some(hsl) = color.get("hsl") {
+        optional_fields(
+            hsl,
+            &["red", "yellow", "green", "cyan", "blue", "magenta"],
+            "hsl",
+        )?;
+        for channel in hsl.as_object().unwrap().values() {
+            optional_fields(channel, &["hue", "saturation", "lightness"], "hsl channel")?;
+            for (key, min, max) in [
+                ("hue", -180.0, 180.0),
+                ("saturation", -1.0, 1.0),
+                ("lightness", -1.0, 1.0),
+            ] {
+                if channel.get(key).is_some() {
+                    bounded(channel, key, min, max)?;
+                }
+            }
+        }
+    }
+    if let Some(curves) = color.get("curves") {
+        optional_fields(
+            curves,
+            &["preset", "master", "red", "green", "blue"],
+            "curves",
+        )?;
+        if !CURVE_PRESETS.contains(&string(curves, "preset", "none")) {
+            return Err("지원하지 않는 곡선 프리셋입니다.".into());
+        }
+        for channel in ["master", "red", "green", "blue"] {
+            if let Some(points) = curves.get(channel) {
+                let points = points
+                    .as_array()
+                    .ok_or("곡선 제어점은 [x,y] 배열이어야 합니다.")?;
+                if points.is_empty() {
+                    continue;
+                }
+                if !(2..=16).contains(&points.len()) {
+                    return Err("곡선은 2~16개의 제어점을 지원합니다.".into());
+                }
+                let mut previous = -1.0;
+                for point in points {
+                    let pair = point
+                        .as_array()
+                        .filter(|v| v.len() == 2)
+                        .ok_or("곡선 제어점은 [x,y] 형식이어야 합니다.")?;
+                    let x = pair[0]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                        .ok_or("곡선 x 범위는 0~1입니다.")?;
+                    let _y = pair[1]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                        .ok_or("곡선 y 범위는 0~1입니다.")?;
+                    if x <= previous {
+                        return Err("곡선 x 값은 중복 없이 오름차순이어야 합니다.".into());
+                    }
+                    previous = x;
+                }
+                if points[0][0].as_f64() != Some(0.0)
+                    || points.last().unwrap()[0].as_f64() != Some(1.0)
+                {
+                    return Err("곡선의 처음과 마지막 x 값은 0과 1이어야 합니다.".into());
+                }
+            }
+        }
+    }
+    if let Some(lut) = color.get("lut") {
+        optional_fields(lut, &["path", "name", "enabled"], "lut")?;
+        if lut.get("enabled").is_some() && !lut["enabled"].is_boolean() {
+            return Err("LUT 사용 여부가 올바르지 않습니다.".into());
+        }
+        if lut["enabled"] != false {
+            let path = Path::new(required(lut, "path")?);
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !["cube", "3dl"].contains(&ext.as_str()) {
+                return Err("LUT 경로는 .cube 또는 .3dl 파일이어야 합니다.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn valid_color(s: &str) -> bool {
+    (s.len() == 7 || s.len() == 9)
+        && s.starts_with('#')
+        && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_timestamp(s: &str) -> Option<f64> {
+    let s = s.trim().replace(',', ".");
+    let parts: Vec<_> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h = parts[0].parse::<u32>().ok()?;
+    let m = parts[1].parse::<u32>().ok()?;
+    let sec = parts[2].parse::<f64>().ok()?;
+    if m >= 60 || !(0.0..60.0).contains(&sec) {
+        return None;
+    }
+    Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec)
+}
+fn parse_srt(content: &str) -> Result<Vec<(f64, f64, String)>, String> {
+    // Lines holding only spaces still separate captions.
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(|line| if line.trim().is_empty() { "" } else { line })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = vec![];
+    for block in normalized.split("\n\n") {
+        let lines: Vec<_> = block.lines().collect();
+        let Some(i) = lines.iter().position(|l| l.contains("-->")) else {
+            continue;
+        };
+        let parts: Vec<_> = lines[i].split("-->").collect();
+        if parts.len() != 2 {
+            return Err("자막 시간 형식이 올바르지 않습니다.".into());
+        }
+        let start = parse_timestamp(parts[0]).ok_or("자막 시작 시간이 올바르지 않습니다.")?;
+        let end = parse_timestamp(parts[1].split_whitespace().next().unwrap_or(""))
+            .ok_or("자막 종료 시간이 올바르지 않습니다.")?;
+        let text = lines[i + 1..].join("\n");
+        if end <= start || text.trim().is_empty() {
+            return Err("빈 자막이나 잘못된 시간 범위가 있습니다.".into());
+        }
+        result.push((start, end, text));
+    }
+    if result.is_empty() {
+        return Err("SRT 자막을 찾을 수 없습니다.".into());
+    }
+    Ok(result)
+}
+fn srt_time(seconds: f64) -> String {
+    let millis = (seconds * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        millis / 3600000,
+        (millis / 60000) % 60,
+        (millis / 1000) % 60,
+        millis % 1000
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn temp() -> PathBuf {
+        std::env::temp_dir().join(media::id("studio-editor-test"))
+    }
+
+    /// Text added without a position (the UI, the CLI and MCP alike) takes the lower
+    /// third, then the centre, then the upper third, so it never covers other text
+    /// shown at that time; a position given by the caller is kept.
+    #[tokio::test]
+    async fn new_text_avoids_text_already_on_screen() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let add = |start: f64| json!({"text":"자막","start":start,"duration":2.0});
+        let y = |p: &Value, i: usize| p["clips"][i]["transform"]["y"].as_f64().unwrap();
+        let p = e.dispatch("edit.add", add(0.0)).await.unwrap();
+        let height = p["height"].as_f64().unwrap();
+        assert!((y(&p, 0) - height * 0.32).abs() < 1e-6);
+        let p = e.dispatch("edit.add", add(1.0)).await.unwrap();
+        assert!(y(&p, 1).abs() < 1e-6, "second overlapping text is centred");
+        let p = e.dispatch("edit.add", add(1.5)).await.unwrap();
+        assert!((y(&p, 2) + height * 0.32).abs() < 1e-6);
+        // Nothing else on screen then: the default row again.
+        let p = e.dispatch("edit.add", add(10.0)).await.unwrap();
+        assert!((y(&p, 3) - height * 0.32).abs() < 1e-6);
+        let mut placed = add(0.5);
+        placed["transform"] = json!({"y": 12.0});
+        let p = e.dispatch("edit.add", placed).await.unwrap();
+        assert_eq!(y(&p, 4), 12.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn write_wav(path: &Path, samples: u32) {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples * 2).to_le_bytes());
+        wav.resize(wav.len() + samples as usize * 2, 0);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn misclassified_audio_editor() -> (Editor, PathBuf) {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let path = dir.join("music.wav");
+        write_wav(&path, 16_000);
+        e.project["media"] = json!([{"id":"old-audio","name":"내 음악","path":path,"kind":"video","duration":2.0,"width":720,"height":720,"hasAudio":true}]);
+        let mut clip = default_clip("video", "음악 클립", "video-1", 3.0, 0.75);
+        clip["mediaId"] = json!("old-audio");
+        clip["sourceIn"] = json!(0.25);
+        clip["speed"] = json!(1.5);
+        clip["volume"] = json!(0.65);
+        clip["keyframes"] = json!([{"property":"volume","time":0.5,"value":0.4}]);
+        e.project["clips"] = json!([clip]);
+        validate_project(&e.project).unwrap();
+        e.persist().unwrap();
+        (e, dir)
+    }
+
+    #[tokio::test]
+    async fn reprobe_repairs_audio_without_changing_identity_or_timing_and_is_one_undo() {
+        let (mut e, dir) = misclassified_audio_editor();
+        let mut unused_asset = e.project["media"][0].clone();
+        let unused_path = dir.join("unused.wav");
+        std::fs::copy(required(&unused_asset, "path").unwrap(), &unused_path).unwrap();
+        unused_asset["id"] = json!("unused-audio");
+        unused_asset["path"] = json!(unused_path);
+        e.project["media"]
+            .as_array_mut()
+            .unwrap()
+            .push(unused_asset);
+        let before = e.project.clone();
+        let updated = e
+            .dispatch(
+                "media.reprobe",
+                json!({"ids":["old-audio","unused-audio"],"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        for field in ["id", "name", "path"] {
+            assert_eq!(updated["media"][0][field], before["media"][0][field]);
+        }
+        assert_eq!(updated["media"][0]["kind"], "audio");
+        assert_eq!(updated["media"][1]["id"], "unused-audio");
+        assert_eq!(updated["media"][1]["kind"], "audio");
+        assert_eq!(updated["media"][0]["width"], 0);
+        assert_eq!(updated["media"][0]["height"], 0);
+        let mut expected_clip = before["clips"][0].clone();
+        expected_clip["kind"] = json!("audio");
+        expected_clip["trackId"] = updated["clips"][0]["trackId"].clone();
+        assert_eq!(updated["clips"][0], expected_clip);
+        let track = updated["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|track| track["id"] == expected_clip["trackId"])
+            .unwrap();
+        assert_eq!(track["kind"], "audio");
+        assert_ne!(track["id"], "audio-1");
+        assert_eq!(updated["revision"], 1);
+        assert_eq!(e.undo.len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        for field in ["media", "clips", "tracks"] {
+            assert_eq!(undone[field], before[field]);
+        }
+        assert!(e.undo.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reprobe_rejects_stale_duplicate_unknown_and_locked_media_atomically() {
+        let (mut e, dir) = misclassified_audio_editor();
+        let before = e.project.clone();
+        for params in [
+            json!({"ids":["old-audio"],"expectedRevision":1}),
+            json!({"ids":["old-audio","old-audio"]}),
+            json!({"ids":["old-audio","missing"]}),
+            json!({"ids":[]}),
+        ] {
+            assert!(e.dispatch("media.reprobe", params).await.is_err());
+            assert_eq!(e.project, before);
+            assert!(e.undo.is_empty());
+        }
+        e.project["tracks"][0]["locked"] = json!(true);
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("media.reprobe", json!({"ids":["old-audio"]}))
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        assert!(e.undo.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reimport_existing_path_repairs_misclassification_without_duplicate_asset() {
+        let (mut e, dir) = misclassified_audio_editor();
+        let path = e.project["media"][0]["path"].clone();
+        let updated = e
+            .dispatch("media.import", json!({"paths":[path]}))
+            .await
+            .unwrap();
+        assert_eq!(updated["media"].as_array().unwrap().len(), 1);
+        assert_eq!(updated["media"][0]["id"], "old-audio");
+        assert_eq!(updated["media"][0]["name"], "내 음악");
+        assert_eq!(updated["media"][0]["kind"], "audio");
+        assert_eq!(updated["clips"][0]["kind"], "audio");
+        assert_eq!(e.undo.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn layer_creation_moves_captions_atomically_and_preserves_font_and_animation() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("edit.add", json!({"text":{"content":"자막","fontFamily":"Custom","fontId":"font-test","fontPath":"/tmp/font.ttf"},"start":2.0,"duration":4.0})).await.unwrap();
+        let id = e.project["clips"][0]["id"].clone();
+        e.dispatch(
+            "edit.update",
+            json!({"id":id,"patch":{"keyframes":[{"property":"opacity","time":1.0,"value":0.8}]}}),
+        )
+        .await
+        .unwrap();
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+        let result = e.dispatch("edit.track", json!({"kind":"text","name":"자막 2","clipIds":[id],"expectedRevision":before["revision"]})).await.unwrap();
+        assert_eq!(e.undo.len(), undo_count + 1);
+        let mut expected_clip = before["clips"][0].clone();
+        expected_clip["trackId"] = result["tracks"][3]["id"].clone();
+        assert_eq!(result["clips"][0], expected_clip);
+        assert_eq!(result["tracks"][3]["name"], "자막 2");
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["tracks"], before["tracks"]);
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn layer_creation_rejects_invalid_selection_and_locked_tracks_without_committing() {
+        let (mut e, dir) = misclassified_audio_editor();
+        e.dispatch("edit.add", json!({"text":{"content":"자막"}}))
+            .await
+            .unwrap();
+        let video_id = e.project["clips"][0]["id"].clone();
+        let text_id = e.project["clips"][1]["id"].clone();
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+        for params in [
+            json!({"kind":"video","clipIds":[video_id,"missing"]}),
+            json!({"kind":"video","clipIds":[video_id,video_id]}),
+            json!({"kind":"video","clipIds":[video_id,text_id]}),
+            json!({"kind":"text","clipIds":[video_id]}),
+            json!({"kind":"video","clipIds":[]}),
+        ] {
+            assert!(e.dispatch("edit.track", params).await.is_err());
+            assert_eq!(e.project, before);
+            assert_eq!(e.undo.len(), undo_count);
+        }
+        e.project["tracks"][0]["locked"] = json!(true);
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("edit.track", json!({"kind":"video","clipIds":[video_id]}))
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        assert_eq!(e.undo.len(), undo_count);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn layer_creation_keeps_new_video_below_caption_layers() {
+        let (mut e, dir) = misclassified_audio_editor();
+        let id = e.project["clips"][0]["id"].clone();
+        let before = e.project.clone();
+        let result = e
+            .dispatch("edit.track", json!({"kind":"video","clipIds":[id]}))
+            .await
+            .unwrap();
+        assert_eq!(result["tracks"][0]["id"], "video-1");
+        assert_eq!(result["tracks"][1]["kind"], "video");
+        assert_eq!(result["tracks"][3]["id"], "text-1");
+        let mut expected_clip = before["clips"][0].clone();
+        expected_clip["trackId"] = result["tracks"][1]["id"].clone();
+        assert_eq!(result["clips"][0], expected_clip);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["tracks"], before["tracks"]);
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preset_catalog_survives_restart_and_apply_is_one_revision_guarded_undo() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch(
+                "edit.add",
+                json!({"text":{"content":"preset"},"duration":4.0}),
+            )
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        let p = e
+            .dispatch(
+                "edit.update",
+                json!({"id":id,"patch":{"color":{"brightness":0.3,"saturation":0.7}}}),
+            )
+            .await
+            .unwrap();
+        let preset = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":id,"name":"My color","kind":"filter"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p, e.project,
+            "saving catalog must not edit project or history"
+        );
+        let before = e
+            .dispatch(
+                "edit.update",
+                json!({"id":id,"patch":{"color":{"brightness":-0.2,"hsl":{"red":{"hue":60}}}}}),
+            )
+            .await
+            .unwrap();
+        assert!(e
+            .dispatch(
+                "presets.apply",
+                json!({"id":preset["id"],"clipId":id,"expectedRevision":0})
+            )
+            .await
+            .is_err());
+        let applied = e
+            .dispatch(
+                "presets.apply",
+                json!({"id":preset["id"],"clipId":id,"expectedRevision":before["revision"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied["clips"][0]["color"]["brightness"], 0.3);
+        assert_eq!(applied["clips"][0]["color"]["hsl"]["red"]["hue"], 0.0);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        let exported = dir.join("my-filter.json");
+        e.dispatch("presets.export", json!({"id":preset["id"],"path":exported}))
+            .await
+            .unwrap();
+        let imported = e
+            .dispatch("presets.import", json!({"path":exported}))
+            .await
+            .unwrap();
+        assert_eq!(imported["patch"], preset["patch"]);
+        assert_ne!(imported["id"], preset["id"]);
+        drop(e);
+        let mut reopened = Editor::new(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.dispatch("assets.list", json!({})).await.unwrap()["presets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn effect_presets_scale_timing_and_respect_locks() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch(
+                "edit.add",
+                json!({"text":{"content":"effect"},"duration":4.0}),
+            )
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        e.dispatch("edit.update",json!({"id":id,"patch":{"fadeIn":1.0,"keyframes":[{"property":"scale","time":4.0,"value":1.5}]}})).await.unwrap();
+        let preset = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":id,"name":"Slow zoom","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        e.dispatch("edit.update", json!({"id":id,"patch":{"duration":8.0}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("presets.apply", json!({"clipId":id,"id":preset["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["keyframes"][0]["time"], 8.0);
+        assert_eq!(p["clips"][0]["fadeIn"], 2.0);
+        e.dispatch("edit.track", json!({"id":"text-1","patch":{"locked":true}}))
+            .await
+            .unwrap();
+        assert!(e
+            .dispatch("presets.apply", json!({"clipId":id,"id":preset["id"]}))
+            .await
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// An effect preset of a video clip carries its sound fade: the clip's own
+    /// lengths, scaled like the picture's, or that the sound follows the picture.
+    #[tokio::test]
+    async fn effect_presets_carry_the_sound_fade_of_a_video_clip() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.project = trim_project("video", false, 1.0);
+        let text = e.project["clips"][1]["id"].clone();
+        let own = json!({"fadeIn":1.0,"audioFadeIn":0.5,"audioFadeOut":0.2});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":own}))
+            .await
+            .unwrap();
+        let preset = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Own sound","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preset["patch"]["audioFadeIn"], 0.5);
+        assert_eq!(preset["patch"]["audioFadeOut"], 0.2);
+        // Twice as long, and following the picture again: the preset brings the
+        // sound's own fades back at twice their length.
+        let reset = json!({"duration":8.0,"audioFadeIn":null,"audioFadeOut":null});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":reset}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":preset["id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 2.0);
+        assert_eq!(p["clips"][0]["audioFadeIn"], 1.0);
+        assert_eq!(p["clips"][0]["audioFadeOut"], 0.4);
+        // A text has no sound: the rest of the effect applies.
+        let p = e
+            .dispatch("presets.apply", json!({"clipId":text,"id":preset["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][1]["fadeIn"], 0.5);
+        assert!(p["clips"][1].get("audioFadeIn").is_none());
+        assert!(p["clips"][1].get("audioFadeOut").is_none());
+
+        // A clip whose sound follows the picture says so, and a text says nothing.
+        let follow = json!({"audioFadeIn":null,"audioFadeOut":null});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":follow}))
+            .await
+            .unwrap();
+        let following = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Follows","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert!(following["patch"]["audioFadeIn"].is_null());
+        assert!(following["patch"]
+            .as_object()
+            .unwrap()
+            .contains_key("audioFadeOut"));
+        let from_text = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":text,"name":"Text","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert!(from_text["patch"].get("audioFadeIn").is_none());
+        let own = json!({"audioFadeIn":0.5,"audioFadeOut":0.5});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":own}))
+            .await
+            .unwrap();
+        // From a text the sound fade stays; from the following clip it follows again.
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":from_text["id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["audioFadeIn"], 0.5);
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":following["id"]}),
+            )
+            .await
+            .unwrap();
+        assert!(p["clips"][0].get("audioFadeIn").is_none());
+        assert!(p["clips"][0].get("audioFadeOut").is_none());
+
+        // An audio clip has one fade, under either name, and its preset holds it.
+        e.project = trim_project("audio", false, 1.0);
+        let alias = json!({"audioFadeIn":0.5,"fadeOut":1.0});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":alias}))
+            .await
+            .unwrap();
+        let sound = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Sound","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sound["target"], "audio");
+        assert_eq!(sound["patch"]["fadeIn"], 0.5);
+        assert_eq!(sound["patch"]["fadeOut"], 1.0);
+        assert!(sound["patch"].get("audioFadeIn").is_none());
+        // A transition in the same patch sets the length, as it does beside fadeIn.
+        let both = json!({"audioFadeIn":0.5,"transitionIn":{"type":"fade","duration":1.5}});
+        let p = e
+            .dispatch("edit.update", json!({"id":"trim-clip","patch":both}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.5);
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.5);
+        assert!(p["clips"][0].get("audioFadeIn").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn font_apply_persists_managed_path_and_system_family_releases_it() {
+        let Some(source) = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file()) else {
+            return;
+        };
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":"Custom font"}}))
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        let font = e
+            .dispatch("fonts.import", json!({"path":source}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("fonts.apply", json!({"id":font["id"],"clipId":id}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["text"]["fontPath"], font["path"]);
+        e.dispatch("fonts.remove", json!({"id":font["id"]}))
+            .await
+            .unwrap();
+        assert!(e.asset_path(font["id"].as_str().unwrap(), false).is_some());
+        drop(e);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert_eq!(e.project["clips"][0]["text"]["fontId"], font["id"]);
+        let p = e
+            .dispatch(
+                "edit.update",
+                json!({"id":id,"patch":{"text":{"fontFamily":"Arial"}}}),
+            )
+            .await
+            .unwrap();
+        assert!(p["clips"][0]["text"].get("fontPath").is_none());
+        let p = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(p["clips"][0]["text"]["fontId"], font["id"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn batch_is_atomic_and_undo_revision_is_monotonic() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":"한글 자막"}}))
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        let rev = p["revision"].as_u64().unwrap();
+        let fail=e.dispatch("edit.batch",json!({"commands":[{"method":"edit.update","params":{"id":id,"patch":{"start":2}}},{"method":"edit.update","params":{"id":"missing","patch":{"start":3}}}]})).await;
+        assert!(fail.is_err());
+        assert_eq!(e.project, p);
+        let undo = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert!(undo["clips"].as_array().unwrap().is_empty());
+        assert!(undo["revision"].as_u64().unwrap() > rev);
+        let redo = e.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(redo["clips"][0]["text"]["content"], "한글 자막");
+        drop(e);
+        let reopened = Editor::new(dir.clone()).unwrap();
+        assert_eq!(reopened.project, redo);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn locking_and_stale_writes_are_rejected() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("edit.track", json!({"id":"text-1","patch":{"locked":true}}))
+            .await
+            .unwrap();
+        assert!(e
+            .dispatch(
+                "edit.add",
+                json!({"trackId":"text-1","text":{"content":"x"}})
+            )
+            .await
+            .is_err());
+        assert!(e
+            .dispatch(
+                "project.update",
+                json!({"expectedRevision":0,"patch":{"name":"stale"}})
+            )
+            .await
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn subtitles_round_trip_and_invalid_timestamp() {
+        let s = "1\n00:00:01,200 --> 00:00:03,450\n첫 줄\n둘째 줄\n";
+        let v = parse_srt(s).unwrap();
+        assert_eq!(v[0], (1.2, 3.45, "첫 줄\n둘째 줄".into()));
+        assert_eq!(srt_time(v[0].1), "00:00:03,450");
+        assert!(parse_srt("1\n00:00:05,000 --> 00:00:01,000\nno").is_err());
+        let spaced =
+            "1\n00:00:01,000 --> 00:00:02,000\n하나\n \t\n2\n00:00:03,000 --> 00:00:04,000\n둘\n";
+        let v = parse_srt(spaced).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].2, "하나");
+    }
+
+    fn trim_project(kind: &str, reverse: bool, speed: f64) -> Value {
+        let mut p = empty_project("trim", 1920, 1080, 30.0);
+        p["media"] = json!([{"id":"trim-media","path":"/tmp/trim-test.mp4","kind":kind,"duration":30.0,"hasAudio":true}]);
+        let track = if kind == "audio" {
+            "audio-1"
+        } else {
+            "video-1"
+        };
+        let mut clip = default_clip(kind, "source", track, 10.0, 4.0);
+        clip["id"] = json!("trim-clip");
+        clip["mediaId"] = json!("trim-media");
+        clip["sourceIn"] = json!(8.0);
+        clip["speed"] = json!(speed);
+        clip["reverse"] = json!(reverse);
+        clip["groupId"] = json!("keep-group");
+        p["clips"] = json!([clip]);
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"neighbour","start":16.0,"duration":2.0}),
+        )
+        .unwrap();
+        p
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-8, "{actual} != {expected}");
+    }
+
+    fn source_at(clip: &Value, timeline: f64) -> f64 {
+        let local = timeline - number(clip, "start", 0.0);
+        let source_time = if clip["reverse"] == true {
+            number(clip, "duration", 0.0) - local
+        } else {
+            local
+        };
+        number(clip, "sourceIn", 0.0) + source_time * number(clip, "speed", 1.0)
+    }
+
+    #[test]
+    fn trim_and_extend_preserve_forward_reverse_source_positions_at_speed() {
+        for kind in ["video", "audio"] {
+            for reverse in [false, true] {
+                for speed in [0.5, 2.0] {
+                    let original = trim_project(kind, reverse, speed);
+                    for bounds in [
+                        json!({"start":11.0}),
+                        json!({"end":13.0}),
+                        json!({"start":11.0,"end":13.0}),
+                        json!({"start":9.0}),
+                        json!({"end":15.0}),
+                        json!({"start":9.0,"end":15.0}),
+                    ] {
+                        let mut p = original.clone();
+                        let mut args = bounds;
+                        args["id"] = json!("trim-clip");
+                        mutate(&mut p, "edit.trim", &args).unwrap();
+                        let trimmed = &p["clips"][0];
+                        let start = number(trimmed, "start", 0.0);
+                        let end = start + number(trimmed, "duration", 0.0);
+                        for timeline in [start, (start + end) / 2.0, end] {
+                            assert_close(
+                                source_at(trimmed, timeline),
+                                source_at(&original["clips"][0], timeline),
+                            );
+                        }
+                        for field in [
+                            "id",
+                            "trackId",
+                            "mediaId",
+                            "groupId",
+                            "speed",
+                            "reverse",
+                            "name",
+                            "transform",
+                            "color",
+                        ] {
+                            assert_eq!(trimmed[field], original["clips"][0][field]);
+                        }
+                        assert_eq!(p["clips"][1], original["clips"][1]);
+                        assert_eq!(p["tracks"], original["tracks"]);
+                        assert_eq!(p["media"], original["media"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trim_can_extend_to_both_exact_media_boundaries() {
+        for reverse in [false, true] {
+            let mut p = trim_project("video", reverse, 2.0);
+            let original = p["clips"][0].clone();
+            let (start, end) = if reverse { (3.0, 18.0) } else { (6.0, 21.0) };
+            mutate(
+                &mut p,
+                "edit.trim",
+                &json!({"id":"trim-clip","start":start,"end":end}),
+            )
+            .unwrap();
+            let trimmed = &p["clips"][0];
+            assert_eq!(trimmed["sourceIn"], 0.0);
+            assert_eq!(trimmed["duration"], 15.0);
+            for time in [start, 10.0, 14.0, end] {
+                assert_close(source_at(trimmed, time), source_at(&original, time));
+            }
+        }
+    }
+
+    #[test]
+    fn trim_keyframes_preserve_retained_animation_and_hold_extended_edges() {
+        let mut original = empty_project("animation", 1920, 1080, 30.0);
+        mutate(
+            &mut original,
+            "edit.add",
+            &json!({"text":"animated","start":5.0,"duration":8.0}),
+        )
+        .unwrap();
+        let id = original["clips"][0]["id"].clone();
+        mutate(
+            &mut original,
+            "edit.update",
+            &json!({"id":id,"patch":{"keyframes":[
+                {"property":"transform.scale","time":4.0,"value":2.0},
+                {"property":"scale","time":8.0,"value":1.0},
+                {"property":"x","time":0.0,"value":0.0},
+                {"property":"x","time":6.0,"value":120.0},
+                {"property":"volume","time":2.0,"value":0.2},
+                {"property":"volume","time":8.0,"value":0.8}
+            ]}}),
+        )
+        .unwrap();
+        for (start, end) in [(7.0, 11.0), (3.0, 15.0), (3.0, 11.0), (7.0, 15.0)] {
+            let mut p = original.clone();
+            mutate(
+                &mut p,
+                "edit.trim",
+                &json!({"id":id,"start":start,"end":end}),
+            )
+            .unwrap();
+            let trimmed = &p["clips"][0];
+            let duration = end - start;
+            for time in [0.0, 0.5, 2.0, duration / 2.0, duration - 0.1, duration] {
+                for property in ["scale", "x", "volume"] {
+                    assert_close(
+                        keyframe_value(trimmed, property, time),
+                        keyframe_value(&original["clips"][0], property, time + start - 5.0),
+                    );
+                }
+            }
+            for keyframe in trimmed["keyframes"].as_array().unwrap() {
+                assert!((0.0..=duration).contains(&number(keyframe, "time", -1.0)));
+            }
+        }
+    }
+
+    #[test]
+    fn static_clips_extend_without_source_limits_and_trim_fades_with_metadata() {
+        let mut p = trim_project("image", true, 2.0);
+        let text_id = p["clips"][1]["id"].clone();
+        for id in [json!("trim-clip"), text_id] {
+            mutate(
+                &mut p,
+                "edit.trim",
+                &json!({"id":id,"start":0.0,"end":100.0}),
+            )
+            .unwrap();
+        }
+        assert_eq!(p["clips"][0]["sourceIn"], 8.0);
+        assert_eq!(p["clips"][1]["sourceIn"], 0.0);
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{
+                "transitionIn":{"type":"fade","duration":4.0},
+                "transitionOut":{"type":"fade","duration":3.0}
+            }}),
+        )
+        .unwrap();
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":10.0,"end":11.0}),
+        )
+        .unwrap();
+        // Each fade is limited to the 1 s clip, then the two share it.
+        for (fade, transition) in [("fadeIn", "transitionIn"), ("fadeOut", "transitionOut")] {
+            assert_eq!(p["clips"][0][fade], 0.5);
+            assert_eq!(p["clips"][0][transition]["duration"], 0.5);
+        }
+        assert_eq!(p["clips"][0]["sourceIn"], 8.0);
+    }
+
+    #[tokio::test]
+    async fn trim_is_one_persisted_revision_and_one_undo_with_redo() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.project = trim_project("video", true, 2.0);
+        e.persist().unwrap();
+        let before = e.project.clone();
+        let trimmed = e
+            .dispatch(
+                "edit.trim",
+                json!({"id":"trim-clip","start":11.0,"end":13.0,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trimmed["revision"], 1);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, trimmed);
+        let undone = e
+            .dispatch("history.undo", json!({"expectedRevision":1}))
+            .await
+            .unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        assert_eq!(undone["revision"], 2);
+        assert!(e.undo.is_empty());
+        let redone = e
+            .dispatch("history.redo", json!({"expectedRevision":2}))
+            .await
+            .unwrap();
+        assert_eq!(redone["clips"], trimmed["clips"]);
+        assert_eq!(redone["revision"], 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_trim_ranges_stale_revisions_and_locks_are_atomic() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        for reverse in [false, true] {
+            e.project = trim_project("video", reverse, 2.0);
+            e.persist().unwrap();
+            e.refresh_missing();
+            let before = e.project.clone();
+            let invalid = [
+                json!({}),
+                json!({"start":null}),
+                json!({"end":"12"}),
+                json!({"start":-1.0}),
+                json!({"start":14.0}),
+                json!({"end":10.0}),
+                json!({"start":13.99}),
+                json!({"start":12.0,"end":11.0}),
+                json!({"start":if reverse {2.0} else {5.0}}),
+                json!({"end":if reverse {19.0} else {22.0}}),
+                json!({"start":11.0,"expectedRevision":99}),
+                json!({"start":11.0,"expectedRevision":"0"}),
+            ];
+            for mut args in invalid {
+                args["id"] = json!("trim-clip");
+                assert!(
+                    e.dispatch("edit.trim", args.clone()).await.is_err(),
+                    "accepted {args}"
+                );
+                assert_eq!(e.project, before);
+                assert!(e.undo.is_empty());
+                assert_eq!(Editor::new(dir.clone()).unwrap().project, before);
+            }
+            e.project["tracks"][0]["locked"] = json!(true);
+            let locked = e.project.clone();
+            assert!(e
+                .dispatch("edit.trim", json!({"id":"trim-clip","start":11.0}))
+                .await
+                .is_err());
+            assert_eq!(e.project, locked);
+            assert!(e.undo.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trim_batch_is_atomic_and_multi_clip_split_is_one_undo() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.project = trim_project("video", false, 1.0);
+        let other_id = e.project["clips"][1]["id"].clone();
+        e.project["clips"][1]["start"] = json!(10.0);
+        e.project["clips"][1]["duration"] = json!(4.0);
+        e.persist().unwrap();
+        let before = e.project.clone();
+        assert!(e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":0,"commands":[
+                    {"method":"edit.trim","params":{"id":"trim-clip","start":11.0}},
+                    {"method":"edit.trim","params":{"id":other_id,"end":9.0}}
+                ]})
+            )
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        assert!(e.undo.is_empty());
+        let split = e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":0,"commands":[
+                    {"method":"edit.split","params":{"id":"trim-clip","time":12.0}},
+                    {"method":"edit.split","params":{"id":other_id,"time":12.0}}
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(split["clips"].as_array().unwrap().len(), 4);
+        assert_eq!(split["revision"], 1);
+        assert_eq!(e.undo.len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_reverse_source_ranges_fades_and_static_sources() {
+        let mut p = trim_project("video", true, 2.0);
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{
+                "transitionIn":{"type":"fade","duration":1.5},
+                "transitionOut":{"type":"fade","duration":2.5}
+            }}),
+        )
+        .unwrap();
+        let original = p["clips"][0].clone();
+        mutate(&mut p, "edit.split", &json!({"id":"trim-clip","time":11.0})).unwrap();
+        assert_eq!(p["clips"][0]["sourceIn"], 14.0);
+        assert_eq!(p["clips"][1]["sourceIn"], 8.0);
+        for (index, times) in [(0, [10.0, 10.5, 11.0]), (1, [11.0, 12.5, 14.0])] {
+            for time in times {
+                assert_close(
+                    source_at(&p["clips"][index], time),
+                    source_at(&original, time),
+                );
+            }
+        }
+        assert_eq!(p["clips"][0]["fadeIn"], 1.0);
+        assert_eq!(p["clips"][0]["fadeOut"], 0.0);
+        assert_eq!(p["clips"][1]["fadeIn"], 0.0);
+        assert_eq!(p["clips"][1]["fadeOut"], 2.5);
+        assert!(p["clips"][0]["transitionOut"].is_null());
+        assert!(p["clips"][1]["transitionIn"].is_null());
+        let mut image = trim_project("image", false, 2.0);
+        mutate(
+            &mut image,
+            "edit.split",
+            &json!({"id":"trim-clip","time":11.0}),
+        )
+        .unwrap();
+        assert_eq!(image["clips"][0]["sourceIn"], 8.0);
+        assert_eq!(image["clips"][1]["sourceIn"], 8.0);
+    }
+
+    #[test]
+    fn trim_and_split_allow_exactly_one_frame_including_120fps() {
+        for fps in [24.0, 30.0, 60.0, 120.0] {
+            let mut original = trim_project("video", false, 1.0);
+            original["fps"] = json!(fps);
+            let frame = 1.0 / fps;
+            let mut trimmed = original.clone();
+            mutate(
+                &mut trimmed,
+                "edit.trim",
+                &json!({"id":"trim-clip","end":10.0+frame}),
+            )
+            .unwrap();
+            assert_close(number(&trimmed["clips"][0], "duration", 0.0), frame);
+            let mut split = original.clone();
+            split["clips"][0]["duration"] = json!(2.0 * frame);
+            mutate(
+                &mut split,
+                "edit.split",
+                &json!({"id":"trim-clip","time":10.0+frame}),
+            )
+            .unwrap();
+            for clip in split["clips"].as_array().unwrap().iter().take(2) {
+                assert_close(number(clip, "duration", 0.0), frame);
+            }
+            for time in [10.0 + frame * 0.9, 14.0 - frame * 0.9] {
+                let mut invalid = original.clone();
+                assert!(mutate(
+                    &mut invalid,
+                    "edit.split",
+                    &json!({"id":"trim-clip","time":time})
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_frame_120fps_trim_survives_persistence_and_reopen() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.project = trim_project("video", true, 2.0);
+        e.project["fps"] = json!(120.0);
+        e.persist().unwrap();
+        let trimmed = e
+            .dispatch(
+                "edit.trim",
+                json!({"id":"trim-clip","end":10.0+1.0/120.0,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_close(number(&trimmed["clips"][0], "duration", 0.0), 1.0 / 120.0);
+        drop(e);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, trimmed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_keeps_source_ranges() {
+        let mut p = empty_project("test", 1920, 1080, 30.0);
+        p["media"] = json!([{"id":"m","path":"/tmp/test.mp4","kind":"video","duration":20.0,"hasAudio":true}]);
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"mediaId":"m","start":2.0,"duration":8.0}),
+        )
+        .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        mutate(&mut p, "edit.split", &json!({"id":id,"time":5.0})).unwrap();
+        assert_eq!(p["clips"][0]["duration"], 3.0);
+        assert_eq!(p["clips"][1]["sourceIn"], 3.0);
+        assert_eq!(p["clips"][1]["duration"], 5.0);
+    }
+    #[test]
+    fn split_preserves_animation_at_boundary_and_after() {
+        let mut p = empty_project("test", 1920, 1080, 30.0);
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"animated"},"start":1.0,"duration":8.0}),
+        )
+        .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        mutate(&mut p,"edit.update",&json!({"id":id,"patch":{"keyframes":[{"property":"transform.scale","time":4.0,"value":2.0},{"property":"scale","time":8.0,"value":1.0},{"property":"x","time":0.0,"value":0.0},{"property":"x","time":6.0,"value":120.0}]}})).unwrap();
+        let original = p["clips"][0].clone();
+        mutate(&mut p, "edit.split", &json!({"id":id,"time":3.0})).unwrap();
+        assert!((keyframe_value(&p["clips"][0], "scale", 2.0) - 1.5).abs() < 0.00001);
+        assert!((keyframe_value(&p["clips"][1], "scale", 0.0) - 1.5).abs() < 0.00001);
+        for time in [0.0, 0.5, 2.0, 3.5, 5.0] {
+            for property in ["scale", "x"] {
+                assert!(
+                    (keyframe_value(&p["clips"][1], property, time)
+                        - keyframe_value(&original, property, time + 2.0))
+                    .abs()
+                        < 0.00001
+                );
+            }
+        }
+        let right_id = p["clips"][1]["id"].clone();
+        assert!(mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":right_id,"patch":{"crop":{"x":0.9,"width":0.5}}})
+        )
+        .is_err());
+    }
+    #[test]
+    fn groups_bulk_duplicates_and_ripple_union() {
+        let mut p = empty_project("groups", 320, 180, 24.0);
+        for start in [0.0, 2.0] {
+            mutate(
+                &mut p,
+                "edit.add",
+                &json!({"text":{"content":"clip"},"start":start,"duration":1.0}),
+            )
+            .unwrap();
+        }
+        let ids: Vec<_> = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].clone())
+            .collect();
+        mutate(&mut p, "edit.group", &json!({"ids":ids})).unwrap();
+        let original_group = p["clips"][0]["groupId"].clone();
+        assert_eq!(original_group, p["clips"][1]["groupId"]);
+        mutate(&mut p, "edit.duplicate", &json!({"ids":ids})).unwrap();
+        assert_eq!(p["clips"][2]["start"], 3.0);
+        assert_eq!(p["clips"][3]["start"], 5.0);
+        assert_eq!(p["clips"][2]["groupId"], p["clips"][3]["groupId"]);
+        assert_ne!(original_group, p["clips"][2]["groupId"]);
+        let copies = vec![p["clips"][2]["id"].clone(), p["clips"][3]["id"].clone()];
+        mutate(&mut p, "edit.ungroup", &json!({"ids":copies})).unwrap();
+        assert!(p["clips"][2].get("groupId").is_none());
+        assert_eq!(p["clips"][0]["groupId"], original_group);
+        let mut p = empty_project("ripple", 320, 180, 24.0);
+        for (start, duration) in [(0.0, 2.0), (1.0, 2.0), (4.0, 1.0)] {
+            mutate(
+                &mut p,
+                "edit.add",
+                &json!({"text":{"content":"clip"},"start":start,"duration":duration}),
+            )
+            .unwrap();
+        }
+        let removed = vec![p["clips"][0]["id"].clone(), p["clips"][1]["id"].clone()];
+        mutate(&mut p, "edit.delete", &json!({"ids":removed,"ripple":true})).unwrap();
+        assert_eq!(p["clips"][0]["start"], 1.0);
+    }
+    #[test]
+    fn invalid_color_curves_and_stabilization_are_rejected() {
+        let mut p = empty_project("invalid", 320, 180, 24.0);
+        mutate(&mut p, "edit.add", &json!({"text":{"content":"text"}})).unwrap();
+        let id = p["clips"][0]["id"].clone();
+        for patch in [
+            json!({"color":{"curves":{"master":[[0,0],[0.5,0.5],[0.4,0.8],[1,1]]}}}),
+            json!({"color":{"hsl":{"red":{"hue":181}}}}),
+            json!({"stabilize":{"enabled":true,"strength":2}}),
+        ] {
+            let mut candidate = p.clone();
+            assert!(mutate(
+                &mut candidate,
+                "edit.update",
+                &json!({"id":id,"patch":patch})
+            )
+            .is_err());
+        }
+    }
+
+    // The exact shape written by builds that predate schemaVersion, including
+    // the filter ids the UI stored and a zero-length fade transition.
+    fn v1_project() -> Value {
+        json!({"id":"project-legacy","name":"여행 브이로그","revision":41,"width":1080,"height":1920,
+            "fps":30.0,"background":"#111111","updatedAt":1700000000000u64,
+            "concept":{"audience":"친구","message":"쉼","appeal":"","direction":""},
+            "media":[{"id":"media-1","name":"clip.mp4","path":"/nonexistent/clip.mp4","kind":"video",
+                "duration":12.5,"width":1920,"height":1080,"hasAudio":true,"thumbnail":"/nonexistent/t.jpg","waveform":[0.1,0.4]}],
+            "tracks":[{"id":"video-1","name":"영상 1","kind":"video","muted":false,"hidden":false,"locked":false},
+                {"id":"audio-1","name":"오디오 1","kind":"audio","muted":false,"hidden":false,"locked":false},
+                {"id":"text-1","name":"텍스트 1","kind":"text","muted":false,"hidden":false,"locked":true}],
+            "clips":[{"id":"clip-1","name":"clip.mp4","kind":"video","trackId":"video-1","mediaId":"media-1",
+                "start":0.0,"duration":4.0,"sourceIn":1.0,"speed":1.0,"reverse":false,"volume":0.8,
+                "fadeIn":0.5,"fadeOut":0.0,"filter":"cinema","transitionIn":{"type":"fade","duration":0.2},
+                "transitionOut":{"type":"fade","duration":0.0},
+                "transform":{"x":0.0,"y":0.0,"scale":1.2,"rotation":0.0,"opacity":1.0,"flipX":true},
+                "color":{"brightness":-0.02,"contrast":1.15,"saturation":0.85,"temperature":0.0,"hue":12.0},
+                "keyframes":[{"property":"opacity","time":1.0,"value":0.5}],"groupId":"group-1"},
+              {"id":"clip-2","name":"자막","kind":"text","trackId":"text-1","start":1.0,"duration":2.0,
+                "sourceIn":0.0,"speed":1.0,"reverse":false,"volume":1.0,"fadeIn":0.0,"fadeOut":0.0,"filter":"original",
+                "transform":{"x":0.0,"y":614.4,"scale":1.0,"rotation":0.0,"opacity":1.0},
+                "color":{"brightness":0.0,"contrast":1.0,"saturation":1.0,"temperature":0.0},"keyframes":[],
+                "text":{"content":"자막","fontSize":64,"color":"#ffffff","fontFamily":"sans-serif","bold":false,"align":"center","background":"transparent"}}],
+            "markers":[{"id":"marker-1","time":2.0,"label":"컷"}],
+            "notes":[{"id":"note-1","body":"메모","kind":"context","createdAt":1700000000000u64}]})
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn corrupt_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("current.json.corrupt-")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn existing_v1_project_opens_unchanged_apart_from_documented_repairs() {
+        let dir = temp();
+        let legacy = v1_project();
+        write_json(&dir.join("current.json"), &legacy);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert_eq!(
+            e.dispatch("project.notice", json!({})).await.unwrap()["notice"],
+            Value::Null
+        );
+        assert!(corrupt_files(&dir).is_empty());
+        let p = e.dispatch("project.get", json!({})).await.unwrap();
+        assert_eq!(p["schemaVersion"], SCHEMA_VERSION);
+        let mut expected = legacy.clone();
+        expected["schemaVersion"] = json!(SCHEMA_VERSION);
+        expected["media"][0]["missing"] = json!(true);
+        expected["clips"][0]["filter"] = json!("cinematic");
+        expected["clips"][0]["transitionIn"]["duration"] = json!(0.5);
+        expected["clips"][0]["transitionOut"] = Value::Null;
+        expected["clips"][1]["filter"] = json!("none");
+        assert_eq!(p, expected);
+        // Editing and reopening keeps working on the migrated file.
+        let edited = e
+            .dispatch(
+                "edit.update",
+                json!({"id":"clip-1","patch":{"start":1.0},"expectedRevision":41}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["revision"], 42);
+        drop(e);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, edited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_caption_text_is_editable_and_opens_from_v1_with_a_shortened_name() {
+        let dir = temp();
+        let long = "가".repeat(2000); // 6000 bytes: valid content, too long for a name
+        let mut legacy = v1_project();
+        legacy["clips"][1]["text"]["content"] = json!(long);
+        legacy["clips"][1]["name"] = json!(long);
+        legacy["tracks"][0]["name"] = json!(long);
+        legacy["tracks"][2]["locked"] = json!(false);
+        legacy["markers"][0]["label"] = json!(long);
+        write_json(&dir.join("current.json"), &legacy);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(corrupt_files(&dir).is_empty());
+        assert_eq!(e.project["id"], legacy["id"]);
+        let short = "가".repeat(333);
+        assert_eq!(e.project["clips"][1]["text"]["content"], long.as_str());
+        assert_eq!(e.project["clips"][1]["name"], short.as_str());
+        assert_eq!(e.project["tracks"][0]["name"], short.as_str());
+        assert_eq!(e.project["markers"][0]["label"], short.as_str());
+
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":long},"start":10.0}))
+            .await
+            .unwrap();
+        let added = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(added["text"]["content"], long.as_str());
+        assert_eq!(added["name"], short.as_str());
+        let longer = format!("a{long}");
+        let p = e
+            .dispatch(
+                "edit.update",
+                json!({"id":"clip-2","patch":{"text":{"content":longer}}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][1]["text"]["content"], longer.as_str());
+        assert_eq!(
+            p["clips"][1]["name"],
+            format!("a{}", "가".repeat(333)).as_str()
+        );
+        drop(e);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, p);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn presets_with_legacy_filter_ids_still_apply_and_import() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.add", json!({"text":{"content":"preset"}}))
+            .await
+            .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        e.dispatch(
+            "edit.update",
+            json!({"id":id,"patch":{"color":{"hue":12.0}}}),
+        )
+        .await
+        .unwrap();
+        // A catalog written by the previous build, and a file exported from it.
+        let preset = |filter: &str| {
+            json!({"version":1,"id":format!("preset-{filter}"),"name":filter,"kind":"filter","target":"visual",
+            "sourceDuration":4.0,"patch":{"filter":filter,"color":{"brightness":0.1,"contrast":1.2,"saturation":0.9,"temperature":0.0}}})
+        };
+        write_json(
+            &dir.join("catalog/index.json"),
+            &json!({"version":1,"presets":[preset("cinema"), preset("vivid")],"fonts":[],"luts":[]}),
+        );
+        for (filter, expected) in [("cinema", "cinematic"), ("vivid", "none")] {
+            let p = e
+                .dispatch(
+                    "presets.apply",
+                    json!({"id":format!("preset-{filter}"),"clipId":id}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(p["clips"][0]["filter"], expected);
+            assert_eq!(p["clips"][0]["color"]["contrast"], 1.2);
+            assert_eq!(p["clips"][0]["color"]["hue"], 12.0);
+        }
+        let file = dir.join("old-preset.json");
+        write_json(&file, &preset("soft"));
+        let imported = e
+            .dispatch("presets.import", json!({"path":file}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("presets.apply", json!({"id":imported["id"],"clipId":id}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["filter"], "none");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_repairs_sloppy_v1_fields_and_rejects_newer_files() {
+        let mut p = v1_project();
+        for field in [
+            "sourceIn",
+            "speed",
+            "volume",
+            "fadeOut",
+            "reverse",
+            "keyframes",
+            "color",
+        ] {
+            p["clips"][0].as_object_mut().unwrap().remove(field);
+        }
+        p["clips"][0]["fadeIn"] = json!(9.0);
+        p["clips"][0]["transitionOut"] = json!("dissolve");
+        p["clips"][0]["filter"] = json!(3);
+        p["clips"][1]["name"] = json!(7);
+        p["tracks"][0].as_object_mut().unwrap().remove("muted");
+        p["markers"] = json!([{"time":1.0},{"id":"m","time":-4,"label":"x"},"junk",{"id":"keep","time":3.0,"label":5}]);
+        p["notes"] = json!([{"body":"ok"}, 3, {"id":"n"}]);
+        p.as_object_mut().unwrap().remove("concept");
+        assert!(validate_project(&p).is_err());
+        migrate_project(&mut p).unwrap();
+        validate_project(&p).unwrap();
+        let clip = &p["clips"][0];
+        assert_eq!(clip["speed"], 1.0);
+        assert_eq!(clip["fadeIn"], 4.0);
+        assert_eq!(clip["transitionIn"], json!({"type":"fade","duration":4.0}));
+        assert!(clip["transitionOut"].is_null());
+        assert_eq!(clip["filter"], "none");
+        assert_eq!(clip["color"]["contrast"], 1.0);
+        assert_eq!(p["markers"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            p["markers"][1],
+            json!({"id":"keep","time":3.0,"label":"마커"})
+        );
+        assert_eq!(p["notes"], json!([{"body":"ok"}]));
+        let migrated = p.clone();
+        migrate_project(&mut p).unwrap();
+        assert_eq!(p, migrated, "files of the current version are left alone");
+        p["schemaVersion"] = json!(SCHEMA_VERSION + 1);
+        assert!(migrate_project(&mut p.clone()).is_err());
+        assert!(validate_project(&p).is_err());
+        assert!(migrate_project(&mut json!([])).is_err());
+    }
+
+    #[tokio::test]
+    async fn unreadable_current_file_is_kept_and_startup_recovers() {
+        // Broken JSON: fall back to the newest valid stored project.
+        let dir = temp();
+        let mut older = v1_project();
+        older["id"] = json!("project-older");
+        older["updatedAt"] = json!(5);
+        write_json(&dir.join("projects/project-older.json"), &older);
+        write_json(&dir.join("projects/project-legacy.json"), &v1_project());
+        std::fs::write(dir.join("projects/broken.json"), "{").unwrap();
+        std::fs::write(dir.join("current.json"), "{\"id\":\"project-legacy\",").unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert_eq!(e.project["id"], "project-legacy");
+        let kept = corrupt_files(&dir);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&kept[0]).unwrap(),
+            "{\"id\":\"project-legacy\","
+        );
+        let notice = e.dispatch("project.notice", json!({})).await.unwrap();
+        assert!(notice["notice"].as_str().unwrap().contains("여행 브이로그"));
+        assert_eq!(
+            e.dispatch("project.noticeDismiss", json!({}))
+                .await
+                .unwrap(),
+            json!({"notice":null})
+        );
+        assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_null());
+        drop(e);
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_null());
+        assert_eq!(corrupt_files(&dir).len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // Valid JSON that fails validation, or a newer schema, and nothing to fall back to.
+        for broken in [json!({"id":"project-x","name":"x"}), {
+            let mut p = v1_project();
+            p["schemaVersion"] = json!(99);
+            p
+        }] {
+            let dir = temp();
+            write_json(&dir.join("current.json"), &broken);
+            let mut e = Editor::new(dir.clone()).unwrap();
+            assert!(e.project["clips"].as_array().unwrap().is_empty());
+            assert_ne!(e.project["id"], broken["id"]);
+            assert!(e.dispatch("project.notice", json!({})).await.unwrap()["notice"].is_string());
+            assert_eq!(corrupt_files(&dir).len(), 1);
+            e.dispatch("edit.add", json!({"text":{"content":"계속 작업"}}))
+                .await
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn project_lifecycle_new_list_open_rename_duplicate_delete() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        e.dispatch("edit.add", json!({"text":{"content":"첫 프로젝트"}}))
+            .await
+            .unwrap();
+        let second = e
+            .dispatch(
+                "project.new",
+                json!({"name":"두 번째","width":1080,"height":1920,"fps":24}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (second["width"].clone(), second["fps"].clone()),
+            (json!(1080), json!(24.0))
+        );
+        assert_eq!(second["schemaVersion"], SCHEMA_VERSION);
+        assert!(e.undo.is_empty());
+        let second_id = second["id"].as_str().unwrap().to_owned();
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert_eq!(list[0]["id"], second_id.as_str());
+
+        // Conditional get.
+        let revision = second["revision"].clone();
+        assert_eq!(
+            e.dispatch(
+                "project.get",
+                json!({"ifProjectId":second_id,"ifRevision":revision})
+            )
+            .await
+            .unwrap(),
+            json!({"unchanged":true,"id":second_id,"revision":revision,"missing":[]})
+        );
+        for params in [
+            json!({"ifProjectId":first,"ifRevision":revision}),
+            json!({"ifProjectId":second_id,"ifRevision":0}),
+            json!({"ifProjectId":second_id}),
+            json!({"ifRevision":revision}),
+            json!({}),
+        ] {
+            assert_eq!(e.dispatch("project.get", params).await.unwrap(), e.project);
+        }
+
+        // Rename: a stored project, then the open one.
+        let list = e
+            .dispatch("project.rename", json!({"id":first,"name":"  이름 바꿈 "}))
+            .await
+            .unwrap();
+        assert!(list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == first.as_str() && p["name"] == "이름 바꿈"));
+        assert_eq!(e.project["revision"], revision);
+        e.dispatch(
+            "project.rename",
+            json!({"id":second_id,"name":"열린 프로젝트"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(e.project["name"], "열린 프로젝트");
+        assert_eq!(
+            e.project["revision"].as_u64(),
+            revision.as_u64().map(|r| r + 1)
+        );
+        for params in [
+            json!({"id":first,"name":""}),
+            json!({"id":"nope","name":"x"}),
+            json!({"id":"../x","name":"x"}),
+        ] {
+            assert!(e.dispatch("project.rename", params).await.is_err());
+        }
+
+        // Duplicate does not switch projects and copies project-owned LUTs.
+        let lut = e.assets_dir(&first).join("luts/look.cube");
+        std::fs::create_dir_all(lut.parent().unwrap()).unwrap();
+        std::fs::write(&lut, "LUT_3D_SIZE 2\n").unwrap();
+        let mut stored: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap();
+        stored["clips"][0]["color"]["lut"] = json!({"path":lut,"name":"look","enabled":true});
+        write_json(&e.project_file(&first), &stored);
+        let copy = e
+            .dispatch("project.duplicate", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(copy["name"], "이름 바꿈 사본");
+        assert_eq!(e.project["id"], second_id.as_str());
+        let copy_id = copy["id"].as_str().unwrap().to_owned();
+        let opened = e
+            .dispatch("project.open", json!({"id":copy_id}))
+            .await
+            .unwrap();
+        assert_eq!(opened["clips"][0]["text"]["content"], "첫 프로젝트");
+        let copied_lut =
+            PathBuf::from(opened["clips"][0]["color"]["lut"]["path"].as_str().unwrap());
+        assert_eq!(copied_lut, e.assets_dir(&copy_id).join("luts/look.cube"));
+        assert!(copied_lut.is_file());
+
+        // Delete: never the open project; removes the file and its assets only.
+        assert!(e
+            .dispatch("project.delete", json!({"id":copy_id}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch("project.delete", json!({"id":"missing"}))
+            .await
+            .is_err());
+        assert!(e.dispatch("project.delete", json!({})).await.is_err());
+        let list = e
+            .dispatch("project.delete", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert!(!e.project_file(&first).exists() && !e.assets_dir(&first).exists());
+        assert!(copied_lut.is_file());
+        assert!(e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .is_err());
+        assert_eq!(e.project["id"], copy_id.as_str());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_requires_overwrite_remembers_the_file_and_protects_store_and_sources() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.join("state")).unwrap();
+        let source = out.join("source.wav");
+        write_wav(&source, 8_000);
+        e.dispatch("media.import", json!({"paths":[source]}))
+            .await
+            .unwrap();
+
+        // Without a path the store copy is the target.
+        let saved = e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(
+            PathBuf::from(saved["path"].as_str().unwrap()),
+            e.project_file(e.project["id"].as_str().unwrap())
+        );
+
+        let file = out.join("my.byori.json");
+        let saved = e
+            .dispatch("project.save", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(saved["project"], e.project);
+        // Later plain saves go to the remembered file, including new edits.
+        e.dispatch("project.update", json!({"patch":{"name":"저장됨"}}))
+            .await
+            .unwrap();
+        let saved = e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(PathBuf::from(saved["path"].as_str().unwrap()), file);
+        assert_eq!(load_project(&file).unwrap()["name"], "저장됨");
+
+        let other = out.join("other.json");
+        std::fs::write(&other, "keep").unwrap();
+        let error = e
+            .dispatch("project.save", json!({"path":other}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        assert!(e
+            .dispatch("project.save", json!({"path":other,"overwrite":false}))
+            .await
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+        e.dispatch("project.save", json!({"path":other,"overwrite":true}))
+            .await
+            .unwrap();
+        assert_eq!(load_project(&other).unwrap()["id"], e.project["id"]);
+
+        let source_bytes = std::fs::read(&source).unwrap();
+        for target in [
+            json!(source),
+            json!(dir.join("state/current.json")),
+            json!(dir.join("state/projects/another.json")),
+            json!(dir.join("state/catalog/index.json")),
+        ] {
+            for method in ["project.save", "captions.export"] {
+                let error = e
+                    .dispatch(method, json!({"path":target,"overwrite":true}))
+                    .await
+                    .unwrap_err();
+                assert!(!error.contains("FILE_EXISTS"), "{error}");
+            }
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        // The store's exports folder is output space: new files only, like any other folder.
+        let exported = dir.join("state/exports/captions.srt");
+        std::fs::create_dir_all(exported.parent().unwrap()).unwrap();
+        std::fs::write(&exported, "keep").unwrap();
+        let error = e
+            .dispatch(
+                "captions.export",
+                json!({"path":exported,"overwrite":false}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        let copy = dir.join("state/exports/copy.json");
+        e.dispatch("project.save", json!({"path":copy,"overwrite":false}))
+            .await
+            .unwrap();
+        assert_eq!(load_project(&copy).unwrap()["id"], e.project["id"]);
+
+        // Opening by path remembers that file; switching projects forgets it.
+        let id = e.project["id"].clone();
+        e.dispatch("project.new", json!({})).await.unwrap();
+        assert!(e.file_path.is_none());
+        let opened = e
+            .dispatch("project.open", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(opened["id"], id);
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+        e.dispatch("project.save", json!({})).await.unwrap();
+        assert_eq!(
+            load_project(&file).unwrap()["markers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn captions_import_and_export_through_dispatch() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        assert!(e
+            .dispatch("captions.export", json!({"path":out.join("empty.srt")}))
+            .await
+            .is_err());
+        let input = out.join("in.srt");
+        std::fs::write(&input, "\u{feff}1\r\n00:00:01,000 --> 00:00:02,500\r\n첫 자막\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n둘째\r\n줄\r\n").unwrap();
+        assert!(e
+            .dispatch(
+                "captions.import",
+                json!({"path":input,"expectedRevision":7})
+            )
+            .await
+            .is_err());
+        let p = e
+            .dispatch(
+                "captions.import",
+                json!({"path":input,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["revision"], 1);
+        assert_eq!(e.undo.len(), 1, "one undo for the whole file");
+        assert_eq!(p["clips"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            (
+                p["clips"][0]["start"].clone(),
+                p["clips"][0]["duration"].clone()
+            ),
+            (json!(1.0), json!(1.5))
+        );
+        assert_eq!(p["clips"][1]["text"]["content"], "둘째\n줄");
+        assert_eq!(p["clips"][1]["trackId"], "text-1");
+
+        let exported = out.join("out.srt");
+        e.dispatch("captions.export", json!({"path":exported}))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&exported).unwrap();
+        assert_eq!(text, "1\n00:00:01,000 --> 00:00:02,500\n첫 자막\n\n2\n00:00:03,000 --> 00:00:04,000\n둘째\n줄\n");
+        let error = e
+            .dispatch("captions.export", json!({"path":exported}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("FILE_EXISTS"), "{error}");
+        e.dispatch("captions.export", json!({"path":exported,"overwrite":true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            2,
+            "no temporary files left"
+        );
+        assert_eq!(e.project["revision"], 1);
+
+        std::fs::write(&input, "1\n00:00:05,000 --> 00:00:01,000\n거꾸로\n").unwrap();
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("captions.import", json!({"path":input}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch("captions.import", json!({"path":out.join("none.srt")}))
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn markers_add_update_delete_and_are_validated() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let p = e
+            .dispatch("edit.marker", json!({"time":2.5,"label":"인트로"}))
+            .await
+            .unwrap();
+        let id = p["markers"][0]["id"].clone();
+        let p = e
+            .dispatch("edit.marker", json!({"time":4.0}))
+            .await
+            .unwrap();
+        assert_eq!(p["markers"][1]["label"], "마커");
+        let p = e
+            .dispatch(
+                "edit.markerUpdate",
+                json!({"id":id,"time":3.0,"expectedRevision":2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p["markers"][0],
+            json!({"id":id,"time":3.0,"label":"인트로"})
+        );
+        let p = e
+            .dispatch("edit.markerUpdate", json!({"id":id,"label":"본편"}))
+            .await
+            .unwrap();
+        assert_eq!(p["markers"][0], json!({"id":id,"time":3.0,"label":"본편"}));
+        let before = e.project.clone();
+        for (method, params) in [
+            ("edit.marker", json!({"time":-1.0})),
+            ("edit.marker", json!({"label":"x"})),
+            ("edit.markerUpdate", json!({"id":id,"time":-1})),
+            ("edit.markerUpdate", json!({"id":id,"time":"3"})),
+            ("edit.markerUpdate", json!({"id":id,"label":4})),
+            ("edit.markerUpdate", json!({"id":"missing","time":1})),
+            (
+                "edit.markerUpdate",
+                json!({"id":id,"time":1,"expectedRevision":0}),
+            ),
+            ("edit.markerDelete", json!({"id":"missing"})),
+            ("edit.markerDelete", json!({})),
+            (
+                "project.update",
+                json!({"patch":{"markers":[{"id":"a","time":"soon","label":"x"}]}}),
+            ),
+            (
+                "project.update",
+                json!({"patch":{"markers":[{"id":"a","time":1},{"id":"a","time":2}]}}),
+            ),
+            ("project.update", json!({"patch":{"markers":["x"]}})),
+            ("project.update", json!({"patch":{"notes":[{"id":"n"}]}})),
+            ("project.update", json!({"patch":{"notes":[3]}})),
+        ] {
+            assert!(
+                e.dispatch(method, params.clone()).await.is_err(),
+                "accepted {method} {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"notes":[{"id":"n","body":"메모","kind":"context","createdAt":1}]}}),
+        )
+        .await
+        .unwrap();
+        let second = e.project["markers"][1]["id"].clone();
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[
+                {"method":"edit.markerDelete","params":{"id":id}},
+                {"method":"edit.markerUpdate","params":{"id":second,"label":"끝"}}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["markers"], json!([{"id":second,"time":4.0,"label":"끝"}]));
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["markers"], before["markers"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn track_delete_and_move_are_single_undo_and_respect_locks() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("edit.add", json!({"text":{"content":"남는 자막"}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("edit.track", json!({"kind":"text","name":"자막 2"}))
+            .await
+            .unwrap();
+        let extra = p["tracks"][3]["id"].clone();
+        for content in ["지울 자막 1", "지울 자막 2"] {
+            e.dispatch(
+                "edit.add",
+                json!({"text":{"content":content},"trackId":extra}),
+            )
+            .await
+            .unwrap();
+        }
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+
+        e.dispatch("edit.track", json!({"id":extra,"patch":{"locked":true}}))
+            .await
+            .unwrap();
+        assert!(e
+            .dispatch("edit.trackDelete", json!({"id":extra}))
+            .await
+            .is_err());
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        for params in [
+            json!({"id":"missing"}),
+            json!({}),
+            json!({"id":extra,"expectedRevision":0}),
+        ] {
+            assert!(e.dispatch("edit.trackDelete", params).await.is_err());
+        }
+        assert_eq!(e.project["clips"], before["clips"]);
+
+        let p = e
+            .dispatch("edit.trackDelete", json!({"id":extra}))
+            .await
+            .unwrap();
+        assert_eq!(p["tracks"].as_array().unwrap().len(), 3);
+        assert_eq!(p["clips"].as_array().unwrap().len(), 1);
+        assert_eq!(p["clips"][0]["text"]["content"], "남는 자막");
+        assert_eq!(e.undo.len(), undo_count + 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(
+            (&undone["tracks"], &undone["clips"]),
+            (&before["tracks"], &before["clips"])
+        );
+
+        let order = |p: &Value| -> Vec<Value> {
+            p["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].clone())
+                .collect()
+        };
+        let p = e
+            .dispatch("edit.trackMove", json!({"id":extra,"index":0}))
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&p),
+            vec![
+                extra.clone(),
+                json!("video-1"),
+                json!("audio-1"),
+                json!("text-1")
+            ]
+        );
+        assert_eq!(p["clips"], before["clips"]);
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[
+                {"method":"edit.trackMove","params":{"id":"video-1","index":3}},
+                {"method":"edit.trackDelete","params":{"id":"audio-1"}}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            order(&p),
+            vec![extra.clone(), json!("text-1"), json!("video-1")]
+        );
+        let current = e.project.clone();
+        for params in [
+            json!({"id":extra,"index":3}),
+            json!({"id":extra,"index":-1}),
+            json!({"id":extra}),
+            json!({"id":"missing","index":0}),
+        ] {
+            assert!(e.dispatch("edit.trackMove", params).await.is_err());
+            assert_eq!(e.project, current);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paste_inserts_copies_with_new_ids_groups_spacing_and_track_fallback() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        for start in [2.0, 5.0] {
+            e.dispatch(
+                "edit.add",
+                json!({"text":{"content":"복사"},"start":start,"duration":1.0}),
+            )
+            .await
+            .unwrap();
+        }
+        let ids: Vec<Value> = e.project["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].clone())
+            .collect();
+        let p = e.dispatch("edit.group", json!({"ids":ids})).await.unwrap();
+        let copied = p["clips"].clone();
+        let undo_count = e.undo.len();
+        let p = e
+            .dispatch(
+                "edit.paste",
+                json!({"clips":copied,"at":10.0,"expectedRevision":p["revision"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.undo.len(), undo_count + 1);
+        let clips = p["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 4);
+        assert_eq!(
+            (clips[2]["start"].clone(), clips[3]["start"].clone()),
+            (json!(10.0), json!(13.0))
+        );
+        assert_eq!(clips[2]["groupId"], clips[3]["groupId"]);
+        assert_ne!(clips[2]["groupId"], clips[0]["groupId"]);
+        assert_eq!(
+            clips
+                .iter()
+                .map(|c| c["id"].as_str().unwrap())
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        let mut expected = copied[0].clone();
+        for field in ["id", "start", "groupId"] {
+            expected[field] = clips[2][field].clone();
+        }
+        assert_eq!(clips[2], expected);
+
+        // Source track gone, then locked: use the first compatible unlocked track.
+        let p = e
+            .dispatch("edit.track", json!({"kind":"text","name":"자막 2"}))
+            .await
+            .unwrap();
+        let second = p["tracks"][3]["id"].clone();
+        let mut foreign = copied[0].clone();
+        foreign["trackId"] = json!("track-from-another-project");
+        foreign["unknownField"] = json!({"x":1});
+        let p = e
+            .dispatch("edit.paste", json!({"clips":[foreign],"at":0.0}))
+            .await
+            .unwrap();
+        let pasted = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            (pasted["trackId"].clone(), pasted["start"].clone()),
+            (json!("text-1"), json!(0.0))
+        );
+        assert!(pasted.get("unknownField").is_none());
+        e.dispatch("edit.track", json!({"id":"text-1","patch":{"locked":true}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch("edit.batch", json!({"commands":[{"method":"edit.paste","params":{"clips":[copied[1]],"at":1.0}}]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            p["clips"].as_array().unwrap().last().unwrap()["trackId"],
+            second
+        );
+        e.dispatch("edit.track", json!({"id":second,"patch":{"locked":true}}))
+            .await
+            .unwrap();
+
+        let before = e.project.clone();
+        let mut no_media = copied[0].clone();
+        no_media["kind"] = json!("video");
+        no_media["mediaId"] = json!("media-from-another-project");
+        for params in [
+            json!({"clips":copied,"at":1.0}),
+            json!({"clips":[],"at":1.0}),
+            json!({"clips":["x"],"at":1.0}),
+            json!({"clips":[no_media],"at":1.0}),
+            json!({"clips":[copied[0]],"at":-1.0}),
+            json!({"clips":[copied[0]]}),
+            json!({"at":1.0}),
+        ] {
+            assert!(
+                e.dispatch("edit.paste", params.clone()).await.is_err(),
+                "accepted {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filter_merges_basic_grade_and_fades_stay_in_sync_with_transitions() {
+        let mut p = empty_project("filter", 320, 180, 24.0);
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"text"},"duration":4.0}),
+        )
+        .unwrap();
+        let id = p["clips"][0]["id"].clone();
+        let update =
+            |p: &mut Value, patch: Value| mutate(p, "edit.update", &json!({"id":id,"patch":patch}));
+        let lut = json!({"path":"/tmp/look.cube","name":"look","enabled":true});
+        update(&mut p, json!({"color":{"hue":20.0,"hsl":{"red":{"hue":30.0}},"curves":{"preset":"vintage"},"lut":lut}})).unwrap();
+        update(&mut p, json!({"filter":"warm"})).unwrap();
+        assert_eq!(
+            p["clips"][0]["color"],
+            json!({"brightness":0.02,"contrast":1.03,"saturation":1.05,"temperature":0.5,
+                "hue":20.0,"hsl":{"red":{"hue":30.0}},"curves":{"preset":"vintage"},"lut":lut})
+        );
+        // With explicit colour values the filter id is still checked.
+        update(&mut p, json!({"filter":"mono","color":{"saturation":0.2}})).unwrap();
+        assert_eq!(p["clips"][0]["color"]["saturation"], 0.2);
+        assert_eq!(p["clips"][0]["color"]["hue"], 20.0);
+        for patch in [
+            json!({"filter":"cinema"}),
+            json!({"filter":"original","color":{"saturation":1.0}}),
+            json!({"filter":3,"color":{"saturation":1.0}}),
+            json!({"reverse":"yes"}),
+            json!({"name":5}),
+            json!({"transitionIn":{"type":"wipe","duration":1.0}}),
+            json!({"transitionOut":"fade"}),
+        ] {
+            assert!(
+                update(&mut p.clone(), patch.clone()).is_err(),
+                "accepted {patch}"
+            );
+        }
+        let mut invalid = p.clone();
+        invalid["clips"][0]["transitionOut"] = json!({"type":"wipe","duration":1.0});
+        assert!(validate_project(&invalid).is_err());
+        let mut invalid = p.clone();
+        invalid["tracks"][0]["name"] = json!(1);
+        assert!(validate_project(&invalid).is_err());
+
+        update(
+            &mut p,
+            json!({"transitionIn":{"type":"fade","duration":1.0},"fadeOut":0.5}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.0);
+        assert!(
+            p["clips"][0].get("transitionOut").is_none(),
+            "a plain fade needs no transition object"
+        );
+        update(&mut p, json!({"fadeIn":2.0})).unwrap();
+        assert_eq!(
+            p["clips"][0]["transitionIn"],
+            json!({"type":"fade","duration":2.0})
+        );
+        // 1.5 s + 0.5 s of fades no longer fit: both shrink by the same ratio.
+        update(&mut p, json!({"duration":1.5})).unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.125);
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.125);
+        assert_eq!(p["clips"][0]["fadeOut"], 0.375);
+        update(&mut p, json!({"fadeIn":0.0})).unwrap();
+        assert!(p["clips"][0]["transitionIn"].is_null());
+        update(
+            &mut p,
+            json!({"transitionOut":{"type":"fade","duration":0.0}}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][0]["fadeOut"], 0.0);
+        assert!(p["clips"][0]["transitionOut"].is_null());
+    }
+
+    #[tokio::test]
+    async fn media_import_and_add_remove_missing_flag_and_relink() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let (first, second, moved) = (out.join("a.wav"), out.join("b.wav"), out.join("moved.wav"));
+        write_wav(&first, 16_000);
+        write_wav(&second, 8_000);
+        let p = e
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[first, second],"start":3.0,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["revision"], 1);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(p["media"].as_array().unwrap().len(), 2);
+        let clips = p["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0]["trackId"], "audio-1");
+        assert_eq!(
+            (clips[0]["start"].clone(), clips[1]["start"].clone()),
+            (json!(3.0), json!(5.0))
+        );
+        assert!(p["media"][0].get("missing").is_none());
+        let (a, b) = (p["media"][0]["id"].clone(), p["media"][1]["id"].clone());
+        assert!(e
+            .dispatch("media.importAndAdd", json!({"paths":[]}))
+            .await
+            .is_err());
+        assert!(e
+            .dispatch(
+                "media.importAndAdd",
+                json!({"paths":[out.join("none.wav")]})
+            )
+            .await
+            .is_err());
+
+        // media.remove: refused while used, one undo otherwise.
+        assert!(e.dispatch("media.remove", json!({"id":b})).await.is_err());
+        assert!(e
+            .dispatch("media.remove", json!({"id":"missing"}))
+            .await
+            .is_err());
+        e.dispatch("edit.delete", json!({"ids":[clips[1]["id"]]}))
+            .await
+            .unwrap();
+        let p = e.dispatch("media.remove", json!({"id":b})).await.unwrap();
+        assert_eq!(p["media"].as_array().unwrap().len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["media"].as_array().unwrap().len(), 2);
+
+        // A moved source is flagged without a new revision, even on a conditional get.
+        std::fs::rename(&first, &moved).unwrap();
+        let revision = e.project["revision"].clone();
+        let p = e
+            .dispatch(
+                "project.get",
+                json!({"ifProjectId":e.project["id"],"ifRevision":revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["media"][0]["missing"], true);
+        assert!(p["media"][1].get("missing").is_none());
+        assert_eq!(p["revision"], revision);
+        assert_eq!(
+            e.dispatch(
+                "project.get",
+                json!({"ifProjectId":e.project["id"],"ifRevision":revision})
+            )
+            .await
+            .unwrap(),
+            json!({"unchanged":true,"id":e.project["id"],"revision":revision,"missing":[a]})
+        );
+
+        let before = e.project.clone();
+        let undo_count = e.undo.len();
+        for params in [
+            json!({"id":a,"path":out.join("none.wav")}),
+            json!({"id":a,"path":second}),
+            json!({"id":"missing","path":moved}),
+            json!({"id":a,"path":moved,"expectedRevision":0}),
+            json!({"id":a}),
+        ] {
+            assert!(
+                e.dispatch("media.relink", params.clone()).await.is_err(),
+                "accepted {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        let p = e
+            .dispatch(
+                "media.relink",
+                json!({"id":a,"path":moved,"expectedRevision":revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.undo.len(), undo_count + 1);
+        assert!(p["media"][0].get("missing").is_none());
+        assert!(media::same_path(
+            Path::new(p["media"][0]["path"].as_str().unwrap()),
+            &moved
+        ));
+        assert_eq!(
+            (&p["media"][0]["id"], &p["media"][0]["name"]),
+            (&a, &before["media"][0]["name"])
+        );
+        assert_eq!(p["clips"], before["clips"]);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["media"], before["media"]);
+
+        // A replacement too short for the clips that use it is refused.
+        e.dispatch("history.redo", json!({})).await.unwrap();
+
+        // Relinking a video source to an audio file is refused, not converted.
+        let mut as_video = e.project.clone();
+        as_video["media"][0]["kind"] = json!("video");
+        as_video["media"][0]["width"] = json!(720);
+        as_video["media"][0]["height"] = json!(720);
+        as_video["clips"][0]["kind"] = json!("video");
+        as_video["clips"][0]["trackId"] = json!("video-1");
+        validate_project(&as_video).unwrap();
+        let other = out.join("other.wav");
+        write_wav(&other, 16_000);
+        let audio_project = std::mem::replace(&mut e.project, as_video.clone());
+        let error = e
+            .dispatch("media.relink", json!({"id":a,"path":other}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("소재 종류가 다릅니다"), "{error}");
+        assert_eq!(e.project, as_video);
+        e.project = audio_project;
+
+        std::fs::remove_file(&moved).unwrap();
+        let short = out.join("short.wav");
+        write_wav(&short, 800);
+        let before = e.project.clone();
+        assert!(e
+            .dispatch("media.relink", json!({"id":a,"path":short}))
+            .await
+            .is_err());
+        assert_eq!(e.project["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn demo_project_replaces_current_and_history_is_bounded() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let first = e.project["id"].clone();
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+        let demo = e.dispatch("project.demo", json!({})).await.unwrap();
+        assert_ne!(demo["id"], first);
+        assert!(e.undo.is_empty());
+        assert!(!demo["media"].as_array().unwrap().is_empty());
+        assert!(demo["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("missing").is_none()));
+        assert!(demo["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["kind"] == "text"));
+        assert_eq!(
+            e.dispatch("project.list", json!({}))
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, demo);
+
+        for i in 0..103 {
+            e.dispatch("edit.marker", json!({"time":i as f64}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(e.undo.len(), 100);
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(
+            e.dispatch("history.status", json!({})).await.unwrap(),
+            json!({"canUndo":true,"canRedo":true})
+        );
+        e.dispatch("edit.marker", json!({"time":500.0}))
+            .await
+            .unwrap();
+        assert!(e.redo.is_empty(), "a new edit discards redo");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keyframe_easing_shapes_values_and_survives_split_and_trim() {
+        for (easing, half) in [
+            ("linear", 0.5),
+            ("easeIn", 0.25),
+            ("easeOut", 0.75),
+            ("easeInOut", 0.5),
+            ("hold", 0.0),
+        ] {
+            assert_close(ease(easing, 0.0), 0.0);
+            assert_close(ease(easing, 0.5), half);
+            assert_close(ease(easing, 1.0), 1.0);
+        }
+        assert_close(ease("easeInOut", 0.25), 0.15625);
+        assert_close(ease("unknown", 0.3), 0.3);
+
+        let mut p = trim_project("video", false, 1.0);
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{"keyframes":[
+                {"property":"x","time":0.0,"value":0.0,"easing":"easeIn"},
+                {"property":"x","time":2.0,"value":100.0,"easing":"hold"},
+                {"property":"x","time":4.0,"value":300.0},
+                {"property":"opacity","time":0.0,"value":0.0},
+                {"property":"opacity","time":4.0,"value":1.0}]}}),
+        )
+        .unwrap();
+        let clip = p["clips"][0].clone();
+        assert_close(keyframe_value(&clip, "x", 1.0), 25.0);
+        assert_close(keyframe_value(&clip, "transform.x", 3.9), 100.0);
+        assert_close(keyframe_value(&clip, "x", 4.0), 300.0);
+        assert_close(keyframe_value(&clip, "opacity", 1.0), 0.25);
+        assert_eq!(
+            keyframe_points(&clip, "x"),
+            vec![(0.0, 0.0), (2.0, 100.0), (4.0, 300.0)]
+        );
+
+        // Split inside the eased segment and inside the held one.
+        let mut split = p.clone();
+        mutate(
+            &mut split,
+            "edit.split",
+            &json!({"id":"trim-clip","time":11.0}),
+        )
+        .unwrap();
+        let (left, right) = (&split["clips"][0], &split["clips"][1]);
+        assert_close(keyframe_value(left, "x", 1.0), 25.0);
+        assert_close(keyframe_value(right, "x", 0.0), 25.0);
+        assert_eq!(
+            right["keyframes"][0],
+            json!({"property":"opacity","time":0.0,"value":0.25})
+        );
+        let right_x: Vec<&Value> = right["keyframes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|k| k["property"] == "x")
+            .collect();
+        assert_eq!(right_x[0]["easing"], "easeIn");
+        assert_eq!(right_x[1]["easing"], "hold");
+        assert!(right_x[2].get("easing").is_none());
+        assert_close(keyframe_value(right, "x", 2.5), 100.0);
+        assert_close(keyframe_value(right, "x", 3.0), 300.0);
+        let mut held = p.clone();
+        mutate(
+            &mut held,
+            "edit.split",
+            &json!({"id":"trim-clip","time":13.0}),
+        )
+        .unwrap();
+        assert_close(keyframe_value(&held["clips"][0], "x", 3.0), 100.0);
+        assert_close(keyframe_value(&held["clips"][1], "x", 0.5), 100.0);
+        assert_close(keyframe_value(&held["clips"][1], "x", 1.0), 300.0);
+
+        let mut trimmed = p.clone();
+        mutate(
+            &mut trimmed,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":11.0,"end":13.5}),
+        )
+        .unwrap();
+        let clip = &trimmed["clips"][0];
+        assert_close(keyframe_value(clip, "x", 0.0), 25.0);
+        assert_close(keyframe_value(clip, "x", 1.0), 100.0);
+        assert_close(keyframe_value(clip, "x", 2.4), 100.0);
+        assert_close(keyframe_value(clip, "x", 2.5), 100.0);
+        validate_project(&trimmed).unwrap();
+
+        let mut invalid = p.clone();
+        invalid["clips"][0]["keyframes"][0]["easing"] = json!("bounce");
+        assert!(validate_project(&invalid).is_err());
+        invalid["clips"][0]["keyframes"][0]["easing"] = json!(1);
+        assert!(validate_project(&invalid).is_err());
+    }
+
+    #[test]
+    fn transition_types_blend_modes_and_text_styles_are_validated_and_fades_stay_synced() {
+        let mut p = trim_project("video", false, 1.0);
+        let update = |p: &mut Value, id: &Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":id,"patch":patch}))
+        };
+        let video = json!("trim-clip");
+        let text = p["clips"][1]["id"].clone();
+        for kind in TRANSITIONS {
+            update(
+                &mut p,
+                &video,
+                json!({"transitionIn":{"type":kind,"duration":1.0}}),
+            )
+            .unwrap();
+            assert_eq!(
+                p["clips"][0]["transitionIn"],
+                json!({"type":kind,"duration":1.0})
+            );
+            assert_eq!(p["clips"][0]["fadeIn"], 1.0, "audio fade follows {kind}");
+        }
+        update(
+            &mut p,
+            &text,
+            json!({"transitionOut":{"type":"slideRight","duration":0.5}}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][1]["fadeOut"], 0.5);
+        // Changing the fade keeps the type; zero removes the transition.
+        update(
+            &mut p,
+            &video,
+            json!({"transitionIn":{"type":"wipeLeft","duration":1.0}}),
+        )
+        .unwrap();
+        update(&mut p, &video, json!({"fadeIn":0.4})).unwrap();
+        assert_eq!(
+            p["clips"][0]["transitionIn"],
+            json!({"type":"wipeLeft","duration":0.4})
+        );
+        update(&mut p, &video, json!({"transitionIn":{"type":"zoom"}})).unwrap();
+        assert_eq!(
+            p["clips"][0]["transitionIn"],
+            json!({"type":"zoom","duration":0.4})
+        );
+        update(&mut p, &video, json!({"duration":0.2})).unwrap();
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 0.2);
+        assert_eq!(p["clips"][0]["fadeIn"], 0.2);
+        update(&mut p, &video, json!({"duration":4.0,"transitionIn":{"type":"zoom","duration":1.0},"transitionOut":{"type":"dissolve","duration":1.0}})).unwrap();
+        let mut split = p.clone();
+        mutate(
+            &mut split,
+            "edit.split",
+            &json!({"id":"trim-clip","time":12.0}),
+        )
+        .unwrap();
+        assert_eq!(split["clips"][0]["transitionIn"]["type"], "zoom");
+        assert!(split["clips"][0]["transitionOut"].is_null());
+        assert!(split["clips"][1]["transitionIn"].is_null());
+        assert_eq!(split["clips"][1]["transitionOut"]["type"], "dissolve");
+        update(&mut p, &video, json!({"fadeIn":0.0})).unwrap();
+        assert!(p["clips"][0]["transitionIn"].is_null());
+        update(&mut p, &video, json!({"transitionOut":null})).unwrap();
+        assert_eq!(p["clips"][0]["fadeOut"], 0.0);
+        for patch in [
+            json!({"transitionIn":{"type":"wipe","duration":1.0}}),
+            json!({"transitionIn":{"type":"zoom"}}),
+            json!({"transitionIn":{"type":"zoom","duration":1.0,"angle":3}}),
+            json!({"blendMode":"difference"}),
+            json!({"blendMode":1}),
+        ] {
+            assert!(
+                update(&mut p.clone(), &video, patch.clone()).is_err(),
+                "accepted {patch}"
+            );
+        }
+
+        // Effect presets keep the transition type.
+        update(
+            &mut p,
+            &video,
+            json!({"transitionIn":{"type":"slideLeft","duration":1.0},"blendMode":"screen"}),
+        )
+        .unwrap();
+        let preset = capture_preset(&p["clips"][0], "effect").unwrap();
+        assert_eq!(
+            preset["patch"]["transitionIn"],
+            json!({"type":"slideLeft","duration":1.0})
+        );
+        assert_eq!(preset["patch"]["blendMode"], "screen");
+        validate_preset(&preset).unwrap();
+
+        for mode in BLEND_MODES {
+            update(&mut p, &video, json!({"blendMode":mode})).unwrap();
+            update(&mut p, &text, json!({"blendMode":mode})).unwrap();
+        }
+        let mut audio = trim_project("audio", false, 1.0);
+        update(
+            &mut audio,
+            &video,
+            json!({"transitionIn":{"type":"fade","duration":1.0},"blendMode":"normal"}),
+        )
+        .unwrap();
+        assert_eq!(audio["clips"][0]["fadeIn"], 1.0);
+        for patch in [
+            json!({"transitionIn":{"type":"dissolve","duration":1.0}}),
+            json!({"blendMode":"screen"}),
+        ] {
+            assert!(
+                update(&mut audio.clone(), &video, patch.clone()).is_err(),
+                "accepted {patch}"
+            );
+        }
+
+        update(
+            &mut p,
+            &text,
+            json!({"text":{"italic":true,"letterSpacing":-5.0,"lineHeight":3.0,
+                "outline":{"color":"#000000","width":20.0},
+                "shadow":{"color":"#00000080","x":4.0,"y":-4.0,"blur":40.0}}}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][1]["text"]["shadow"]["blur"], 40.0);
+        assert_eq!(p["clips"][1]["name"], "neighbour");
+        update(
+            &mut p,
+            &text,
+            json!({"text":{"outline":null,"shadow":null}}),
+        )
+        .unwrap();
+        for style in [
+            json!({"italic":"yes"}),
+            json!({"letterSpacing":-5.1}),
+            json!({"letterSpacing":51.0}),
+            json!({"lineHeight":0.7}),
+            json!({"lineHeight":3.1}),
+            json!({"outline":{"color":"#000000","width":21.0}}),
+            json!({"outline":{"color":"black","width":2.0}}),
+            json!({"outline":{"width":2.0}}),
+            json!({"outline":{"color":"#000000"}}),
+            json!({"outline":{"color":"#000000","width":2.0,"join":"round"}}),
+            json!({"shadow":{"color":"#000000","x":0.0,"y":0.0,"blur":41.0}}),
+            json!({"shadow":{"color":"#000000","x":0.0,"blur":1.0}}),
+            json!({"underline":true}),
+        ] {
+            assert!(
+                update(&mut p.clone(), &text, json!({"text":style.clone()})).is_err(),
+                "accepted {style}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_clips_keep_default_placement_and_ripple_never_goes_negative() {
+        let mut p = empty_project("overlap", 320, 180, 24.0);
+        let add = |p: &mut Value, args: Value| {
+            mutate(p, "edit.add", &args).unwrap();
+            p["clips"].as_array().unwrap().last().unwrap()["id"].clone()
+        };
+        // b overlaps a by one second (a transition), c follows b, d sits later.
+        let a = add(&mut p, json!({"text":"a","start":2.0,"duration":3.0}));
+        let b = add(&mut p, json!({"text":"b","start":4.0,"duration":3.0}));
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":b,"patch":{"transitionIn":{"type":"dissolve","duration":1.0}}}),
+        )
+        .unwrap();
+        // Without a start the next clip goes to the end of the track.
+        let c = add(&mut p, json!({"text":"c","duration":1.0}));
+        assert_eq!(p["clips"][2]["start"], 7.0);
+        let d = add(&mut p, json!({"text":"d","start":10.0,"duration":1.0}));
+        let other = add(&mut p, json!({"text":"other","start":0.5,"duration":1.0}));
+        let starts = |p: &Value| -> Vec<f64> {
+            p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["start"].as_f64().unwrap())
+                .collect()
+        };
+
+        // Removing a frees only the two seconds it held alone.
+        let mut one = p.clone();
+        mutate(&mut one, "edit.delete", &json!({"ids":[a],"ripple":true})).unwrap();
+        assert_eq!(starts(&one), [2.0, 5.0, 8.0, 0.5]);
+        // Removing b frees the time after a; nothing moves before a's end.
+        let mut two = p.clone();
+        mutate(&mut two, "edit.delete", &json!({"ids":[b],"ripple":true})).unwrap();
+        assert_eq!(starts(&two), [2.0, 5.0, 8.0, 0.5]);
+        // Removing both overlapped clips counts their shared second once.
+        let mut both = p.clone();
+        mutate(
+            &mut both,
+            "edit.delete",
+            &json!({"ids":[a, b],"ripple":true}),
+        )
+        .unwrap();
+        assert_eq!(starts(&both), [2.0, 5.0, 0.5]);
+        // A clip that starts inside a removed one lands on its start, not below zero.
+        let mut early = empty_project("early", 320, 180, 24.0);
+        let first = add(
+            &mut early,
+            json!({"text":"first","start":0.0,"duration":3.0}),
+        );
+        add(
+            &mut early,
+            json!({"text":"second","start":0.5,"duration":3.0}),
+        );
+        add(
+            &mut early,
+            json!({"text":"third","start":3.5,"duration":1.0}),
+        );
+        mutate(
+            &mut early,
+            "edit.delete",
+            &json!({"ids":[first],"ripple":true}),
+        )
+        .unwrap();
+        assert_eq!(starts(&early), [0.0, 3.0]);
+        validate_project(&early).unwrap();
+        let _ = (c, d, other);
+    }
+
+    #[tokio::test]
+    async fn background_waveform_and_proxy_flags_change_no_revision_and_history_shares_waveforms() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let wav = out.join("a.wav");
+        write_wav(&wav, 16_000);
+        let p = e
+            .dispatch("media.importAndAdd", json!({"paths":[wav]}))
+            .await
+            .unwrap();
+        let id = p["media"][0]["id"].as_str().unwrap().to_owned();
+        let path = PathBuf::from(p["media"][0]["path"].as_str().unwrap());
+        // As imported by a probe that leaves the waveform for later.
+        e.project["media"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("waveform");
+        e.waveforms.clear();
+        validate_project(&e.project).unwrap();
+        assert_eq!(e.pending_waveforms(), vec![(id.clone(), path.clone(), 2.0)]);
+        let poll =
+            |e: &Editor| json!({"ifProjectId":e.project["id"],"ifRevision":e.project["revision"]});
+        let conditional = poll(&e);
+        assert_eq!(
+            e.dispatch("project.get", conditional.clone())
+                .await
+                .unwrap()["unchanged"],
+            true
+        );
+
+        // An edit made while the waveform is still being computed.
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+        let conditional = poll(&e);
+        let revision = e.project["revision"].clone();
+        assert!(!e
+            .set_waveform(&id, &out.join("other.wav"), vec![1.0])
+            .unwrap());
+        assert!(!e.set_waveform("missing", &path, vec![1.0]).unwrap());
+        assert!(e.set_waveform(&id, &path, None).unwrap());
+        assert_eq!(e.project["media"][0]["waveform"], json!([]));
+        assert!(e.set_waveform(&id, &path, vec![0.25, 0.5]).unwrap());
+        assert_eq!(e.project["revision"], revision);
+        assert_eq!(e.undo.len(), 2);
+        assert!(e.pending_waveforms().is_empty());
+        // An unconditional read (the service's own) does not hide it from the poller.
+        e.dispatch("project.get", json!({})).await.unwrap();
+        let full = e
+            .dispatch("project.get", conditional.clone())
+            .await
+            .unwrap();
+        assert_eq!(full["media"][0]["waveform"], json!([0.25, 0.5]));
+        assert_eq!(
+            e.dispatch("project.get", conditional.clone())
+                .await
+                .unwrap(),
+            json!({"unchanged":true,"id":e.project["id"],"revision":revision,"missing":[]})
+        );
+        assert_eq!(
+            Editor::new(dir.clone()).unwrap().project["media"][0]["waveform"],
+            json!([0.25, 0.5])
+        );
+
+        // Undo to the state before the waveform arrived still shows it, and no
+        // history entry carries its own copy.
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert!(undone["markers"].as_array().unwrap().is_empty());
+        assert_eq!(undone["media"][0]["waveform"], json!([0.25, 0.5]));
+        let redone = e.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(redone["media"][0]["waveform"], json!([0.25, 0.5]));
+        e.dispatch("edit.marker", json!({"time":2.0}))
+            .await
+            .unwrap();
+        for snapshot in e.undo.iter().chain(e.redo.iter()) {
+            assert!(snapshot.rest["media"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("waveform").is_none()));
+        }
+        // Removing the media and undoing brings the waveform back.
+        let clip = e.project["clips"][0]["id"].clone();
+        e.dispatch("edit.delete", json!({"ids":[clip]}))
+            .await
+            .unwrap();
+        e.dispatch("media.remove", json!({"id":id})).await.unwrap();
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["media"][0]["waveform"], json!([0.25, 0.5]));
+
+        // A proxy file flags the media, again without a revision.
+        let revision = e.project["revision"].clone();
+        let conditional = poll(&e);
+        e.dispatch("project.get", conditional.clone())
+            .await
+            .unwrap();
+        let proxy = e.proxy_path(&id).unwrap();
+        assert_eq!(proxy, e.root.join("proxies").join(format!("{id}.mp4")));
+        assert!(e.proxy_path("missing").is_none());
+        std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+        std::fs::write(&proxy, b"proxy").unwrap();
+        // Without the service's note of its source a proxy file does not count.
+        assert!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
+                .get("proxy")
+                .is_none()
+        );
+        std::fs::write(
+            proxy.with_extension("source"),
+            media::proxy_note(e.project["media"][0]["path"].as_str().unwrap()),
+        )
+        .unwrap();
+        let full = e
+            .dispatch("project.get", conditional.clone())
+            .await
+            .unwrap();
+        assert_eq!(full["media"][0]["proxy"], true);
+        assert_eq!(full["revision"], revision);
+        assert_eq!(
+            e.dispatch("project.get", conditional.clone())
+                .await
+                .unwrap(),
+            json!({"unchanged":true,"id":e.project["id"],"revision":revision,"missing":[],"proxy":[id]})
+        );
+        // A proxy noted as made from another file (relinked since) does not count.
+        std::fs::write(proxy.with_extension("source"), "/another/file.mp4").unwrap();
+        assert!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]
+                .get("proxy")
+                .is_none()
+        );
+        let path = e.project["media"][0]["path"].as_str().unwrap().to_owned();
+        std::fs::write(proxy.with_extension("source"), media::proxy_note(&path)).unwrap();
+        assert_eq!(
+            e.dispatch("project.get", json!({})).await.unwrap()["media"][0]["proxy"],
+            true
+        );
+        std::fs::remove_file(&proxy).unwrap();
+        let full = e.dispatch("project.get", conditional).await.unwrap();
+        assert!(full["media"][0].get("proxy").is_none());
+        let mut invalid = e.project.clone();
+        invalid["media"][0]["proxy"] = json!("yes");
+        assert!(validate_project(&invalid).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn relink_drops_a_waveform_the_probe_did_not_supply_and_reimport_keeps_it() {
+        let mut p = trim_project("audio", false, 1.0);
+        p["media"][0]["waveform"] = json!([0.5]);
+        let same =
+            json!({"path":"/tmp/trim-test.mp4","kind":"audio","duration":30.0,"hasAudio":true});
+        refresh_media_metadata(&mut p, "trim-media", same).unwrap();
+        assert_eq!(p["media"][0]["waveform"], json!([0.5]));
+        let moved = json!({"path":"/tmp/moved.mp4","kind":"audio","duration":30.0,"hasAudio":true});
+        refresh_media_metadata(&mut p, "trim-media", moved.clone()).unwrap();
+        assert!(p["media"][0].get("waveform").is_none());
+        let mut probed = moved;
+        probed["waveform"] = json!([0.1, 0.2]);
+        refresh_media_metadata(&mut p, "trim-media", probed).unwrap();
+        assert_eq!(p["media"][0]["waveform"], json!([0.1, 0.2]));
+    }
+
+    #[tokio::test]
+    async fn opening_a_file_whose_id_belongs_to_another_stored_project_gets_a_new_id() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("edit.add", json!({"text":"kept"}))
+            .await
+            .unwrap();
+        let id = e.project["id"].as_str().unwrap().to_owned();
+        let file = out.join("export.json");
+        e.dispatch("project.save", json!({"path":file}))
+            .await
+            .unwrap();
+
+        // The same content reopens as the same project.
+        for _ in 0..2 {
+            let reopened = e
+                .dispatch("project.open", json!({"path":file}))
+                .await
+                .unwrap();
+            assert_eq!(reopened["id"], id.as_str());
+        }
+        assert_eq!(
+            e.dispatch("project.list", json!({}))
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The stored project moves on; the old export no longer matches it.
+        e.dispatch("edit.add", json!({"text":"newer work"}))
+            .await
+            .unwrap();
+        let stored = e.project.clone();
+        let opened = e
+            .dispatch("project.open", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_ne!(opened["id"], id.as_str());
+        assert_eq!(opened["clips"].as_array().unwrap().len(), 1);
+        let kept: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&id)).unwrap()).unwrap();
+        assert_eq!(kept["clips"], stored["clips"]);
+        assert_eq!(
+            e.dispatch("project.list", json!({}))
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Saving goes back to the opened file, not to the other project.
+        let saved = e.dispatch("project.save", json!({})).await.unwrap();
+        assert!(media::same_path(
+            Path::new(saved["path"].as_str().unwrap()),
+            &file
+        ));
+
+        // The same holds when the other project is not the open one.
+        e.dispatch("project.new", json!({})).await.unwrap();
+        let mut copy = stored.clone();
+        copy["name"] = json!("someone else's copy");
+        let other = out.join("copy.json");
+        write_json(&other, &copy);
+        let opened = e
+            .dispatch("project.open", json!({"path":other}))
+            .await
+            .unwrap();
+        assert_ne!(opened["id"], id.as_str());
+        assert_eq!(opened["name"], "someone else's copy");
+        let kept: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&id)).unwrap()).unwrap();
+        assert_eq!(kept["name"], stored["name"]);
+        // Opening a stored project by id is untouched.
+        assert_eq!(
+            e.dispatch("project.open", json!({"id":id})).await.unwrap()["id"],
+            id.as_str()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn freeze_frame_splits_inserts_a_managed_still_shifts_the_track_and_is_one_undo() {
+        let dir = temp();
+        let out = temp();
+        std::fs::create_dir_all(&out).unwrap();
+        let video = out.join("clip.mp4");
+        let made = std::process::Command::new(media::executable("ffmpeg"))
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x180:rate=30:duration=4")
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("media.importAndAdd", json!({"paths":[video, video]}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch(
+                "edit.add",
+                json!({"text":"caption","start":3.0,"duration":2.0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["media"].as_array().unwrap().len(), 1);
+        let (first, second) = (p["clips"][0]["id"].clone(), p["clips"][1]["id"].clone());
+        let p = e
+            .dispatch(
+                "edit.update",
+                json!({"id":first,"patch":{"blendMode":"screen","filter":"mono","keyframes":[
+                    {"property":"x","time":0.0,"value":0.0},{"property":"x","time":4.0,"value":400.0}]}}),
+            )
+            .await
+            .unwrap();
+        let (revision, undo) = (p["revision"].as_u64().unwrap(), e.undo.len());
+
+        let before = e.project.clone();
+        for params in [
+            json!({"id":first,"time":1.0,"expectedRevision":0}),
+            json!({"id":first,"time":0.0}),
+            json!({"id":first,"time":9.0}),
+            json!({"id":first}),
+            json!({"id":first,"time":1.0,"duration":0.0}),
+            json!({"id":p["clips"][2]["id"],"time":3.5}),
+            json!({"id":"missing","time":1.0}),
+        ] {
+            assert!(
+                e.dispatch("edit.freeze", params.clone()).await.is_err(),
+                "accepted {params}"
+            );
+            assert_eq!(e.project, before);
+        }
+        let frames = e
+            .assets_dir(e.project["id"].as_str().unwrap())
+            .join("frames");
+        assert!(std::fs::read_dir(&frames).map_or(true, |mut d| d.next().is_none()));
+
+        let p = e
+            .dispatch(
+                "edit.freeze",
+                // Off-grid requests land on the 30 fps frame grid: 1.0 s and 2.0 s.
+                json!({"id":first,"time":1.01,"duration":2.01,"expectedRevision":revision}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["revision"], revision + 1);
+        assert_eq!(e.undo.len(), undo + 1);
+        let clips = p["clips"].as_array().unwrap();
+        let by_start = |start: f64| {
+            clips
+                .iter()
+                .find(|c| c["trackId"] == "video-1" && c["start"] == start)
+                .unwrap()
+        };
+        let (left, still, right, next) =
+            (by_start(0.0), by_start(1.0), by_start(3.0), by_start(6.0));
+        assert_eq!(left["id"], first);
+        assert_eq!(
+            (&left["duration"], &right["duration"]),
+            (&json!(1.0), &json!(3.0))
+        );
+        assert_eq!(right["sourceIn"], 1.0);
+        assert_eq!(next["id"], second);
+        assert_eq!(
+            (&still["kind"], &still["duration"]),
+            (&json!("image"), &json!(2.0))
+        );
+        assert_eq!(still["blendMode"], "screen");
+        assert_eq!(still["filter"], "mono");
+        assert_eq!(still["transform"]["x"], 100.0);
+        assert!(still["keyframes"].as_array().unwrap().is_empty());
+        // Other tracks stay where they were.
+        assert_eq!(
+            clips.iter().find(|c| c["kind"] == "text").unwrap()["start"],
+            3.0
+        );
+        let image = p["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == still["mediaId"])
+            .unwrap();
+        assert_eq!(image["kind"], "image");
+        assert_eq!(
+            (&image["width"], &image["height"]),
+            (&json!(320), &json!(180))
+        );
+        let png = PathBuf::from(image["path"].as_str().unwrap());
+        assert!(png.starts_with(&frames) && png.is_file());
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, p);
+
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        assert_eq!(undone["media"], before["media"]);
+        let redone = e.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(redone["clips"], p["clips"]);
+
+        // A custom length, on a reversed clip: the frame comes from the mirrored position.
+        e.dispatch("edit.update", json!({"id":second,"patch":{"reverse":true}}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch(
+                "edit.freeze",
+                json!({"id":second,"time":7.0,"duration":0.5}),
+            )
+            .await
+            .unwrap();
+        let held = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["start"] == 7.0 && c["kind"] == "image")
+            .unwrap();
+        assert_eq!(held["duration"], 0.5);
+        // A freeze that was undone leaves its still for redo, but only this session.
+        e.dispatch("edit.freeze", json!({"id":second,"time":6.5}))
+            .await
+            .unwrap();
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        let count = |folder: &Path| std::fs::read_dir(folder).unwrap().count();
+        assert_eq!(count(&frames), 3);
+        // A duplicated project owns its own copy of the stills it uses.
+        let copy = e
+            .dispatch("project.duplicate", json!({"id":p["id"]}))
+            .await
+            .unwrap();
+        let copied = e
+            .dispatch("project.open", json!({"id":copy["id"]}))
+            .await
+            .unwrap();
+        let copied_frames = e.assets_dir(copy["id"].as_str().unwrap()).join("frames");
+        let stills: Vec<&Value> = copied["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "image")
+            .collect();
+        assert_eq!(stills.len(), 2);
+        for still in stills {
+            let path = PathBuf::from(still["path"].as_str().unwrap());
+            assert!(path.starts_with(&copied_frames) && path.is_file());
+            assert!(still.get("missing").is_none());
+        }
+        assert_eq!(count(&copied_frames), 2);
+        // The next start removes the stills no saved project mentions.
+        assert_eq!(count(&frames), 3);
+        std::fs::write(frames.join("notes.txt"), b"not a still").unwrap();
+        let restarted = Editor::new(dir.clone()).unwrap();
+        assert_eq!(count(&frames), 3); // two stills and the unrelated file
+        assert_eq!(count(&copied_frames), 2);
+        for still in restarted.project["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "image")
+        {
+            assert!(Path::new(still["path"].as_str().unwrap()).is_file());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reprobe_and_relink_make_the_waveform_pending_again_and_history_forgets_it() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let wav = dir.join("a.wav");
+        write_wav(&wav, 16_000);
+        let p = e
+            .dispatch("media.import", json!({"paths":[wav]}))
+            .await
+            .unwrap();
+        let id = p["media"][0]["id"].as_str().unwrap().to_owned();
+        let path = PathBuf::from(p["media"][0]["path"].as_str().unwrap());
+        let pending = |duration: f64| vec![(id.clone(), path.clone(), duration)];
+        assert!(e.set_waveform(&id, &path, vec![0.5]).unwrap());
+        e.dispatch("edit.marker", json!({"time":1.0}))
+            .await
+            .unwrap();
+
+        // Importing the unchanged file again keeps what is known.
+        let p = e
+            .dispatch("media.import", json!({"paths":[path]}))
+            .await
+            .unwrap();
+        assert_eq!(p["media"][0]["waveform"], json!([0.5]));
+
+        // The file is replaced in place by a longer one.
+        write_wav(&path, 32_000);
+        let p = e
+            .dispatch("media.reprobe", json!({"ids":[id]}))
+            .await
+            .unwrap();
+        assert_eq!(p["media"][0]["duration"], 4.0);
+        assert!(p["media"][0].get("waveform").is_none());
+        assert_eq!(e.pending_waveforms(), pending(4.0));
+        // Undo must not bring the old file's waveform back either.
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert!(undone["media"][0].get("waveform").is_none());
+        assert_eq!(e.pending_waveforms(), pending(2.0));
+        assert!(e.set_waveform(&id, &path, vec![0.25, 0.75]).unwrap());
+        let redone = e.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(redone["media"][0]["waveform"], json!([0.25, 0.75]));
+
+        // A failed attempt (recorded as empty) is retried by a reprobe, by relinking
+        // the same path, and by the next start.
+        assert!(e.set_waveform(&id, &path, None).unwrap());
+        assert!(e.pending_waveforms().is_empty());
+        e.dispatch("media.reprobe", json!({"ids":[id]}))
+            .await
+            .unwrap();
+        assert_eq!(e.pending_waveforms(), pending(4.0));
+        assert!(e.set_waveform(&id, &path, None).unwrap());
+        e.dispatch("media.relink", json!({"id":id,"path":path}))
+            .await
+            .unwrap();
+        assert_eq!(e.pending_waveforms(), pending(4.0));
+        assert!(e.set_waveform(&id, &path, None).unwrap());
+        assert_eq!(
+            Editor::new(dir.clone()).unwrap().pending_waveforms(),
+            pending(4.0)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reprobe_to_audio_keeps_only_what_an_audio_clip_may_have() {
+        let (mut e, dir) = misclassified_audio_editor();
+        let clip = e.project["clips"][0]["id"].clone();
+        e.dispatch(
+            "edit.update",
+            json!({"id":clip,"patch":{"blendMode":"screen","audioFadeOut":0.1,
+                "transitionIn":{"type":"wipeLeft","duration":0.25},
+                "transitionOut":{"type":"zoom","duration":0.5}}}),
+        )
+        .await
+        .unwrap();
+        let p = e
+            .dispatch("media.reprobe", json!({"ids":["old-audio"]}))
+            .await
+            .unwrap();
+        let clip = &p["clips"][0];
+        assert_eq!(clip["kind"], "audio");
+        assert_eq!(clip["transitionIn"], json!({"type":"fade","duration":0.25}));
+        // The sound's own fade out is the one an audio clip keeps.
+        assert_eq!(clip["transitionOut"], json!({"type":"fade","duration":0.1}));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(0.25), &json!(0.1))
+        );
+        assert!(clip.get("audioFadeOut").is_none());
+        assert!(clip.get("blendMode").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transitions_and_fades_set_on_a_clip_never_outlast_it() {
+        let mut p = trim_project("video", false, 1.0); // a 4 s clip
+        let mut update = |patch: Value| {
+            mutate(
+                &mut p,
+                "edit.update",
+                &json!({"id":"trim-clip","patch":patch}),
+            )
+            .unwrap();
+            validate_project(&p).unwrap();
+            p["clips"][0].clone()
+        };
+        let clip = update(json!({"transitionIn":{"type":"wipeLeft","duration":10.0}}));
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":4.0})
+        );
+        assert_eq!(clip["fadeIn"], 4.0);
+        // Together they may not be longer than the clip either: they share it.
+        let clip = update(json!({"fadeOut":9.0}));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(2.0), &json!(2.0))
+        );
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":2.0})
+        );
+        // A transition of no length is no transition.
+        let clip = update(json!({"transitionIn":{"type":"slideLeft","duration":0.0}}));
+        assert!(clip["transitionIn"].is_null());
+        assert_eq!(clip["fadeIn"], 0.0);
+        let clip = update(json!({"transitionOut":{"type":"zoom","duration":86400.0}}));
+        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":4.0}));
+        let clip = update(json!({"fadeIn":1.0,"fadeOut":5.0}));
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(0.8), &json!(3.2))
+        );
+        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":3.2}));
+        let clip = update(json!({"transitionOut":{"type":"zoom","duration":1.0}}));
+        assert_eq!(clip["transitionOut"], json!({"type":"zoom","duration":1.0}));
+    }
+
+    #[test]
+    fn add_can_make_its_own_track_in_the_same_step() {
+        let mut p = trim_project("video", false, 1.0);
+        let tracks = p["tracks"].as_array().unwrap().len();
+        let clips = p["clips"].as_array().unwrap().len();
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":{"content":"제목"},"start":0.0,"duration":2.0,"newTrack":"자막·텍스트 2"}),
+        )
+        .unwrap();
+        validate_project(&p).unwrap();
+        let track = p["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|track| track["name"] == "자막·텍스트 2")
+            .expect("the new track")
+            .clone();
+        assert_eq!(track["kind"], "text");
+        assert_eq!(p["tracks"].as_array().unwrap().len(), tracks + 1);
+        let added = p["clips"].as_array().unwrap().last().unwrap();
+        assert_eq!(p["clips"].as_array().unwrap().len(), clips + 1);
+        assert_eq!(added["trackId"], track["id"]);
+        // A refused add leaves no track behind, and the two ways to name a track exclude each other.
+        let mut refused = p.clone();
+        for params in [
+            json!({"text":{"content":"x"},"newTrack":"t","trackId":track["id"]}),
+            json!({"text":{"content":"x"},"newTrack":""}),
+            json!({"text":{"content":"x"},"newTrack":3}),
+            json!({"mediaId":"none","newTrack":"t"}),
+        ] {
+            assert!(
+                mutate(&mut refused, "edit.add", &params).is_err(),
+                "{params}"
+            );
+        }
+        assert_eq!(refused["tracks"], p["tracks"]);
+    }
+
+    #[tokio::test]
+    async fn shift_moves_every_later_clip_on_one_track_in_one_command() {
+        let mut p = trim_project("video", false, 1.0);
+        let template = p["clips"][0].clone();
+        // 700 one-second clips from 0 s: more than a batch of updates could carry.
+        let clips: Vec<Value> = (0..700)
+            .map(|i| {
+                let mut clip = template.clone();
+                clip["id"] = json!(format!("clip-{i}"));
+                clip["start"] = json!(i as f64);
+                clip["duration"] = json!(1.0);
+                clip
+            })
+            .chain([p["clips"][1].clone()])
+            .collect();
+        p["clips"] = json!(clips);
+        validate_project(&p).unwrap();
+        let before = p.clone();
+        // 0.51 s is 15.3 frames at 30 fps: the shift is 15 whole frames.
+        mutate(
+            &mut p,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":100.0,"delta":-0.51}),
+        )
+        .unwrap();
+        for (i, clip) in p["clips"].as_array().unwrap().iter().enumerate() {
+            let was = number(&before["clips"][i], "start", -1.0);
+            let moved = clip["trackId"] == "video-1" && was >= 100.0;
+            assert_eq!(
+                clip["start"],
+                if moved { was - 0.5 } else { was },
+                "clip {i}"
+            );
+            assert_eq!(clip["duration"], before["clips"][i]["duration"]);
+        }
+        // Repeated shifts leave no float noise behind.
+        for _ in 0..7 {
+            mutate(
+                &mut p,
+                "edit.shift",
+                &json!({"trackId":"video-1","from":50.0,"delta":0.1}),
+            )
+            .unwrap();
+        }
+        assert_eq!(p["clips"][49]["start"], 49.0);
+        assert_eq!(p["clips"][50]["start"], 50.7);
+        assert_eq!(p["clips"][100]["start"], 100.2);
+
+        let unchanged = p.clone();
+        for params in [
+            json!({"trackId":"video-1","from":0.0,"delta":-0.5}), // start below zero
+            json!({"trackId":"video-1","from":0.0,"delta":0.01}), // under one frame
+            json!({"trackId":"video-1","from":0.0}),
+            json!({"trackId":"video-1","delta":1.0}),
+            json!({"trackId":"video-1","from":"0","delta":1.0}),
+            json!({"trackId":"missing","from":0.0,"delta":1.0}),
+            json!({"from":0.0,"delta":1.0}),
+        ] {
+            let mut attempt = p.clone();
+            assert!(
+                mutate(&mut attempt, "edit.shift", &params).is_err(),
+                "accepted {params}"
+            );
+        }
+        p["tracks"][0]["locked"] = json!(true);
+        assert!(mutate(
+            &mut p,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":0.0,"delta":1.0})
+        )
+        .is_err());
+        p["tracks"][0]["locked"] = json!(false);
+        assert_eq!(p, unchanged);
+
+        // Through dispatch: usable in a batch, revision-guarded, atomic, one undo.
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        for start in [0.0, 2.0, 4.0] {
+            e.dispatch("edit.add", json!({"text":"t","start":start,"duration":2.0}))
+                .await
+                .unwrap();
+        }
+        let track = e.project["clips"][0]["trackId"].clone();
+        let before = e.project.clone();
+        let undo = e.undo.len();
+        assert!(e
+            .dispatch(
+                "edit.shift",
+                json!({"trackId":track,"from":2.0,"delta":1.0,"expectedRevision":0})
+            )
+            .await
+            .unwrap_err()
+            .contains("REVISION_CONFLICT"));
+        assert!(e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":3,"commands":[
+                    {"method":"edit.shift","params":{"trackId":track,"from":2.0,"delta":1.0}},
+                    {"method":"edit.shift","params":{"trackId":track,"from":0.0,"delta":-5.0}}
+                ]})
+            )
+            .await
+            .is_err());
+        assert_eq!(e.project, before);
+        let p = e
+            .dispatch(
+                "edit.batch",
+                json!({"expectedRevision":3,"commands":[
+                    {"method":"edit.shift","params":{"trackId":track,"from":2.0,"delta":-0.5}},
+                    {"method":"edit.update","params":{"id":p_id(&before, 1),"patch":{"transitionIn":{"type":"fade","duration":0.5}}}}
+                ]}),
+            )
+            .await
+            .unwrap();
+        let starts: Vec<&Value> = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| &c["start"])
+            .collect();
+        assert_eq!(starts, [&json!(0.0), &json!(1.5), &json!(3.5)]);
+        assert_eq!((p["revision"].clone(), e.undo.len()), (json!(4), undo + 1));
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn p_id(p: &Value, index: usize) -> Value {
+        p["clips"][index]["id"].clone()
+    }
+
+    fn frames(value: &Value) -> f64 {
+        value.as_f64().unwrap() * 30.0
+    }
+
+    #[test]
+    fn new_edits_land_on_the_frame_grid_and_stored_off_grid_clips_are_left_alone() {
+        let mut p = trim_project("video", false, 1.0); // 30 fps
+        let text_track = p["clips"][1]["trackId"].clone();
+        // add: nearest frame, at least one frame long.
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"a","start":1.01,"duration":0.99}),
+        )
+        .unwrap();
+        let added = p["clips"][2].clone();
+        assert_eq!(
+            (&added["start"], &added["duration"]),
+            (&json!(1.0), &json!(1.0))
+        );
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"b","start":20.0,"duration":0.001}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][3]["duration"], 1.0 / 30.0);
+
+        // update: start, duration and a duration derived from speed.
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        let clip = update(
+            &mut p,
+            json!({"start":2.02,"duration":0.51,"volume":0.333,"sourceIn":8.011}),
+        );
+        assert_eq!(
+            (&clip["start"], &clip["duration"]),
+            (&json!(61.0 / 30.0), &json!(0.5))
+        );
+        // Values that are not timeline positions are not touched.
+        assert_eq!(
+            (&clip["volume"], &clip["sourceIn"]),
+            (&json!(0.333), &json!(8.011))
+        );
+        update(
+            &mut p,
+            json!({"start":10.0,"duration":4.0,"sourceIn":8.0,"keyframes":[
+            {"property":"x","time":0.0,"value":0.0},{"property":"x","time":4.0,"value":100.0}]}),
+        );
+        let clip = update(&mut p, json!({"speed":1.7})); // 4 / 1.7 s = 70.59 frames
+        assert_eq!(clip["duration"], 71.0 / 30.0);
+        assert_eq!(clip["keyframes"][1]["time"], clip["duration"]);
+        let clip = update(&mut p, json!({"speed":1.0,"keyframes":[]}));
+        assert_eq!(frames(&clip["duration"]).fract(), 0.0);
+        update(&mut p, json!({"duration":4.0}));
+
+        // trim: given boundaries go to the nearest frame.
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":10.26,"end":13.49}),
+        )
+        .unwrap();
+        let clip = p["clips"][0].clone();
+        assert_eq!(clip["start"], 308.0 / 30.0);
+        assert_eq!(frames(&clip["duration"]).round(), 97.0);
+        assert_close(frames(&clip["duration"]), 97.0);
+        assert_close(number(&clip, "sourceIn", 0.0), 8.0 + 8.0 / 30.0);
+        // A source that ends between frames: the last partial frame is not used,
+        // and the request is still accepted.
+        p["media"][0]["duration"] = json!(30.02);
+        let source_end = number(&clip, "start", 0.0) + 30.02 - number(&clip, "sourceIn", 0.0);
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","end":source_end}),
+        )
+        .unwrap();
+        let clip = p["clips"][0].clone();
+        let end = number(&clip, "start", 0.0) + number(&clip, "duration", 0.0);
+        assert_close(end * 30.0, (source_end * 30.0).floor());
+        assert!(number(&clip, "sourceIn", 0.0) + number(&clip, "duration", 0.0) <= 30.02);
+        assert!(mutate(
+            &mut p.clone(),
+            "edit.trim",
+            &json!({"id":"trim-clip","end":source_end + 0.05})
+        )
+        .is_err());
+
+        // split: the cut is on a frame and both halves are whole frames.
+        mutate(
+            &mut p,
+            "edit.trim",
+            &json!({"id":"trim-clip","start":10.0,"end":14.0}),
+        )
+        .unwrap();
+        mutate(
+            &mut p,
+            "edit.split",
+            &json!({"id":"trim-clip","time":11.51}),
+        )
+        .unwrap();
+        let (left, right) = (p["clips"][0].clone(), p["clips"][1].clone());
+        assert_eq!(
+            (&left["duration"], &right["start"]),
+            (&json!(1.5), &json!(11.5))
+        );
+        assert_eq!(right["duration"], 2.5);
+
+        // paste: position and length.
+        let mut copy = added.clone();
+        copy["start"] = json!(0.013);
+        copy["duration"] = json!(1.26);
+        copy["fadeIn"] = json!(1.0);
+        copy["fadeOut"] = json!(1.0);
+        mutate(&mut p, "edit.paste", &json!({"clips":[copy],"at":5.01})).unwrap();
+        let pasted = p["clips"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(pasted["start"], 5.0);
+        assert_eq!(pasted["duration"], 38.0 / 30.0);
+        assert_close(
+            number(&pasted, "fadeIn", 0.0) + number(&pasted, "fadeOut", 0.0),
+            38.0 / 30.0,
+        );
+
+        // A stored project with off-grid clips still validates, an unrelated edit
+        // does not move them, and the next clip starts on the frame after them.
+        let mut legacy = trim_project("video", false, 1.0);
+        legacy["clips"][0]["start"] = json!(10.013);
+        legacy["clips"][0]["duration"] = json!(4.021);
+        legacy["clips"][1]["start"] = json!(16.004);
+        legacy["clips"][1]["duration"] = json!(2.003);
+        validate_project(&legacy).unwrap();
+        mutate(
+            &mut legacy,
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{"volume":0.5,"trackId":"video-1"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                &legacy["clips"][0]["start"],
+                &legacy["clips"][0]["duration"]
+            ),
+            (&json!(10.013), &json!(4.021))
+        );
+        // Shifting keeps the spacing of off-grid clips exactly.
+        mutate(
+            &mut legacy,
+            "edit.shift",
+            &json!({"trackId":"video-1","from":0.0,"delta":1.0}),
+        )
+        .unwrap();
+        assert_close(number(&legacy["clips"][0], "start", 0.0), 11.013);
+        mutate(
+            &mut legacy,
+            "edit.add",
+            &json!({"text":"next","trackId":text_track}),
+        )
+        .unwrap();
+        let next = legacy["clips"].as_array().unwrap().last().unwrap();
+        assert_eq!(next["start"], 541.0 / 30.0); // the track ends at 18.007 s, in frame 540
+                                                 // Only one boundary of an off-grid clip was asked to move.
+        mutate(
+            &mut legacy,
+            "edit.trim",
+            &json!({"id":"trim-clip","end":13.01}),
+        )
+        .unwrap();
+        assert_close(number(&legacy["clips"][0], "start", 0.0), 11.013);
+        assert_close(number(&legacy["clips"][0], "duration", 0.0), 13.0 - 11.013);
+
+        // A source shorter than the rounded length gives the partial frame back.
+        let mut short = trim_project("video", false, 1.0);
+        short["media"][0]["duration"] = json!(10.02); // 300.6 frames
+        short["clips"] = json!([]);
+        mutate(&mut short, "edit.add", &json!({"mediaId":"trim-media"})).unwrap();
+        assert_eq!(short["clips"][0]["duration"], 10.0);
+    }
+
+    #[tokio::test]
+    async fn project_list_names_a_cover_thumbnail_that_is_served_for_closed_projects() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let thumbnails = e.root.join("thumbnails");
+        std::fs::create_dir_all(&thumbnails).unwrap();
+        let (late, early) = (thumbnails.join("late.jpg"), thumbnails.join("early.jpg"));
+        std::fs::write(&late, b"late").unwrap();
+        std::fs::write(&early, b"early").unwrap();
+        let outside = e.root.join("outside.jpg");
+        std::fs::write(&outside, b"outside").unwrap();
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            e.dispatch("project.list", json!({})).await.unwrap()[0]["empty"],
+            true
+        );
+        assert!(e.dispatch("project.list", json!({})).await.unwrap()[0]
+            .get("thumbnail")
+            .is_none());
+
+        let mut p = e.project.clone();
+        p["media"] = json!([
+            {"id":"sound","path":"/tmp/a.wav","kind":"audio","duration":9.0,"hasAudio":true,"thumbnail":late},
+            {"id":"bare","path":"/tmp/bare.png","kind":"image","duration":5.0},
+            {"id":"foreign","path":"/tmp/foreign.png","kind":"image","duration":5.0,"thumbnail":outside},
+            {"id":"late","path":"/tmp/late.mp4","kind":"video","duration":9.0,"hasAudio":true,"thumbnail":late},
+            {"id":"early","path":"/tmp/early.png","kind":"image","duration":5.0,"thumbnail":early},
+            {"id":"gone","path":"/tmp/gone.png","kind":"image","duration":5.0,"thumbnail":thumbnails.join("gone.jpg")}
+        ]);
+        let clip = |kind: &str, media: &str, track: &str, start: f64| {
+            let mut clip = default_clip(kind, media, track, start, 1.0);
+            clip["mediaId"] = json!(media);
+            clip
+        };
+        // The earliest picture clips have no usable thumbnail; "early" is the first that has.
+        p["clips"] = json!([
+            clip("audio", "sound", "audio-1", 0.0),
+            clip("video", "late", "video-1", 6.0),
+            clip("image", "bare", "video-1", 0.0),
+            clip("image", "foreign", "video-1", 1.0),
+            clip("image", "gone", "video-1", 2.0),
+            clip("image", "early", "video-1", 3.0)
+        ]);
+        e.commit(p).unwrap();
+        let cover = json!({"mediaId":"early","path":early});
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list[0]["thumbnail"], cover);
+        assert_eq!(e.project_thumbnail(&first, "early"), Some(early.clone()));
+
+        // Still there, and still served, once another project is open.
+        e.dispatch("project.new", json!({"name":"둘째"}))
+            .await
+            .unwrap();
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        let listed = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(listed(&first)["thumbnail"], cover);
+        assert!(listed(e.project["id"].as_str().unwrap())
+            .get("thumbnail")
+            .is_none());
+        assert_eq!(e.asset_path("early", true), None);
+        assert_eq!(e.project_thumbnail(&first, "early"), Some(early));
+        assert_eq!(e.project_thumbnail(&first, "late"), Some(late));
+        // Nothing outside the thumbnail folder, missing, unknown or with an unsafe id.
+        for (project, media) in [
+            (first.as_str(), "foreign"),
+            (first.as_str(), "gone"),
+            (first.as_str(), "bare"),
+            (first.as_str(), "missing"),
+            ("missing", "early"),
+            ("../current", "early"),
+        ] {
+            assert_eq!(
+                e.project_thumbnail(project, media),
+                None,
+                "{project} {media}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn span(clip: &Value) -> (f64, f64) {
+        // Frame numbers; anything off the grid stays visibly fractional.
+        let frame = |seconds: f64| (seconds * 30.0 * 1e6).round() / 1e6;
+        let start = number(clip, "start", -1.0);
+        (frame(start), frame(start + number(clip, "duration", -1.0)))
+    }
+
+    #[tokio::test]
+    async fn clips_that_touch_before_frame_rounding_still_touch_after_it() {
+        // 1.017 s = 30.51 frames, 2.534 s = 76.02 frames: rounding start and length
+        // separately would end the first clip on frame 77 and start the second on 76.
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let srt = dir.join("touching.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:01,017 --> 00:00:02,534\nfirst\n\n2\n00:00:02,534 --> 00:00:04,000\nsecond\n",
+        )
+        .unwrap();
+        let p = e
+            .dispatch("captions.import", json!({"path":srt}))
+            .await
+            .unwrap();
+        assert_eq!(span(&p["clips"][0]), (31.0, 76.0));
+        assert_eq!(span(&p["clips"][1]), (76.0, 120.0));
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut p = trim_project("video", false, 1.0);
+        for (start, duration) in [(1.017, 1.517), (2.534, 1.466)] {
+            mutate(
+                &mut p,
+                "edit.add",
+                &json!({"text":"t","start":start,"duration":duration}),
+            )
+            .unwrap();
+        }
+        assert_eq!(span(&p["clips"][2]), (31.0, 76.0));
+        assert_eq!(span(&p["clips"][3]), (76.0, 120.0));
+        // update with both values: the same ends as add.
+        let neighbour = p_id(&p, 1);
+        mutate(
+            &mut p,
+            "edit.update",
+            &json!({"id":neighbour,"patch":{"start":1.017,"duration":1.517}}),
+        )
+        .unwrap();
+        assert_eq!(span(&p["clips"][1]), (31.0, 76.0));
+        // paste: a touching pair pasted at an off-grid time stays touching.
+        let copies = json!([p["clips"][2], p["clips"][3]]);
+        mutate(&mut p, "edit.paste", &json!({"clips":copies,"at":10.017})).unwrap();
+        let (first, second) = (span(&p["clips"][4]), span(&p["clips"][5]));
+        assert_eq!(first.0, 301.0);
+        assert_eq!(first.1, second.0);
+        assert_eq!(second.1 - second.0, 44.0);
+        // A length under half a frame is still one frame.
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"t","start":1.017,"duration":0.001}),
+        )
+        .unwrap();
+        assert_eq!(span(&p["clips"][6]), (31.0, 32.0));
+    }
+
+    #[test]
+    fn a_video_clips_sound_fade_is_its_own_and_follows_the_picture_while_unset() {
+        let update = |p: &mut Value, patch: Value| -> Result<Value, String> {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch}))?;
+            Ok(p["clips"][0].clone())
+        };
+        let mut p = trim_project("video", false, 1.0); // 30 fps, a 4 s clip
+                                                       // Unset: the clip stores nothing, the picture's fade is the sound's.
+        let clip = update(
+            &mut p,
+            json!({"transitionIn":{"type":"wipeLeft","duration":1.0}}),
+        )
+        .unwrap();
+        assert!(clip.get("audioFadeIn").is_none() && clip.get("audioFadeOut").is_none());
+        // Its own, on the frame grid; the picture's transition is untouched.
+        let clip = update(&mut p, json!({"audioFadeIn":0.26,"audioFadeOut":0.0})).unwrap();
+        assert_eq!(frames(&clip["audioFadeIn"]).round(), 8.0);
+        assert_eq!(clip["audioFadeOut"], 0.0);
+        assert_eq!(clip["fadeIn"], 1.0);
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":1.0})
+        );
+        // The picture's fade no longer moves the sound's, and the other way round.
+        let clip = update(&mut p, json!({"fadeIn":2.0,"fadeOut":1.5})).unwrap();
+        assert_eq!(frames(&clip["audioFadeIn"]).round(), 8.0);
+        assert_eq!(clip["audioFadeOut"], 0.0);
+        // Neither outlasts the clip; together they share it in proportion.
+        let clip = update(&mut p, json!({"audioFadeIn":9.0})).unwrap();
+        assert_eq!(
+            (&clip["audioFadeIn"], &clip["audioFadeOut"]),
+            (&json!(4.0), &json!(0.0))
+        );
+        let clip = update(&mut p, json!({"audioFadeIn":1.0,"audioFadeOut":7.0})).unwrap();
+        assert_eq!(
+            (&clip["audioFadeIn"], &clip["audioFadeOut"]),
+            (&json!(0.8), &json!(3.2))
+        );
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(2.0), &json!(1.5))
+        );
+        // A shorter clip: both pairs fit again, each on its own.
+        let clip = update(&mut p, json!({"duration":2.0})).unwrap();
+        assert_close(number(&clip, "audioFadeIn", 0.0), 0.8 * 2.0 / 2.8);
+        assert_close(number(&clip, "audioFadeOut", 0.0), 2.0 * 2.0 / 2.8);
+        assert_close(
+            number(&clip, "fadeIn", 0.0) + number(&clip, "fadeOut", 0.0),
+            2.0,
+        );
+        // One of its own beside one that follows the picture gives way to it.
+        let clip = update(&mut p, json!({"audioFadeOut":null,"audioFadeIn":2.0})).unwrap();
+        assert!(clip.get("audioFadeOut").is_none());
+        assert_close(
+            number(&clip, "audioFadeIn", 0.0) + number(&clip, "fadeOut", 0.0),
+            2.0,
+        );
+        // null: the sound follows the picture again.
+        let clip = update(&mut p, json!({"audioFadeIn":null})).unwrap();
+        assert!(clip.get("audioFadeIn").is_none());
+        validate_project(&p).unwrap();
+        // A split ends the sound's own fade at the cut, like the picture's.
+        update(&mut p, json!({"audioFadeIn":0.5,"audioFadeOut":0.5})).unwrap();
+        mutate(&mut p, "edit.split", &json!({"id":"trim-clip","time":11.0})).unwrap();
+        assert_eq!(
+            (
+                &p["clips"][0]["audioFadeIn"],
+                &p["clips"][0]["audioFadeOut"]
+            ),
+            (&json!(0.5), &json!(0.0))
+        );
+        assert_eq!(
+            (
+                &p["clips"][1]["audioFadeIn"],
+                &p["clips"][1]["audioFadeOut"]
+            ),
+            (&json!(0.0), &json!(0.5))
+        );
+        // Refused: not a length, and clips without sound.
+        for bad in [json!("1"), json!(-1.0), json!(true)] {
+            assert!(update(&mut p, json!({"audioFadeIn":bad})).is_err());
+        }
+        let text = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == "text")
+            .unwrap()["id"]
+            .clone();
+        let error = mutate(
+            &mut p.clone(),
+            "edit.update",
+            &json!({"id":text,"patch":{"audioFadeIn":0.5}}),
+        )
+        .unwrap_err();
+        assert!(error.contains("영상·오디오"), "{error}");
+        let mut stored = p.clone();
+        let index = stored["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c["kind"] == "text")
+            .unwrap();
+        stored["clips"][index]["audioFadeIn"] = json!(0.5);
+        assert!(validate_project(&stored).is_err());
+
+        // An audio clip has one fade: the same name sets it.
+        let mut p = trim_project("audio", false, 1.0);
+        let clip = update(&mut p, json!({"audioFadeIn":0.52,"audioFadeOut":1.0})).unwrap();
+        assert!(clip.get("audioFadeIn").is_none() && clip.get("audioFadeOut").is_none());
+        assert_eq!(frames(&clip["fadeIn"]).round(), 16.0);
+        assert_eq!(clip["fadeOut"], 1.0);
+        let clip = update(&mut p, json!({"audioFadeIn":null})).unwrap();
+        assert_eq!(frames(&clip["fadeIn"]).round(), 16.0);
+        validate_project(&p).unwrap();
+        // Removing the transition in the same command does not drop the fade asked for.
+        let clip = update(&mut p, json!({"audioFadeIn":0.7,"transitionIn":null})).unwrap();
+        assert_eq!(frames(&clip["fadeIn"]).round(), 21.0);
+        assert!(clip["transitionIn"].is_null());
+        validate_project(&p).unwrap();
+    }
+
+    #[test]
+    fn version_2_projects_migrate_without_changing_what_they_render() {
+        let mut p = trim_project("video", false, 1.0);
+        p["schemaVersion"] = json!(2);
+        p["clips"][0]["fadeIn"] = json!(1.0);
+        p["clips"][0]["fadeOut"] = json!(0.4);
+        p["clips"][0]["transitionIn"] = json!({"type":"slideLeft","duration":1.0});
+        let mut expected = p.clone();
+        expected["schemaVersion"] = json!(SCHEMA_VERSION);
+        migrate_project(&mut p).unwrap();
+        assert_eq!(p, expected, "only the version changes");
+        validate_project(&p).unwrap();
+        // A field that version 2 never wrote has no meaning there.
+        let mut odd = expected.clone();
+        odd["schemaVersion"] = json!(2);
+        odd["clips"][0]["audioFadeIn"] = json!("soon");
+        migrate_project(&mut odd).unwrap();
+        assert_eq!(odd, expected);
+    }
+
+    /// Inside a batch the project is not checked between commands, so a command
+    /// can meet what an earlier one left invalid. It is refused with that earlier
+    /// command's error, never a panic (which closed the connection).
+    #[tokio::test]
+    async fn a_batch_command_after_an_invalid_one_is_refused_not_a_panic() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.replace(trim_project("video", false, 1.0)).unwrap();
+        let before = e.project.clone();
+        let update = |patch: Value| json!({"method":"edit.update","params":{"id":"trim-clip","patch":patch}});
+        for (broken, next) in [
+            // Retiming rescales keyframe times; these keyframes are not objects.
+            (json!({"keyframes":[1]}), update(json!({"speed":2.0}))),
+            (
+                json!({"keyframes":["a", null]}),
+                update(json!({"duration":2.0})),
+            ),
+            // A split copies the clip, its transform and its keyframes.
+            (
+                json!({"transform":5}),
+                json!({"method":"edit.split","params":{"id":"trim-clip","time":11.0}}),
+            ),
+            (
+                json!({"keyframes":[1]}),
+                json!({"method":"edit.split","params":{"id":"trim-clip","time":11.0}}),
+            ),
+        ] {
+            let alone = mutate(
+                &mut before.clone(),
+                "edit.update",
+                &json!({"id":"trim-clip","patch":broken}),
+            )
+            .unwrap_err();
+            let error = e
+                .dispatch(
+                    "edit.batch",
+                    json!({"commands":[update(broken.clone()), next]}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, alone, "{broken}");
+            assert_eq!(e.project, before);
+        }
+        assert!(e.undo.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A write that was cut off between its temporary file and the rename leaves
+    /// that file behind; the next start removes it and nothing else.
+    #[test]
+    fn abandoned_temporary_writes_are_removed_at_start() {
+        let dir = temp();
+        let e = Editor::new(dir.clone()).unwrap();
+        let id = e.project_id().to_owned();
+        drop(e);
+        let abandoned = [
+            dir.join(format!("current.tmp-{}", uuid::Uuid::new_v4())),
+            dir.join(format!("projects/{id}.tmp-{}", uuid::Uuid::new_v4())),
+        ];
+        let kept = [
+            dir.join("current.json.corrupt-1"),
+            dir.join("projects/notes.tmp-backup"),
+            dir.join("projects/other.json"),
+        ];
+        for file in abandoned.iter().chain(&kept) {
+            std::fs::write(file, "{").unwrap();
+        }
+        std::fs::create_dir_all(dir.join(format!("frames.tmp-{}", uuid::Uuid::new_v4()))).unwrap();
+        let reopened = Editor::new(dir.clone()).unwrap();
+        assert_eq!(reopened.project_id(), id);
+        assert!(abandoned.iter().all(|file| !file.exists()));
+        assert!(kept.iter().all(|file| file.is_file()));
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            // projects/ and the folder that only looks like a temporary file.
+            2 + usize::from(dir.join("frames").is_dir()),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `project.new` starts a project one revision past the one that was open, so
+    /// an empty project is told by what is in it, not by its revision.
+    #[tokio::test]
+    async fn an_empty_project_made_after_edits_counts_as_empty() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("project.new", json!({"name":"여행"}))
+            .await
+            .unwrap();
+        for text in ["하나", "둘"] {
+            e.dispatch("edit.add", json!({"text":text,"start":0.0,"duration":1.0}))
+                .await
+                .unwrap();
+        }
+        let travel = e.project_id().to_owned();
+        let empty = e.dispatch("project.new", json!({})).await.unwrap();
+        assert!(empty["revision"].as_u64().unwrap() >= 3, "{empty}");
+        let empty = empty["id"].as_str().unwrap().to_owned();
+        // Open, it is not offered.
+        assert!(e
+            .empty_unnamed_projects()
+            .iter()
+            .all(|(id, _)| *id != empty));
+        e.dispatch("project.open", json!({"id":travel}))
+            .await
+            .unwrap();
+        let found = e.empty_unnamed_projects();
+        assert!(found.iter().any(|(id, _)| *id == empty), "{found:?}");
+        assert!(found.iter().all(|(id, _)| *id != travel));
+        let (removed, _) = e.delete_empty_unnamed_projects();
+        assert_eq!(removed as usize, found.len());
+        assert!(!e.project_file(&empty).exists());
+        assert!(e.project_file(&travel).is_file());
+        assert!(e.empty_unnamed_projects().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Values of every JSON type, for a place that expects another one.
+    fn wrong_values() -> Vec<Value> {
+        vec![
+            Value::Null,
+            json!(true),
+            json!(0),
+            json!(-1),
+            json!(0.5),
+            json!(1e308),
+            json!(-1e308),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(""),
+            json!("x"),
+            json!("1.5"),
+            json!("한글"),
+            json!("fade"),
+            json!([]),
+            json!([0]),
+            json!(["a", 1, null]),
+            json!([[0, 0], [1, 1]]),
+            json!([{}]),
+            json!({}),
+            json!({"x":1}),
+            json!({"type":"fade","duration":"1"}),
+            json!({"type":5,"duration":-1}),
+            json!({"enabled":"yes"}),
+            json!([{"property":"scale","time":"1","value":[]}]),
+            json!([{"property":5,"time":0.5}, 7]),
+            json!({"content":5,"fontSize":"big"}),
+        ]
+    }
+
+    /// The commands of `apply`, each as the editor would accept it on `fuzz_project`.
+    fn fuzz_commands() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"speed":2.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"duration":2.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"speed":0.5,"duration":8.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"fadeIn":1.0,"fadeOut":0.5,"audioFadeIn":0.2,"audioFadeOut":null}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"transitionIn":{"type":"wipeLeft","duration":0.5},"transitionOut":null}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"keyframes":[{"property":"scale","time":0.0,"value":1.0}],"start":3.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"filter":"warm","trackId":"video-1","reverse":true}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"text":{"fontFamily":"serif","content":"글"},"name":"이름"}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"transform":{"x":3.0},"color":{"hsl":{"red":{"hue":3.0}}},"crop":{"x":0.1},"mask":{"type":"circle"},"chromaKey":{"enabled":true},"audio":{"eq":{"bass":1.0}},"stabilize":{"enabled":true},"blendMode":"screen","groupId":"g","volume":0.5,"sourceIn":1.0}}),
+            ),
+            (
+                "edit.add",
+                json!({"mediaId":"trim-media","start":20.0,"duration":1.0,"sourceIn":1.0,"name":"n","transform":{"x":1.0}}),
+            ),
+            (
+                "edit.add",
+                json!({"text":{"content":"추가"},"start":11.0,"duration":1.0,"newTrack":"새 트랙"}),
+            ),
+            ("edit.add", json!({"text":"글","trackId":"text-1"})),
+            ("edit.split", json!({"id":"trim-clip","time":12.0})),
+            (
+                "edit.trim",
+                json!({"id":"trim-clip","start":10.5,"end":13.0}),
+            ),
+            ("edit.trim", json!({"id":"trim-clip","start":9.0})),
+            ("edit.delete", json!({"ids":["trim-clip"],"ripple":true})),
+            ("edit.duplicate", json!({"ids":["trim-clip"]})),
+            ("edit.duplicate", json!({"id":"trim-clip"})),
+            ("edit.group", json!({"ids":["trim-clip","other"]})),
+            ("edit.ungroup", json!({"ids":["trim-clip"]})),
+            (
+                "edit.track",
+                json!({"id":"video-1","patch":{"name":"층","muted":true}}),
+            ),
+            (
+                "edit.track",
+                json!({"kind":"video","name":"새 층","clipIds":["trim-clip"]}),
+            ),
+            ("edit.trackDelete", json!({"id":"video-1"})),
+            ("edit.trackMove", json!({"id":"video-1","index":1})),
+            ("edit.marker", json!({"time":1.0,"label":"표시"})),
+            (
+                "edit.markerUpdate",
+                json!({"id":"marker","time":2.0,"label":"바뀜"}),
+            ),
+            ("edit.markerDelete", json!({"id":"marker"})),
+            (
+                "edit.shift",
+                json!({"trackId":"video-1","from":0.0,"delta":1.0}),
+            ),
+        ]
+    }
+
+    /// `trim_project` with a second clip beside the first, a marker and keyframes.
+    fn fuzz_project(kind: &str) -> Value {
+        let mut p = trim_project(kind, false, 1.0);
+        let mut other = p["clips"][0].clone();
+        other["id"] = json!("other");
+        other["start"] = json!(14.5);
+        other["duration"] = json!(1.0);
+        p["clips"].as_array_mut().unwrap().push(other);
+        p["clips"][0]["keyframes"] = json!([{"property":"scale","time":0.0,"value":1.0},
+            {"property":"scale","time":2.0,"value":1.5},{"property":"volume","time":1.0,"value":0.5}]);
+        p["markers"] = json!([{"id":"marker","time":1.0,"label":"표시"}]);
+        validate_project(&p).unwrap();
+        p
+    }
+
+    /// Runs commands on a copy of `p` as a batch does (nothing checked in between,
+    /// then the whole project). Returns what a panic said, if there was one.
+    fn panics(p: &Value, commands: &[(&str, &Value)]) -> Option<String> {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut p = p.clone();
+            for (method, args) in commands {
+                if apply(&mut p, method, args).is_err() {
+                    return;
+                }
+            }
+            let _ = validate_project(&p);
+        }));
+        run.err().map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|said| (*said).to_owned()))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Every place inside a value, as the keys that lead to it.
+    fn places(value: &Value, at: Vec<String>, found: &mut Vec<Vec<String>>) {
+        let children: Vec<(String, &Value)> = match value {
+            Value::Object(fields) => fields.iter().map(|(k, v)| (k.clone(), v)).collect(),
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v))
+                .collect(),
+            _ => vec![],
+        };
+        for (key, child) in children {
+            let mut here = at.clone();
+            here.push(key);
+            found.push(here.clone());
+            places(child, here, found);
+        }
+    }
+
+    fn place_mut<'a>(value: &'a mut Value, at: &[String]) -> &'a mut Value {
+        at.iter().fold(value, |value, key| match value {
+            Value::Array(items) => &mut items[key.parse::<usize>().unwrap()],
+            other => &mut other[key.as_str()],
+        })
+    }
+
+    /// A value of the wrong type is a validation error wherever it is met: as an
+    /// argument of a command, and as what an earlier command of the same batch
+    /// left in a clip (a batch checks the project only after its last command).
+    /// No command may panic on it. Every clip field is given every wrong value
+    /// before every command, and every argument of every command is replaced by
+    /// every wrong value.
+    #[test]
+    fn no_command_panics_on_a_value_of_the_wrong_type() {
+        let wrong = wrong_values();
+        let commands = fuzz_commands();
+        let mut failures = vec![];
+        let mut ran = 0usize;
+        for kind in ["video", "audio"] {
+            let p = fuzz_project(kind);
+            // 1. One argument of a command replaced.
+            for (method, args) in &commands {
+                let mut found = vec![];
+                places(args, vec![], &mut found);
+                for place in &found {
+                    for value in &wrong {
+                        let mut args = args.clone();
+                        *place_mut(&mut args, place) = value.clone();
+                        ran += 1;
+                        if let Some(said) = panics(&p, &[(method, &args)]) {
+                            failures.push(format!("{method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 2. A clip field left with the wrong type, then each command.
+            for field in CLIP_FIELDS {
+                for value in &wrong {
+                    let poison = json!({"id":"trim-clip","patch":{*field:value}});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.update", &poison), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("{poison} then {method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 3. The same through a pasted clip, which every later command walks past.
+            for field in CLIP_FIELDS {
+                for value in &wrong {
+                    let mut clip = p["clips"][0].clone();
+                    clip[*field] = value.clone();
+                    let paste = json!({"clips":[clip],"at":20.0});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.paste", &paste), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("paste {field}={value} then {method}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 4. The same one level down: one value inside a field's object or list.
+            let nested = json!({"transform":{"x":10.0,"y":-10.0,"scale":1.2,"rotation":15.0,"opacity":0.8,"flipX":true},
+                "color":{"brightness":0.1,"hue":10.0,"hsl":{"red":{"hue":10.0}},
+                    "curves":{"preset":"none","master":[[0.0,0.0],[1.0,1.0]]},"lut":{"enabled":false}},
+                "keyframes":[{"property":"scale","time":0.0,"value":1.0,"easing":"easeInOut"},
+                    {"property":"volume","time":0.5,"value":0.5}],
+                "text":{"content":"글","fontSize":48,"fontFamily":"sans-serif","fontId":"f","fontPath":"/f.ttf",
+                    "outline":{"color":"#000000","width":2},"shadow":{"x":2,"blur":4}},
+                "crop":{"x":0.1,"width":0.5},"mask":{"type":"circle","feather":0.1},
+                "chromaKey":{"enabled":true,"similarity":0.2},"audio":{"normalize":true,"eq":{"bass":1.0}},
+                "stabilize":{"enabled":true,"strength":2},
+                "transitionIn":{"type":"wipeLeft","duration":0.3},"transitionOut":{"type":"fade","duration":0.2}});
+            let mut found = vec![];
+            places(&nested, vec![], &mut found);
+            for place in found.iter().filter(|place| place.len() > 1) {
+                for value in &wrong {
+                    let mut patch = json!({place[0].as_str():nested[place[0].as_str()]});
+                    *place_mut(&mut patch, place) = value.clone();
+                    let poison = json!({"id":"trim-clip","patch":patch});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.update", &poison), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("{poison} then {method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 5. A track or a marker left with the wrong type.
+            let mut poisons = vec![];
+            for value in &wrong {
+                for key in ["name", "muted", "hidden", "locked"] {
+                    for track in ["video-1", "audio-1", "text-1"] {
+                        poisons.push(("edit.track", json!({"id":track,"patch":{key:value}})));
+                    }
+                }
+                for key in ["time", "label"] {
+                    poisons.push(("edit.markerUpdate", json!({"id":"marker",key:value})));
+                }
+            }
+            for (poison, poisoned) in &poisons {
+                for (method, args) in &commands {
+                    ran += 1;
+                    if let Some(said) = panics(&p, &[(*poison, poisoned), (*method, args)]) {
+                        failures.push(format!("{poison} {poisoned} then {method} {args}: {said}"));
+                    }
+                }
+            }
+            // 6. Two fields at once (a seeded sequence), then each command.
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = |below: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % below as u64) as usize
+            };
+            for _ in 0..600 {
+                let mut patch = json!({});
+                for _ in 0..2 {
+                    patch[CLIP_FIELDS[next(CLIP_FIELDS.len())]] = wrong[next(wrong.len())].clone();
+                }
+                let poison = json!({"id":"trim-clip","patch":patch});
+                for (method, args) in &commands {
+                    ran += 1;
+                    let batch = [("edit.update", &poison), (*method, args)];
+                    if let Some(said) = panics(&p, &batch) {
+                        failures.push(format!("{poison} then {method} {args}: {said}"));
+                    }
+                }
+            }
+        }
+        // The check itself notices a panic: a project that is not one has no clips.
+        assert!(panics(&json!(5), &[("edit.split", &json!({"id":"a","time":1.0}))]).is_some());
+        assert!(ran > 150_000, "{ran}");
+        failures.truncate(20);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_checked_once_and_fails_with_its_first_bad_commands_error() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.replace(trim_project("video", false, 1.0)).unwrap();
+        let before = e.project.clone();
+        let saved = std::fs::read(dir.join("current.json")).unwrap();
+        let update = |patch: Value| json!({"method":"edit.update","params":{"id":"trim-clip","patch":patch}});
+        // The second command leaves an invalid clip; the third would be refused by
+        // itself. The error is the one the second command gives on its own.
+        let alone = mutate(
+            &mut before.clone(),
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{"volume":9.0}}),
+        )
+        .unwrap_err();
+        let error = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})), update(json!({"volume":9.0})),
+                    update(json!({"start":-3.0}))]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, alone);
+        assert!(error.contains("volume"), "{error}");
+        // A command that refuses itself stops the batch at once.
+        let error = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})),
+                    {"method":"edit.update","params":{"id":"missing","patch":{"volume":1.0}}}]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "클립을 찾을 수 없습니다.");
+        // Nothing changed, in memory or on disk, and nothing can be undone.
+        assert_eq!(e.project, before);
+        assert_eq!(std::fs::read(dir.join("current.json")).unwrap(), saved);
+        assert!(e.undo.is_empty());
+        // The whole batch is one valid change and one undo step.
+        let after = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})), update(json!({"speed":2.0})),
+                    {"method":"edit.split","params":{"id":"trim-clip","time":11.0}}],
+                    "expectedRevision":before["revision"]}),
+            )
+            .await
+            .unwrap();
+        validate_project(&after).unwrap();
+        assert_eq!(after["clips"].as_array().unwrap().len(), 3);
+        assert_eq!(e.undo.len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_speed_alone_and_a_speed_with_its_length_are_the_same_change() {
+        let project = || {
+            let mut p = trim_project("video", false, 1.0); // 4 s at 30 fps
+            p["clips"][0]["keyframes"] = json!([
+                {"property":"scale","time":0.0,"value":1.0},
+                {"property":"scale","time":2.0,"value":1.5},
+                {"property":"scale","time":4.0,"value":2.0}
+            ]);
+            p["clips"][0]["fadeIn"] = json!(1.0);
+            p
+        };
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        for speed in [2.0_f64, 1.7, 0.5, 0.3] {
+            let alone = update(&mut project(), json!({"speed":speed}));
+            // The length as a caller derives it, exact and rounded to a frame.
+            let exact = update(
+                &mut project(),
+                json!({"speed":speed,"duration":4.0 / speed}),
+            );
+            let rounded = update(
+                &mut project(),
+                json!({"speed":speed,"duration":(4.0 / speed * 30.0).round() / 30.0}),
+            );
+            assert_eq!(alone, exact, "speed {speed}");
+            assert_eq!(alone, rounded, "speed {speed}");
+            // Length and keyframes follow by the same ratio; nothing is cut off.
+            let length = number(&alone, "duration", 0.0);
+            assert_eq!(
+                frames(&alone["duration"]).round(),
+                (4.0 / speed * 30.0_f64).round()
+            );
+            let times: Vec<f64> = alone["keyframes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| number(k, "time", -1.0))
+                .collect();
+            assert_eq!(times.len(), 3);
+            assert_close(times[1], length / 2.0);
+            assert_close(times[2], length);
+            assert_eq!(alone["sourceSpan"], 4.0);
+        }
+        // Back again: both forms restore the length and the keyframes.
+        for with_length in [false, true] {
+            let mut p = project();
+            update(&mut p, json!({"speed":1.7}));
+            let length = number(&p["clips"][0], "duration", 0.0);
+            let patch = if with_length {
+                json!({"speed":1.0,"duration":length * 1.7})
+            } else {
+                json!({"speed":1.0})
+            };
+            let clip = update(&mut p, patch);
+            assert_eq!(clip["duration"], 4.0);
+            assert_close(number(&clip["keyframes"][1], "time", 0.0), 2.0);
+            assert_close(number(&clip["keyframes"][2], "time", 0.0), 4.0);
+        }
+        // Keyframes given with the speed are taken as given.
+        let clip = update(
+            &mut project(),
+            json!({"speed":2.0,"keyframes":[{"property":"scale","time":1.0,"value":1.2}]}),
+        );
+        assert_eq!(clip["keyframes"][0]["time"], 1.0);
+    }
+
+    #[test]
+    fn a_speed_change_and_back_restores_the_length() {
+        // Frames 60..180 of the timeline, 4 s of a 30 s source.
+        let project = || {
+            let mut p = trim_project("video", false, 1.0);
+            p["clips"][0]["start"] = json!(2.0);
+            p
+        };
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        let mut p = project();
+        let clip = update(&mut p, json!({"speed":1.7})); // 70.59 frames
+        assert_eq!(frames(&clip["duration"]), 71.0);
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+        // Several steps away and back.
+        for speed in [0.3, 2.9, 1.1, 1.0] {
+            update(&mut p, json!({"speed":speed}));
+        }
+        assert_eq!(span(&p["clips"][0]), (60.0, 180.0));
+
+        // The inspector sends the length it derived along with the speed.
+        let mut p = project();
+        let clip = update(&mut p, json!({"speed":1.7,"duration":4.0 / 1.7}));
+        assert_eq!(frames(&clip["duration"]), 71.0);
+        let length = number(&clip, "duration", 0.0) * 1.7;
+        let clip = update(&mut p, json!({"speed":1.0,"duration":length}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+
+        // A clip that ends with its source gives the partial frame back while
+        // faster, and still returns to its length.
+        let mut p = project();
+        p["media"][0]["duration"] = json!(12.0);
+        let clip = update(&mut p, json!({"speed":1.7}));
+        assert_eq!(frames(&clip["duration"]), 70.0);
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(span(&clip), (60.0, 180.0));
+
+        // A resize after the speed change makes the new length the reference.
+        let mut p = project();
+        update(&mut p, json!({"speed":1.7}));
+        update(&mut p, json!({"duration":2.0}));
+        let clip = update(&mut p, json!({"speed":1.0}));
+        assert_eq!(frames(&clip["duration"]), 102.0);
+        // A length given with a speed that is not the derived one is a resize.
+        let clip = update(&mut p, json!({"speed":2.0,"duration":1.0}));
+        assert_eq!(frames(&clip["duration"]), 30.0);
+        validate_project(&p).unwrap();
+        p["clips"][0]["sourceSpan"] = json!("4");
+        assert!(validate_project(&p).is_err());
+    }
+
+    #[test]
+    fn shift_keeps_grouped_clips_on_other_tracks_together() {
+        let mut p = trim_project("video", false, 1.0);
+        let text_track = p["clips"][1]["trackId"].clone();
+        let mut clips = Vec::new();
+        for (id, start, group) in [("a", 0.0, "one"), ("b", 2.0, "two"), ("c", 4.0, "three")] {
+            let mut clip = p["clips"][0].clone();
+            clip["id"] = json!(id);
+            clip["start"] = json!(start);
+            clip["duration"] = json!(2.0);
+            clip["groupId"] = json!(group);
+            clips.push(clip);
+        }
+        // Captions: one before `from` grouped with a moving clip, one loose, and
+        // two in a group that also has a clip staying on the shifted track.
+        for (id, start, group) in [
+            ("cap-b", 1.9, Some("two")),
+            ("cap-loose", 3.0, None),
+            ("cap-a-early", 0.5, Some("one")),
+            ("cap-a-late", 2.5, Some("one")),
+        ] {
+            let mut clip = p["clips"][1].clone();
+            clip["id"] = json!(id);
+            clip["start"] = json!(start);
+            clip["duration"] = json!(0.5);
+            if let Some(group) = group {
+                clip["groupId"] = json!(group);
+            }
+            clips.push(clip);
+        }
+        p["clips"] = json!(clips);
+        p["clips"][2]["groupId"] = json!("one"); // a stays, c moves: group one is split
+        validate_project(&p).unwrap();
+        let starts = |p: &Value| -> Vec<f64> {
+            p["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| number(c, "start", -1.0))
+                .collect()
+        };
+        let before = p.clone();
+        let shift = json!({"trackId":"video-1","from":2.0,"delta":-0.5});
+        mutate(&mut p, "edit.shift", &shift).unwrap();
+        assert_eq!(starts(&p), [0.0, 1.5, 3.5, 1.4, 3.0, 0.5, 2.0]);
+
+        // A grouped clip on a locked track, or one that would start before 0,
+        // refuses the whole shift.
+        let mut locked = before.clone();
+        for track in locked["tracks"].as_array_mut().unwrap() {
+            if track["id"] == text_track {
+                track["locked"] = json!(true);
+            }
+        }
+        let unchanged = locked.clone();
+        assert!(mutate(&mut locked, "edit.shift", &shift).is_err());
+        assert_eq!(locked, unchanged);
+        let mut early = before.clone();
+        early["clips"][3]["start"] = json!(0.2);
+        assert!(mutate(&mut early, "edit.shift", &shift).is_err());
+    }
+
+    #[test]
+    fn a_start_before_the_timeline_is_refused_not_rounded_to_zero() {
+        let mut p = trim_project("video", false, 1.0);
+        let before = p.clone();
+        for (method, params) in [
+            ("edit.add", json!({"text":"t","start":-0.01,"duration":1.0})),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"start":-0.01}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"start":-0.01,"duration":1.0}}),
+            ),
+        ] {
+            let mut attempt = p.clone();
+            assert!(
+                mutate(&mut attempt, method, &params).is_err(),
+                "accepted {params}"
+            );
+        }
+        assert_eq!(p, before);
+        // Under half a frame after 0 is frame 0, stored as a plain zero.
+        for start in [0.01, -0.0] {
+            mutate(
+                &mut p,
+                "edit.update",
+                &json!({"id":"trim-clip","patch":{"start":start}}),
+            )
+            .unwrap();
+            let stored = p["clips"][0]["start"].as_f64().unwrap();
+            assert!(stored == 0.0 && stored.is_sign_positive());
+        }
+    }
+
+    fn stored(dir: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("current.json")).unwrap()).unwrap()
+    }
+
+    /// With deferred saves an edit is in the project's files before it is answered
+    /// (a killed process keeps it); only the flush to the device waits: due once
+    /// editing pauses, done before the project is left, and on drop.
+    #[tokio::test]
+    async fn deferred_saves_are_written_at_once_and_flushed_when_due() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.defer_saves();
+        let first = e.project_id().to_owned();
+        assert!(!e.save_due());
+        let added = e
+            .dispatch(
+                "edit.add",
+                json!({"text":"하나","start":0.0,"duration":1.0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added["revision"], 1);
+        assert_eq!(stored(&dir), added, "written before the reply");
+        assert!(!e.unsynced.is_empty(), "the flush is what waits");
+        // The stored file is replaced by a flush only, by a copy that is on the device.
+        let in_store: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap();
+        assert_eq!(in_store["revision"], 0);
+        assert!(!e.save_due(), "not while editing goes on");
+        std::thread::sleep(SAVE_IDLE + Duration::from_millis(20));
+        assert!(e.save_due());
+        e.flush().unwrap();
+        assert!(!e.save_due() && e.unsynced.is_empty());
+        assert_eq!(stored(&dir), added);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(e.project_file(&first)).unwrap())
+                .unwrap(),
+            added
+        );
+
+        // A steady stream of edits is still written after SAVE_LATEST.
+        e.dispatch("project.update", json!({"patch":{"name":"이름"}}))
+            .await
+            .unwrap();
+        assert!(!e.save_due());
+        e.unsynced.waiting().as_mut().unwrap().first -= SAVE_LATEST;
+        assert!(e.save_due());
+        // The shared handle flushes without the editor.
+        let unsynced = e.unsynced();
+        unsynced.sync().unwrap();
+        assert!(!e.save_due() && e.unsynced.is_empty());
+        e.dispatch("project.update", json!({"patch":{"name":"이름"}}))
+            .await
+            .unwrap();
+        // The list shows the open project as it is, not as it was last written.
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list[0]["name"], "이름");
+
+        // Leaving the project flushes it first; opening it again reads all of it.
+        let renamed = e.project.clone();
+        assert!(!e.unsynced.is_empty());
+        e.dispatch("project.new", json!({"name":"다른 프로젝트"}))
+            .await
+            .unwrap();
+        assert!(e.unsynced.is_empty(), "both projects are on the device");
+        assert_eq!(stored(&dir)["name"], "다른 프로젝트");
+        let reopened = e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(reopened["clips"], renamed["clips"]);
+        assert_eq!(reopened["name"], "이름");
+
+        // Undo and a reopen of the open project keep the latest edits too.
+        e.dispatch("edit.add", json!({"text":"둘","start":2.0,"duration":1.0}))
+            .await
+            .unwrap();
+        let again = e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(again["clips"].as_array().unwrap().len(), 2);
+        let last = e
+            .dispatch("edit.add", json!({"text":"셋","start":4.0,"duration":1.0}))
+            .await
+            .unwrap();
+        assert_eq!(stored(&dir), last);
+        let unsynced = e.unsynced();
+        assert!(!unsynced.is_empty());
+        drop(e);
+        assert!(unsynced.is_empty(), "flushed when the editor goes away");
+        assert_eq!(stored(&dir), last);
+        assert_eq!(Editor::new(dir.clone()).unwrap().project, last);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `project.new` must not take an edited project for an untouched one.
+    #[tokio::test]
+    async fn a_new_project_keeps_an_edited_one_whose_save_is_still_waiting() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.defer_saves();
+        let first = e.project_id().to_owned();
+        let edited = e
+            .dispatch("edit.add", json!({"text":"사용자 자막","duration":1.0}))
+            .await
+            .unwrap();
+        assert_eq!(stored(&dir), edited);
+        let fresh = e.dispatch("project.new", json!({})).await.unwrap();
+        assert_ne!(fresh["id"], json!(first));
+        assert_eq!(fresh["clips"], json!([]));
+        let kept: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap();
+        assert_eq!(kept, edited);
+        let list = e.dispatch("project.list", json!({})).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let reopened = e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(reopened["clips"], edited["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A command that keeps the editor busy for long flushes the edits before it to
+    /// the device when it starts.
+    #[tokio::test]
+    async fn slow_commands_flush_waiting_edits_before_they_start() {
+        for (method, params) in [
+            ("media.import", json!({"paths":["/nonexistent/clip.mp4"]})),
+            (
+                "media.importAndAdd",
+                json!({"paths":["/nonexistent/clip.mp4"]}),
+            ),
+            ("media.reprobe", json!({"ids":["media-none"]})),
+            (
+                "media.relink",
+                json!({"id":"media-none","path":"/nonexistent/clip.mp4"}),
+            ),
+            ("edit.freeze", json!({"id":"clip-none"})),
+            ("color.importLut", json!({"path":"/nonexistent/look.cube"})),
+        ] {
+            let dir = temp();
+            let mut e = Editor::new(dir.clone()).unwrap();
+            e.defer_saves();
+            let edited = e
+                .dispatch("edit.add", json!({"text":"중요한 편집","duration":1.0}))
+                .await
+                .unwrap();
+            assert_eq!(stored(&dir), edited);
+            assert!(!e.unsynced.is_empty());
+            // Whatever becomes of the command itself.
+            let failed = e.dispatch(method, params).await.is_err();
+            assert!(failed && e.unsynced.is_empty(), "{method}");
+            assert_eq!(stored(&dir), edited, "{method}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A failed write is not silent. An edit that cannot reach the autosave is
+    /// refused and leaves no trace. When the flush to the stored file fails nothing
+    /// answered is lost, and until a flush succeeds every further edit is flushed at
+    /// once and refused when it cannot be.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_that_cannot_be_written_is_refused_with_deferred_saves_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.defer_saves();
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        let writable = |folder: &Path, on: bool| {
+            let mode = if on { 0o700 } else { 0o500 };
+            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let in_store = |e: &Editor| -> Value {
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap()
+        };
+        let add = json!({"text":"자막","duration":1.0});
+        let kept = e.dispatch("edit.add", add.clone()).await.unwrap();
+        assert_eq!(stored(&dir), kept);
+
+        // The autosave cannot be replaced: the edit is refused.
+        writable(&dir, false);
+        assert!(e.dispatch("edit.add", add.clone()).await.is_err());
+        writable(&dir, true);
+        assert_eq!(e.project, kept);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(stored(&dir), kept);
+
+        // The stored file cannot be replaced: the flush fails and keeps waiting.
+        writable(&dir.join("projects"), false);
+        assert!(e.flush().is_err());
+        assert!(!e.unsynced.is_empty());
+        assert_eq!(e.project, kept, "the edit is not lost");
+        assert_eq!(stored(&dir), kept);
+        assert_eq!(in_store(&e)["revision"], 0);
+        assert!(e.dispatch("edit.add", add.clone()).await.is_err());
+        assert_eq!(e.project, kept);
+        assert_eq!(e.undo.len(), 1);
+        assert!(
+            e.dispatch("project.new", json!({})).await.is_err(),
+            "the project is not left unsaved"
+        );
+        assert_eq!(e.project, kept);
+        assert_eq!(stored(&dir), kept);
+
+        // Writable again: the next edit is flushed at once, and deferring returns.
+        writable(&dir.join("projects"), true);
+        let next = e.dispatch("edit.add", add.clone()).await.unwrap();
+        assert_eq!(stored(&dir), next);
+        assert_eq!(in_store(&e), next);
+        assert!(e.unsynced.is_empty());
+        assert_eq!(e.undo.len(), 2);
+        let last = e.dispatch("edit.add", add).await.unwrap();
+        assert_eq!(stored(&dir), last);
+        assert_eq!(in_store(&e), next, "deferred again");
+        assert!(!e.unsynced.is_empty());
+        drop(e);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_shares_the_clips_an_edit_did_not_change() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.replace(long_project(40)).unwrap();
+        let start = e.project.clone();
+        let id = start["clips"][7]["id"].clone();
+        for volume in [0.5, 0.25] {
+            e.dispatch("edit.update", json!({"id":id,"patch":{"volume":volume}}))
+                .await
+                .unwrap();
+        }
+        let (first, second) = (&e.undo[0], &e.undo[1]);
+        assert_eq!(first.clips.len(), 40);
+        let shared = first
+            .clips
+            .iter()
+            .zip(&second.clips)
+            .filter(|(a, b)| Arc::ptr_eq(a, b))
+            .count();
+        assert_eq!(shared, 39, "only the edited clip is stored twice");
+        assert!(first.rest["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("waveform").is_none()));
+        // Undo, redo and undo again give back exactly the earlier states.
+        let strip = |mut p: Value| {
+            p["revision"] = Value::Null;
+            p["updatedAt"] = Value::Null;
+            p
+        };
+        let edited = e.project.clone();
+        e.dispatch("history.undo", json!({})).await.unwrap();
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(strip(undone), strip(start));
+        assert_eq!(e.redo.len(), 2);
+        assert!(e.redo[0]
+            .clips
+            .iter()
+            .zip(&e.redo[1].clips)
+            .any(|(a, b)| Arc::ptr_eq(a, b)));
+        e.dispatch("history.redo", json!({})).await.unwrap();
+        let redone = e.dispatch("history.redo", json!({})).await.unwrap();
+        assert_eq!(strip(redone), strip(edited));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn add_without_a_track_never_lands_on_a_hidden_locked_or_muted_track() {
+        let mut p = empty_project("기본 트랙", 1920, 1080, 30.0);
+        p["media"] = json!([
+            {"id":"clip","name":"clip.mp4","path":"/tmp/clip.mp4","kind":"video","duration":4.0,"width":1920,"height":1080,"hasAudio":true},
+            {"id":"song","name":"song.wav","path":"/tmp/song.wav","kind":"audio","duration":4.0,"width":0,"height":0,"hasAudio":true}
+        ]);
+        insert_track(&mut p, "video", "영상 2");
+        p["tracks"][0]["hidden"] = json!(true);
+        let second = p["tracks"][1]["id"].clone();
+        mutate(&mut p, "edit.add", &json!({"mediaId":"clip"})).unwrap();
+        assert_eq!(p["clips"][0]["trackId"], second, "the visible track");
+
+        // No track of the kind is usable: the clip gets one, named after its kind.
+        p["tracks"][1]["locked"] = json!(true);
+        let tracks = p["tracks"].as_array().unwrap().len();
+        mutate(&mut p, "edit.add", &json!({"mediaId":"clip"})).unwrap();
+        mutate(&mut p, "edit.add", &json!({"mediaId":"clip"})).unwrap();
+        let made = p["tracks"][2].clone();
+        assert_eq!(p["tracks"].as_array().unwrap().len(), tracks + 1);
+        assert_eq!(
+            (
+                &made["kind"],
+                &made["name"],
+                &made["hidden"],
+                &made["locked"]
+            ),
+            (
+                &json!("video"),
+                &json!("영상 3"),
+                &json!(false),
+                &json!(false)
+            )
+        );
+        assert_eq!(p["clips"][1]["trackId"], made["id"]);
+        assert_eq!(p["clips"][2]["trackId"], made["id"], "and it is used again");
+        assert_eq!(p["clips"][2]["start"], 4.0);
+
+        let audio = |p: &Value| -> Vec<Value> {
+            p["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["kind"] == "audio")
+                .cloned()
+                .collect()
+        };
+        p["tracks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["id"] == "audio-1")
+            .unwrap()["muted"] = json!(true);
+        mutate(&mut p, "edit.add", &json!({"mediaId":"song"})).unwrap();
+        let heard = audio(&p);
+        assert_eq!(heard.len(), 2);
+        assert_eq!(heard[1]["name"], "오디오 2");
+        assert_eq!(p["clips"][3]["trackId"], heard[1]["id"]);
+
+        p["tracks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["id"] == "text-1")
+            .unwrap()["hidden"] = json!(true);
+        mutate(&mut p, "edit.add", &json!({"text":"자막"})).unwrap();
+        let text = p["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rfind(|t| t["kind"] == "text")
+            .unwrap();
+        assert_eq!(text["name"], "텍스트 2");
+        assert_eq!(p["clips"][4]["trackId"], text["id"]);
+
+        // A track named by the caller is taken as given, and a locked one refused.
+        let before = p.clone();
+        mutate(
+            &mut p,
+            "edit.add",
+            &json!({"text":"숨긴 곳","trackId":"text-1"}),
+        )
+        .unwrap();
+        assert_eq!(p["clips"][5]["trackId"], "text-1");
+        let mut locked = before.clone();
+        assert!(mutate(
+            &mut locked,
+            "edit.add",
+            &json!({"mediaId":"clip","trackId":second})
+        )
+        .is_err());
+        assert!(mutate(
+            &mut locked,
+            "edit.add",
+            &json!({"mediaId":"clip","trackId":"none"})
+        )
+        .is_err());
+        assert_eq!(locked, before);
+    }
+
+    #[tokio::test]
+    async fn a_new_project_reuses_an_untouched_unnamed_one() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let count = |e: &Editor| {
+            std::fs::read_dir(e.root.join("projects"))
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        };
+        let first = e.project_id().to_owned();
+        // The open project is untouched: asking for another keeps it, with the new size.
+        let again = e
+            .dispatch(
+                "project.new",
+                json!({"name":"이름 없는 프로젝트","width":1080,"height":1920}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["id"], first.as_str());
+        assert_eq!(
+            (&again["name"], &again["width"], &again["height"]),
+            (&json!("이름 없는 프로젝트"), &json!(1080), &json!(1920))
+        );
+        assert_eq!(count(&e), 1);
+
+        // A named project is always new, and leaves the untouched one in the store.
+        let named = e
+            .dispatch("project.new", json!({"name":"여행"}))
+            .await
+            .unwrap();
+        assert_ne!(named["id"], first.as_str());
+        assert_eq!(count(&e), 2);
+        // The stored untouched one is used again rather than a third file.
+        let reused = e.dispatch("project.new", json!({})).await.unwrap();
+        assert_eq!(reused["id"], first.as_str());
+        assert_eq!(reused["name"], "새 프로젝트");
+        assert_eq!(count(&e), 2);
+
+        // Anything the user did to it makes it theirs: notes, a clip, its name.
+        e.dispatch(
+            "edit.add",
+            json!({"text":"자막","start":0.0,"duration":1.0}),
+        )
+        .await
+        .unwrap();
+        let third = e.dispatch("project.new", json!({})).await.unwrap();
+        assert_ne!(third["id"], first.as_str());
+        assert_eq!(count(&e), 3);
+        e.dispatch("project.update", json!({"patch":{"background":"#222222"}}))
+            .await
+            .unwrap();
+        let fourth = e.dispatch("project.new", json!({})).await.unwrap();
+        assert_ne!(fourth["id"], third["id"]);
+        assert_eq!(count(&e), 4);
+        let kept = e
+            .dispatch("project.open", json!({"id":first}))
+            .await
+            .unwrap();
+        assert_eq!(kept["clips"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn waveforms_are_stored_rounded_and_can_be_left_out_of_replies() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        let path = dir.join("tone.wav");
+        write_wav(&path, 8_000);
+        let path = path.canonicalize().unwrap();
+        e.project["media"] = json!([{"id":"tone","name":"tone.wav","path":path,"kind":"audio","duration":1.0,"width":0,"height":0,"hasAudio":true}]);
+        e.persist().unwrap();
+        let pending = e
+            .dispatch("media.waveform", json!({"id":"tone"}))
+            .await
+            .unwrap();
+        assert_eq!(pending, json!({"id":"tone","waveform":null}));
+        assert!(e
+            .set_waveform("tone", &path, vec![0.1f32, 1.0 / 3.0, 1.0])
+            .unwrap());
+        let full = e.dispatch("project.get", json!({})).await.unwrap();
+        assert_eq!(full["media"][0]["waveform"], json!([0.1, 0.333, 1.0]));
+        assert!(full["media"][0].get("waveformPeaks").is_none());
+        let slim = e
+            .dispatch("project.get", json!({"omitWaveforms":true}))
+            .await
+            .unwrap();
+        assert!(slim["media"][0].get("waveform").is_none());
+        assert_eq!(slim["media"][0]["waveformPeaks"], 3);
+        // The peaks have a name that `media.waveform` repeats; other peaks of the
+        // same number (the file was replaced by one as long) have another.
+        let named = slim["media"][0]["waveformId"].as_str().unwrap().to_owned();
+        let fetched = e
+            .dispatch("media.waveform", json!({"id":"tone"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched,
+            json!({"id":"tone","waveform":[0.1, 0.333, 1.0],"waveformId":named})
+        );
+        assert!(full["media"][0].get("waveformId").is_none());
+        assert_eq!(named, waveform_id(&[json!(0.1), json!(0.333), json!(1.0)]));
+        assert_ne!(named, waveform_id(&[json!(0.1), json!(0.334), json!(1.0)]));
+        assert_ne!(named, waveform_id(&[json!(0.333), json!(0.1), json!(1.0)]));
+        // An edit's reply and a saved project's too; the stored project keeps them.
+        let edited = e
+            .dispatch(
+                "edit.add",
+                json!({"mediaId":"tone","omitWaveforms":true,"expectedRevision":0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["media"][0]["waveformPeaks"], 3);
+        assert!(edited["media"][0].get("waveform").is_none());
+        let saved = e
+            .dispatch("project.save", json!({"omitWaveforms":true}))
+            .await
+            .unwrap();
+        assert_eq!(saved["project"]["media"][0]["waveformPeaks"], 3);
+        assert_eq!(
+            stored(&dir)["media"][0]["waveform"],
+            json!([0.1, 0.333, 1.0])
+        );
+        assert_eq!(
+            e.dispatch("media.waveform", json!({"id":"tone"}))
+                .await
+                .unwrap(),
+            json!({"id":"tone","waveform":[0.1, 0.333, 1.0],"waveformId":named})
+        );
+        assert!(e
+            .dispatch("media.waveform", json!({"id":"none"}))
+            .await
+            .is_err());
+
+        // A waveform stored at full float precision is rounded when it is opened.
+        let mut old = e.project.clone();
+        old["media"][0]["waveform"] = json!([0.10000000149011612, 0.5]);
+        let file = dir.join("old.json");
+        std::fs::write(&file, old.to_string()).unwrap();
+        let opened = e
+            .dispatch("project.open", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(opened["media"][0]["waveform"], json!([0.1, 0.5]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A timeline of `clips` clips over four tracks, cut from twenty media items
+    /// that each carry a full-size waveform.
+    fn long_project(clips: usize) -> Value {
+        let mut p = empty_project("긴 타임라인", 1920, 1080, 30.0);
+        insert_track(&mut p, "video", "영상 2");
+        let tracks: Vec<String> = p["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect();
+        let media: Vec<Value> = (0..20)
+            .map(|i| {
+                let peaks: Vec<f32> = (0..1024).map(|n| (n % 97) as f32 / 97.0).collect();
+                json!({"id":format!("media-{i}"),"name":format!("소재 {i}.mp4"),
+                    "path":format!("/nonexistent/bench/source-{i}.mp4"),"kind":"video",
+                    "duration":600.0,"width":1920,"height":1080,"hasAudio":true,
+                    "codec":"h264","fps":30.0,"waveform":peaks})
+            })
+            .collect();
+        p["media"] = json!(media);
+        let list: Vec<Value> = (0..clips)
+            .map(|i| {
+                let track = &p["tracks"][i % 4];
+                let kind = match string(track, "kind", "") {
+                    "text" => "text",
+                    "audio" => "audio",
+                    _ => "video",
+                };
+                let mut clip = default_clip(
+                    kind,
+                    &format!("클립 {i}"),
+                    &tracks[i % 4],
+                    (i / 4) as f64 * 2.0,
+                    2.0,
+                );
+                if kind == "text" {
+                    clip["text"] = json!({"content":format!("자막 {i}"),"fontSize":64,"color":"#ffffff","fontFamily":"sans-serif","bold":false,"align":"center","background":"transparent"});
+                } else {
+                    clip["mediaId"] = json!(format!("media-{}", i % 20));
+                    clip["sourceIn"] = json!((i % 100) as f64);
+                }
+                clip
+            })
+            .collect();
+        p["clips"] = json!(list);
+        validate_project(&p).unwrap();
+        p
+    }
+
+    fn median_ms(mut samples: Vec<f64>) -> f64 {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    }
+
+    /// Not a pass/fail test: prints how large and slow a project reply is.
+    /// cargo test --release --lib project_reply_cost -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn project_reply_cost() {
+        use std::time::Instant;
+        for clips in [500, 2000] {
+            let dir = temp();
+            let mut e = Editor::new(dir.clone()).unwrap();
+            let unrounded = serde_json::to_vec(&long_project(clips)).unwrap().len();
+            e.replace(long_project(clips)).unwrap();
+            let mut line = format!(
+                "{clips} clips, 20 media: full-precision waveforms {} KB",
+                unrounded / 1024
+            );
+            for (name, params) in [
+                ("full", json!({})),
+                ("omitWaveforms", json!({"omitWaveforms":true})),
+                (
+                    "unchanged",
+                    json!({"ifProjectId":e.project["id"],"ifRevision":e.project["revision"]}),
+                ),
+            ] {
+                // The first conditional read reports the derived changes of opening.
+                e.dispatch("project.get", params.clone()).await.unwrap();
+                let mut bytes = 0;
+                let ms = median_ms(
+                    (0..15)
+                        .map(|_| {
+                            let start = Instant::now();
+                            let reply = futures_util::FutureExt::now_or_never(
+                                e.dispatch("project.get", params.clone()),
+                            )
+                            .unwrap()
+                            .unwrap();
+                            bytes = serde_json::to_vec(&json!({"result":reply})).unwrap().len();
+                            start.elapsed().as_secs_f64() * 1000.0
+                        })
+                        .collect(),
+                );
+                line += &format!(" | {name} {} KB {ms:.2}ms", bytes / 1024);
+            }
+            println!("{line}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Not a pass/fail test: prints what one edit costs on a long timeline.
+    /// cargo test --lib long_timeline_edit_cost -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn long_timeline_edit_cost() {
+        use std::time::Instant;
+        let timed = |work: &mut dyn FnMut()| {
+            median_ms(
+                (0..15)
+                    .map(|_| {
+                        let start = Instant::now();
+                        work();
+                        start.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect(),
+            )
+        };
+        for clips in [500, 1000, 2000] {
+            let dir = temp();
+            let mut e = Editor::new(dir.clone()).unwrap();
+            e.replace(long_project(clips)).unwrap();
+            let project = e.project.clone();
+            let bytes = serde_json::to_vec(&project).unwrap().len();
+            let parts = [
+                ("clone", timed(&mut || drop(project.clone()))),
+                (
+                    "validate",
+                    timed(&mut || validate_project(&project).unwrap()),
+                ),
+                (
+                    "json",
+                    timed(&mut || drop(serde_json::to_vec(&project).unwrap())),
+                ),
+                (
+                    "save(fsync)",
+                    timed(&mut || media::atomic_json(&dir.join("bench.json"), &project).unwrap()),
+                ),
+            ];
+            let id = project["clips"][clips / 2]["id"].clone();
+            let part_text: Vec<String> = parts
+                .iter()
+                .map(|(name, ms)| format!("{name} {ms:.2}ms"))
+                .collect();
+            println!(
+                "{clips} clips, {} KB: {}",
+                bytes / 1024,
+                part_text.join(", ")
+            );
+            for deferred in [false, true] {
+                if deferred {
+                    e.defer_saves();
+                }
+                let mut samples: HashMap<&str, Vec<f64>> = HashMap::new();
+                for round in 0..15 {
+                    for (name, method, params) in [
+                        (
+                            "edit.update",
+                            "edit.update",
+                            json!({"id":id,"patch":{"volume":0.5 + round as f64 / 100.0}}),
+                        ),
+                        (
+                            "edit.shift",
+                            "edit.shift",
+                            json!({"trackId":"video-1","from":10.0,"delta":1.0}),
+                        ),
+                        ("undo", "history.undo", json!({})),
+                    ] {
+                        let mut params = params;
+                        params["expectedRevision"] = e.project["revision"].clone();
+                        let start = Instant::now();
+                        e.dispatch(method, params).await.unwrap();
+                        samples
+                            .entry(name)
+                            .or_default()
+                            .push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                let start = Instant::now();
+                e.flush().unwrap();
+                let flush = start.elapsed().as_secs_f64() * 1000.0;
+                let commands: Vec<String> = ["edit.update", "edit.shift", "undo"]
+                    .iter()
+                    .map(|name| format!("{name} {:.2}ms", median_ms(samples[name].clone())))
+                    .collect();
+                println!(
+                    "  {}: {}, flush {flush:.2}ms",
+                    if deferred {
+                        "deferred saves"
+                    } else {
+                        "save per edit"
+                    },
+                    commands.join(", "),
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}

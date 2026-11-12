@@ -1,0 +1,315 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "design-system-font",
+        "value": "arial",
+        "files": [
+          "src/studio/Inspector.tsx",
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:43:51.596Z",
+        "reason": "Agent: these are editable video text font choices, not Studio UI typography; broad font controls are user requested."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#ffffff",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.162Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#ffe76a",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.195Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#d5fb72",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.226Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#dd4a51",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.259Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#7956d8",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.292Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#305b8f",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.330Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#f0cf91",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.370Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#ffffff",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.405Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#00ff00",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.438Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#0000ff",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.472Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#ef5b62",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.505Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#e2c34a",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.538Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#63c777",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.573Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#5dc7d3",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.606Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#658eea",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.640Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#d46fd6",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.674Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#f07178",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.707Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#7bd68c",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.742Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#7fa0f1",
+        "files": [
+          "src/studio/Inspector.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.776Z",
+        "reason": "Agent: video content preset or semantic HSL/RGB/chroma-key swatch; these colors describe editable media, not Studio brand surfaces."
+      },
+      {
+        "rule": "design-system-font",
+        "value": "georgia",
+        "files": [
+          "src/studio/Library.tsx"
+        ],
+        "createdAt": "2026-11-01T04:44:35.810Z",
+        "reason": "Agent: editable video title font preset, not UI typography."
+      },
+      {
+        "rule": "design-system-font",
+        "value": "arial",
+        "files": [
+          "src/studio/CustomAssets.test.tsx"
+        ],
+        "createdAt": "2026-11-01T04:47:45.305Z",
+        "reason": "Agent: literal font and canvas colors in test fixtures matching editor inputs, not UI brand styles."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000000",
+        "files": [
+          "src/studio/CustomAssets.test.tsx"
+        ],
+        "createdAt": "2026-11-01T04:47:45.346Z",
+        "reason": "Agent: literal font and canvas colors in test fixtures matching editor inputs, not UI brand styles."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#ffffff",
+        "files": [
+          "src/studio/CustomAssets.test.tsx"
+        ],
+        "createdAt": "2026-11-01T04:47:45.385Z",
+        "reason": "Agent: literal font and canvas colors in test fixtures matching editor inputs, not UI brand styles."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#87c8c1",
+        "files": [
+          "src/studio/timeline.css"
+        ],
+        "createdAt": "2026-11-01T05:14:06.522Z",
+        "reason": "Agent: preserve existing timeline multi-selection outline hierarchy during layer editing update"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#e0fff8",
+        "files": [
+          "src/studio/timeline.css"
+        ],
+        "createdAt": "2026-11-01T05:14:06.612Z",
+        "reason": "Agent: preserve existing primary clip selection outline during layer editing update"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000000",
+        "files": [
+          "src/studio/Timeline.test.tsx"
+        ],
+        "createdAt": "2026-11-01T05:14:06.700Z",
+        "reason": "Agent: media canvas test fixture background, not application UI palette"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000",
+        "files": [
+          "src/studio/Player.tsx"
+        ],
+        "createdAt": "2026-11-01T05:14:32.794Z",
+        "reason": "Agent: editable video canvas/text colors or their test fixtures, not application chrome palette."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#fff",
+        "files": [
+          "src/studio/Player.tsx"
+        ],
+        "createdAt": "2026-11-01T05:14:32.825Z",
+        "reason": "Agent: editable video canvas/text colors or their test fixtures, not application chrome palette."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000000",
+        "files": [
+          "src/studio/Player.test.tsx"
+        ],
+        "createdAt": "2026-11-01T05:14:32.858Z",
+        "reason": "Agent: editable video canvas/text colors or their test fixtures, not application chrome palette."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#87c8c1",
+        "files": [
+          "src/studio/Timeline.css"
+        ],
+        "createdAt": "2026-11-01T05:15:00.832Z",
+        "reason": "Agent: existing multi-selection outline; hook also reports this CSS through a case-variant import path"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#e0fff8",
+        "files": [
+          "src/studio/Timeline.css"
+        ],
+        "createdAt": "2026-11-01T05:15:00.924Z",
+        "reason": "Agent: existing primary-selection outline; hook also reports this CSS through a case-variant import path"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#00ff00",
+        "files": [
+          "src/studio/Panels.test.tsx"
+        ],
+        "createdAt": "2026-11-01T05:16:30.027Z",
+        "reason": "Chroma-key source key color in an existing editor regression fixture, not a UI palette value."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000000",
+        "files": [
+          "src/App.test.tsx"
+        ],
+        "createdAt": "2026-11-01T05:18:45.358Z",
+        "reason": "Existing project video-canvas background in a test fixture, not application UI chrome."
+      }
+    ]
+  }
+}

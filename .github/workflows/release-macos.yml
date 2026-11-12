@@ -82,20 +82,10 @@ jobs:
     permissions:
       contents: write
     env:
-      # Tauri 는 이 이름들을 읽어 codesign 과 공증을 수행한다. org 시크릿 이름과
-      # Tauri 가 기대하는 이름이 달라 여기서 매핑한다.
-      #   MACOS_SIGN_IDENTITY  -> APPLE_SIGNING_IDENTITY
-      #   APPLE_APP_PASSWORD   -> APPLE_PASSWORD
+      # 서명·공증 시크릿은 여기(job 수준)에 두지 않는다. npm ci, verify, brew,
+      # 서드파티 액션까지 잡의 모든 스텝이 받게 되기 때문이다. 필요한 세 스텝
+      # (인증서 import, 앱 빌드, DMG 공증)에만 스텝 env 로 준다.
       #
-      # APPLE_CERTIFICATE 는 의도적으로 넘기지 않는다. 그 경로를 쓰면 Tauri 가
-      # 자체 키체인에 p12 만 import 하는데, Keychain Access 로 뽑은 p12 에는
-      # leaf 와 개인키만 들어 있어 Developer ID intermediate 가 빠지고 codesign 이
-      # identity 를 찾지 못한다. 아래 import 스텝이 intermediate 까지 넣은 키체인을
-      # 검색 목록에 올려두므로 identity 이름만 주면 된다.
-      APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       # runner 컨텍스트는 job 레벨 env 에서 쓸 수 없다. 키체인 경로는 각 스텝에서
       # $RUNNER_TEMP 로 만들고, 비밀번호는 github 컨텍스트만으로 구성한다.
       KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -181,6 +171,7 @@ jobs:
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
@@ -246,7 +237,16 @@ jobs:
           lipo -info "$OUT/studio-service"
 
       # universal 로 빌드해 Intel 과 Apple Silicon 을 DMG 하나로 덮는다.
-      # 위 env 가 채워져 있으므로 Tauri 가 .app 을 서명하고 공증까지 진행한다.
+      # 이 스텝의 env 가 채워져 있으므로 Tauri 가 .app 을 서명하고 공증까지 진행한다.
+      # Tauri 는 아래 이름들을 읽는다. org 시크릿 이름과 달라 여기서 매핑한다.
+      #   MACOS_SIGN_IDENTITY  -> APPLE_SIGNING_IDENTITY
+      #   APPLE_APP_PASSWORD   -> APPLE_PASSWORD
+      #
+      # APPLE_CERTIFICATE 는 의도적으로 넘기지 않는다. 그 경로를 쓰면 Tauri 가
+      # 자체 키체인에 p12 만 import 하는데, Keychain Access 로 뽑은 p12 에는
+      # leaf 와 개인키만 들어 있어 Developer ID intermediate 가 빠지고 codesign 이
+      # identity 를 찾지 못한다. 위 import 스텝이 intermediate 까지 넣은 키체인을
+      # 검색 목록에 올려두므로 identity 이름만 주면 된다.
       #
       # 재시도를 붙인 이유: Tauri 가 부르는 bundle_dmg.sh 는 DMG 창을 꾸미려고
       # AppleEvent 로 Finder 를 조작하는데, Finder 가 바쁘거나 없으면
@@ -254,6 +254,11 @@ jobs:
       # 그 단계를 건너뛰는 --skip-jenkins 를 Tauri 는 넘기지 않으며 그걸 켤
       # 설정도 없다. 릴리스에서 가장 깨지기 쉬운 지점이라 한 번 다시 시도한다.
       - name: Build signed and notarized app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -uo pipefail
           attempt_build() {
@@ -320,6 +325,13 @@ jobs:
               || { echo "::error::$name has no x86_64 slice"; exit 1; }
             lipo -info "$BIN" | grep -q 'arm64' \
               || { echo "::error::$name has no arm64 slice"; exit 1; }
+            # 두 실행 파일 각각의 서명도 본다. 공증이 몇 분 뒤 거부하기 전에
+            # 어느 파일이 문제인지 여기서 드러난다.
+            codesign --display --verbose=2 "$BIN" 2>&1 \
+              | grep -q '^Authority=Developer ID Application' \
+              || { echo "::error::$name is not signed by a Developer ID authority"; exit 1; }
+            codesign --display --verbose=2 "$BIN" 2>&1 | grep -q 'flags=.*runtime' \
+              || { echo "::error::hardened runtime is not enabled on $name"; exit 1; }
           done
 
           # 예제 소재는 리소스로 들어간다(tauri.conf.json 의 bundle.resources).
@@ -347,6 +359,10 @@ jobs:
       # 확인하고 없을 때만 직접 공증한다. 공증은 수 분이 걸려서 무조건 한 번 더
       # 돌리는 것은 낭비다. 검증 자체는 어느 경로로 왔든 똑같이 강제한다.
       - name: Notarize and staple the DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           SRC_DMG="${{ steps.artifacts.outputs.dmg }}"
@@ -394,7 +410,10 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh "$DMG_PATH"
-          shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
+          # 파일 이름만 적는다. 절대 경로가 들어가면 내려받은 쪽에서
+          # `shasum -a 256 -c` 가 러너의 경로를 찾다 실패한다.
+          (cd "$(dirname "$DMG_PATH")" && shasum -a 256 "$(basename "$DMG_PATH")") \
+            | tee "$DMG_PATH.sha256"
 
       - name: Remove signing keychain
         if: always()

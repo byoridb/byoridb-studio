@@ -252,6 +252,34 @@ describe("Settings", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: /빈 프로젝트/ })).toBeNull());
   });
 
+  it("says that the open project's proxies are over the limit only when the service reports it", async () => {
+    let over: boolean | undefined;
+    vi.mocked(rpc).mockImplementation(async (method) => {
+      if (method === "runtime.status") return status(true);
+      if (method === "storage.usage")
+        return {
+          folders: { proxies: { files: 2, bytes: 6 * 1024 ** 3, cleanable: true, reclaimableBytes: 0, reclaimableFiles: 0 } },
+          bytes: 6 * 1024 ** 3,
+          reclaimableBytes: 0,
+          proxyLimitBytes: 5 * 1024 ** 3,
+          ...(over !== undefined && { proxyOverLimit: over }),
+        };
+      return mcp;
+    });
+    const notice = "열린 프로젝트의 프록시가 한도를 넘었습니다. 열린 프로젝트의 프록시는 지워지지 않습니다.";
+    // An older service (no field) and a service under its limit say nothing.
+    for (const reported of [undefined, false]) {
+      over = reported;
+      const view = render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+      expect(await screen.findByRole("combobox", { name: "프록시 한도" })).toBeInTheDocument();
+      expect(screen.queryByText(notice)).toBeNull();
+      view.unmount();
+    }
+    over = true;
+    render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+  });
+
   it("leaves the storage section out when the service does not report it", async () => {
     render(<Settings onClose={vi.fn()} onUpdate={vi.fn()} />);
     await screen.findByText("로그인 필요");

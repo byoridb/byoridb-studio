@@ -317,10 +317,12 @@ it("plays again after the element ended and the clock seeks back", async () => {
  */
 function engine(
   tag: "audio" | "video" = "audio",
-  { startDelay = 0, seekDelay = 0, rateDelay = 0, falseRun = 0, position = 0, stagger = [] as number[], reportAfter = 0 } = {},
+  { startDelay = 0, seekDelay = 0, rateDelay = 0, falseRun = 0, position = 0, stagger = [] as number[], reportAfter = 0, seekTime = 0 } = {},
 ) {
   const element = document.createElement(tag);
   let base = position, anchor = 0, delay = 0, silent = 0, blind = 0, rate = 1, paused = true, volume = 1, starts = 0;
+  /** `seekTime`: the element reports `seeking` this long (seconds) before `seeked`, as a real engine does. */
+  let seeking = false;
   const writes = { seeks: [] as number[], rates: [] as number[] };
   const since = () => (performance.now() - anchor) / 1000;
   const sound = () => (paused ? base : base + Math.max(0, since() - delay) * rate);
@@ -331,7 +333,7 @@ function engine(
   const restart = (cost: number) => { base = sound(); anchor = performance.now(); delay = cost; silent = 0; blind = 0; };
   Object.defineProperties(element, {
     readyState: { get: () => 4 },
-    seeking: { get: () => false },
+    seeking: { get: () => seeking },
     paused: { get: () => paused },
     duration: { get: () => 600 },
     volume: { get: () => volume, set: (value: number) => { volume = value; } },
@@ -341,7 +343,9 @@ function engine(
         writes.seeks.push(value);
         restart(paused ? 0 : seekDelay);
         base = value;
-        element.dispatchEvent(new Event("seeked"));
+        if (!seekTime) { element.dispatchEvent(new Event("seeked")); return; }
+        seeking = true;
+        setTimeout(() => { seeking = false; element.dispatchEvent(new Event("seeked")); }, seekTime * 1000);
       },
     },
     playbackRate: {
@@ -374,6 +378,8 @@ type Engine = ReturnType<typeof engine>;
 /** The timeline as the app drives it: the clock asks whether to wait, then every element is updated. */
 function timeline(clips: Engine[], frameMs = 16) {
   const clock = { time: 0, epoch: 0, playing: false, skipped: [] as number[] };
+  /** Clips whose turn has not come (or is over): they are on the timeline but do not play. */
+  const inactive = new Set<Engine>();
   // The running clock takes a skip ahead from its next step on.
   vi.spyOn(clockModule, "skipPlaybackAhead").mockImplementation((seconds: number) => {
     clock.time += seconds;
@@ -384,11 +390,17 @@ function timeline(clips: Engine[], frameMs = 16) {
     for (const clip of clips)
       clip.transport.update({
         time: clock.time, target: clock.time, speed: 1, volume: 1,
-        playing: clock.playing, active: true, reverse: false, seekEpoch: clock.epoch,
+        playing: clock.playing, active: !inactive.has(clip), reverse: false, seekEpoch: clock.epoch,
       });
   };
   return {
     clock,
+    inactive,
+    /** The user (or a repeat) moves the playhead; the elements hear of it with the next frame. */
+    seek(to: number) {
+      clock.time = to;
+      clock.epoch++;
+    },
     /** The play button, from the start of the timeline. */
     async start() {
       clock.time = 0;
@@ -410,7 +422,8 @@ function timeline(clips: Engine[], frameMs = 16) {
         await vi.advanceTimersByTimeAsync(frameMs);
         if (!isPreviewPlaybackWaiting()) clock.time += frameMs / 1000;
         update();
-        for (const clip of clips) worst = Math.max(worst, Math.abs(clock.time - clip.sound()));
+        for (const clip of clips)
+          if (!inactive.has(clip)) worst = Math.max(worst, Math.abs(clock.time - clip.sound()));
       }
       return worst;
     },
@@ -546,7 +559,7 @@ describe("keeping the media on the clock", () => {
     expect(stored.afterMove).toBeCloseTo(0.2, 2);
     resetPlaybackCalibration();
     expect(localStorage.getItem("byori-studio.playback-latency.2")).toBeNull();
-    expect(playbackCalibration()).toEqual({ restart: 0, afterMove: 0, seek: 0, trimUsable: true });
+    expect(playbackCalibration()).toEqual({ restart: 0, afterMove: 0, seek: 0, join: 0, trimUsable: true });
   });
 
   it("does not hold the clock for the start delay in a hidden window", async () => {
@@ -677,6 +690,155 @@ describe("keeping the media on the clock", () => {
     await line.run(3);
     expect(costly.writes.rates.length).toBe(rates);
     expect(Math.abs(line.behind(costly))).toBeLessThanOrEqual(DRIFT_START);
+  });
+
+  it("learns what a clip that joins a running timeline costs apart from a seek while playing", async () => {
+    // A start costs this engine 0.3 s and a seek while it plays 0.1 s.
+    const first = engine("audio", { startDelay: 0.3, falseRun: 0.385 });
+    const joiner = engine("audio", { startDelay: 0.3, seekDelay: 0.1, seekTime: 0.05 });
+    const line = timeline([first, joiner]);
+    line.inactive.add(joiner);
+    await line.start();
+    await line.run(1.5);
+    expect(playbackCalibration().restart).toBeCloseTo(0.3, 2);
+    // Its turn comes while the timeline runs: sought ahead by what a start costs, then started.
+    line.inactive.delete(joiner);
+    const joinedAt = line.clock.time;
+    await line.run(2.5);
+    expect(joiner.writes.seeks).toHaveLength(1);
+    expect(joiner.writes.seeks[0]).toBeCloseTo(joinedAt + 0.3, 1);
+    expect(Math.abs(line.behind(joiner))).toBeLessThanOrEqual(0.05);
+    // That was a start, not a seek of a playing element: it says nothing about those.
+    expect(playbackCalibration().join).toBeCloseTo(0.3, 1);
+    expect(playbackCalibration().seek).toBe(0);
+    // A seek while it plays is learned on its own and leaves the join alone.
+    joiner.nudge(-0.6);
+    await line.run(2);
+    expect(playbackCalibration().seek).toBeCloseTo(0.1, 1);
+    expect(playbackCalibration().join).toBeCloseTo(0.3, 1);
+    // The next clip to join is sought ahead by the join's cost, not the seek's.
+    const next = engine("audio", { startDelay: 0.3, seekDelay: 0.1, seekTime: 0.05 });
+    const later = timeline([first, next]);
+    later.clock.time = line.clock.time;
+    later.clock.epoch = line.clock.epoch;
+    later.clock.playing = true;
+    later.inactive.add(next);
+    await later.run(0.1);
+    later.inactive.delete(next);
+    const at = later.clock.time;
+    await later.run(2);
+    expect(next.writes.seeks[next.writes.seeks.length - 1]).toBeCloseTo(at + 0.3, 1);
+    expect(Math.abs(later.behind(next))).toBeLessThanOrEqual(0.05);
+  });
+
+  it("ends a rate trim when the playhead is moved, and still trims afterwards", async () => {
+    const steady = engine("audio"), drifting = engine("audio");
+    const line = timeline([steady, drifting]);
+    await line.start();
+    await line.run(1.5);
+    drifting.nudge(-0.25);
+    await line.run(0.5);
+    expect(drifting.element.playbackRate).toBeGreaterThan(1);
+    // A seek (or a repeat's wrap) puts the element on the clock: the trim has nothing left to do.
+    line.seek(30);
+    await line.run(0.05);
+    expect(drifting.element.playbackRate).toBe(1);
+    await line.run(3);
+    // The jump was not the engine stalling on a rate change.
+    expect(playbackCalibration().trimUsable).toBe(true);
+    expect(Math.abs(line.behind(drifting))).toBeLessThanOrEqual(0.03);
+    const seeks = drifting.writes.seeks.length;
+    drifting.nudge(-0.15);
+    await line.run(4);
+    expect(drifting.writes.seeks.length).toBe(seeks);
+    expect(drifting.element.playbackRate).toBe(1);
+    expect(Math.abs(line.behind(drifting))).toBeLessThanOrEqual(DRIFT_STOP + 0.01);
+  });
+
+  it("ends a rate trim when everything that plays falls behind and the clock waits for it", async () => {
+    const steady = engine("audio"), drifting = engine("audio");
+    const line = timeline([steady, drifting]);
+    await line.start();
+    await line.run(1.5);
+    drifting.nudge(-0.15);
+    await line.run(0.5);
+    expect(drifting.element.playbackRate).toBeGreaterThan(1);
+    // Both stall together: that is the clock's to absorb, not a rate change gone wrong.
+    steady.nudge(-0.15);
+    drifting.nudge(-0.15);
+    await line.run(5);
+    expect(playbackCalibration().trimUsable).toBe(true);
+    expect(drifting.writes.seeks).toEqual([]);
+    expect(steady.writes.rates).toEqual([]);
+    expect(drifting.element.playbackRate).toBe(1);
+    expect(Math.abs(line.behind(drifting))).toBeLessThanOrEqual(DRIFT_STOP + 0.01);
+    expect(Math.abs(line.behind(steady))).toBeLessThanOrEqual(DRIFT_STOP + 0.02);
+  });
+
+  it("puts the rate back to the clip's own when playback stops, or the clip's turn ends, during a trim", async () => {
+    const steady = engine("audio"), drifting = engine("audio");
+    const line = timeline([steady, drifting]);
+    await line.start();
+    await line.run(1.5);
+    drifting.nudge(-0.25);
+    await line.run(0.5);
+    expect(drifting.element.playbackRate).toBeGreaterThan(1);
+    await line.stop();
+    expect(drifting.element.playbackRate).toBe(1);
+
+    await line.start();
+    await line.run(1.5);
+    drifting.nudge(-0.25);
+    await line.run(0.5);
+    expect(drifting.element.playbackRate).toBeGreaterThan(1);
+    line.inactive.add(drifting);
+    await line.run(0.016);
+    expect(drifting.element.playbackRate).toBe(1);
+    expect(playbackCalibration().trimUsable).toBe(true);
+  });
+
+  it("does not hold the clock for the start delay of an element that makes no sound", async () => {
+    const learnt = engine("audio", { startDelay: 0.3, falseRun: 0.385 });
+    const learning = timeline([learnt]);
+    for (let start = 0; start < 2; start++) {
+      await learning.start();
+      await learning.run(1.5);
+      await learning.stop();
+    }
+    expect(playbackCalibration().afterMove).toBeCloseTo(0.3, 2);
+    learnt.transport.dispose();
+
+    // A video without an audio track, where the engine tells: nothing to wait for once it moves.
+    const soundless = engine("video", { startDelay: 0.3, falseRun: 0.385 });
+    Object.defineProperty(soundless.element, "audioTracks", { value: { length: 0 } });
+    const quiet = timeline([soundless]);
+    await quiet.start();
+    await quiet.run(0.1);
+    expect(quiet.clock.time).toBeGreaterThan(0.03);
+    await quiet.stop();
+    soundless.transport.dispose();
+
+    // One with an audio track is waited for as before.
+    const sounding = engine("video", { startDelay: 0.3, falseRun: 0.385 });
+    Object.defineProperty(sounding.element, "audioTracks", { value: { length: 1 } });
+    const loud = timeline([sounding]);
+    await loud.start();
+    await loud.run(0.25);
+    expect(loud.clock.time).toBe(0);
+    expect(await loud.run(2.5)).toBeLessThanOrEqual(0.03);
+  });
+
+  it("still holds the clock until a soundless video's picture moves", async () => {
+    const soundless = engine("video", { startDelay: 0.2 });
+    Object.defineProperty(soundless.element, "audioTracks", { value: { length: 0 } });
+    const line = timeline([soundless]);
+    for (let start = 0; start < 2; start++) {
+      await line.start();
+      await line.run(0.15);
+      expect(line.clock.time).toBe(0);
+      expect(await line.run(2)).toBeLessThanOrEqual(0.03);
+      await line.stop();
+    }
   });
 
   it("lets the clock wait when everything that plays falls behind, without touching the engine", async () => {

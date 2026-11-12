@@ -56,6 +56,8 @@ interface StorageUsage {
   emptyProjects?: { count: number; bytes?: number; removed?: number };
   /** The most that playback proxies may take, 0 for no limit. Optional: older services have none. */
   proxyLimitBytes?: number;
+  /** The open project's proxies alone are over the limit (they are kept). Optional: older services do not tell. */
+  proxyOverLimit?: boolean;
 }
 const GB = 1024 ** 3;
 /** The limits offered for playback proxies; 0 is no limit. */
@@ -469,6 +471,11 @@ export default function Settings({
                       ))}
                   </select>
                 </label>
+              )}
+              {usage?.proxyOverLimit === true && (
+                <p className="status-detail">
+                  열린 프로젝트의 프록시가 한도를 넘었습니다. 열린 프로젝트의 프록시는 지워지지 않습니다.
+                </p>
               )}
               {usage && (
                 <div className="settings-actions">

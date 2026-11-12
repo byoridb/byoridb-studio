@@ -2969,15 +2969,15 @@ fn apply(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                     "audio" => {
                         let value = clip.as_object_mut().unwrap().remove(audio);
                         // As with fadeIn/fadeOut, a transition given in the same
-                        // patch sets the length.
+                        // patch sets the length. One that is only removed (null)
+                        // has no length to give: the fade asked for stays.
                         let transition = if fade == "fadeIn" {
                             "transitionIn"
                         } else {
                             "transitionOut"
                         };
-                        if let Some(value) = value
-                            .filter(|value| !value.is_null() && !patch.contains_key(transition))
-                        {
+                        let timed = patch.get(transition).is_some_and(Value::is_object);
+                        if let Some(value) = value.filter(|value| !value.is_null() && !timed) {
                             clip[fade] = on_grid(&value);
                         }
                     }
@@ -8141,6 +8141,11 @@ mod tests {
         assert_eq!(clip["fadeOut"], 1.0);
         let clip = update(&mut p, json!({"audioFadeIn":null})).unwrap();
         assert_eq!(frames(&clip["fadeIn"]).round(), 16.0);
+        validate_project(&p).unwrap();
+        // Removing the transition in the same command does not drop the fade asked for.
+        let clip = update(&mut p, json!({"audioFadeIn":0.7,"transitionIn":null})).unwrap();
+        assert_eq!(frames(&clip["fadeIn"]).round(), 21.0);
+        assert!(clip["transitionIn"].is_null());
         validate_project(&p).unwrap();
     }
 

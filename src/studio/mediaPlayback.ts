@@ -78,16 +78,19 @@ const START_MARGIN = 0.03;
 /** A measurement this far from what is known is believed only when the next one agrees. */
 const OUTLIER = 0.08;
 
-type Restart = "restart" | "seek";
+type Restart = "restart" | "seek" | "join";
 type Measured = Restart | "afterMove";
-const MEASURED = ["restart", "afterMove", "seek"] as const;
+const MEASURED = ["restart", "afterMove", "seek", "join"] as const;
 /**
  * What this engine was measured to need (seconds; 0 while unknown): `restart` from
  * `play()` to the sound, `afterMove` from the first movement of the position to the
- * sound, `seek` from a seek to the sound.
+ * sound, `seek` from a seek of an element that plays to the sound, `join` from the seek
+ * of an element that does not play yet (a clip whose turn comes while the timeline runs,
+ * a start that begins elsewhere) through its start to the sound. The last two differ:
+ * one is a seek's cost, the other a start's.
  */
-const calibration = { restart: 0, afterMove: 0, seek: 0, trimUsable: true };
-const doubted: Record<Measured, number | null> = { restart: null, afterMove: null, seek: null };
+const calibration = { restart: 0, afterMove: 0, seek: 0, join: 0, trimUsable: true };
+const doubted: Record<Measured, number | null> = { restart: null, afterMove: null, seek: null, join: null };
 try {
   const stored = JSON.parse(localStorage.getItem(STORE_KEY) ?? "null") as Partial<Record<Measured, unknown>> | null;
   for (const kind of MEASURED) {
@@ -167,6 +170,8 @@ function learn(kind: Measured, delay: number) {
 
 /** What a seek while playing costs; until that is known, what a start costs. */
 const seekLatency = () => calibration.seek || calibration.restart;
+/** What a seek followed by a start costs; until that is known, what a start costs. */
+const joinLatency = () => calibration.join || calibration.restart;
 
 /** Call synchronously from the play click/keyboard gesture, before updating React state. */
 export function primePreviewPlayback() {
@@ -220,6 +225,8 @@ export function isPreviewPlaybackWaiting() {
     return false;
   }
   if (frequent && common > DRIFT_START && now >= lagHoldBlockedUntil) {
+    // What they have in common is not for a rate trim to chase, nor a trim's doing.
+    if (lagOverSince === null) for (const transport of active) transport.clockMoved();
     lagOverSince ??= now;
     if (now - lagOverSince >= LAG_SUSTAIN_MS) {
       lagHold = { since: now };
@@ -344,6 +351,12 @@ export class MediaPlayback {
     this.updatedAt = now;
     this.previousPlaying = snapshot.playing && snapshot.active;
     this.snapshot = snapshot;
+    // The playhead was moved (a seek, a repeat's wrap) or the clip re-timed: what a trim
+    // was closing is gone, and the jump is not to be taken for the trim's effect.
+    if (this.trim && (explicitSeek || mappingChanged)) {
+      this.trim = 0;
+      record("trim ended");
+    }
     if (!this.shouldPlay()) {
       this.clockHeld = false;
       this.waitingSince = null;
@@ -397,7 +410,8 @@ export class MediaPlayback {
     // tick would put it further from the sound than the start delay does.
     if (document.visibilityState === "hidden") { this.gate = false; return false; }
     if (!this.progressed) return true;
-    if (now < this.soundDue()) return true;
+    // Without a sound there is nothing more to wait for: the picture moves with the position.
+    if (this.audible() && now < this.soundDue()) return true;
     this.gate = false;
     record("start gate opened after ms", now - this.restartAt);
     return false;
@@ -410,9 +424,22 @@ export class MediaPlayback {
    */
   private soundDue() {
     if (this.restartKind === "seek") return this.restartAt + seekLatency() * 1000;
+    if (this.restartKind === "join") return this.restartAt + joinLatency() * 1000;
     const afterMove = this.progressAt + calibration.afterMove * 1000;
     if (!calibration.restart) return afterMove;
     return Math.max(this.progressAt, Math.min(afterMove, this.restartAt + (calibration.restart + START_MARGIN) * 1000));
+  }
+
+  /**
+   * Whether this element can be heard at all. Only what is certain counts: an element
+   * the engine made silent, or a video that the engine says has no audio track. A volume
+   * of zero does not, since a clip that fades in starts at zero and is heard a moment later.
+   */
+  private audible() {
+    if (this.silenced) return false;
+    if (this.element.tagName !== "VIDEO" || this.element.readyState < 1) return true;
+    const tracks = (this.element as { audioTracks?: { length?: number } }).audioTracks;
+    return !(tracks && tracks.length === 0);
   }
 
   /**
@@ -450,7 +477,13 @@ export class MediaPlayback {
     if (this.pending) this.playRequest++;
     this.pending = false;
     this.requested = false;
-    this.trim = 0;
+    if (this.trim) {
+      // The next start runs at the clip's own rate, not at what a trim left behind.
+      this.trim = 0;
+      record("trim ended");
+      const base = this.baseRate();
+      if (Math.abs(this.element.playbackRate - base) > 1e-9) this.element.playbackRate = base;
+    }
     this.driftSince = null;
   }
 
@@ -491,22 +524,26 @@ export class MediaPlayback {
     // Let the native decoder run continuously between explicit seeks. RAF can
     // arrive late or report a slightly different position; neither means that the
     // user scrubbed. Chasing that clock with currentTime resets audibly stutters.
+    let joined = false;
     if (el.readyState >= 1 && this.seekWhenReady) {
-      const ahead = this.lead && this.shouldPlay() ? seekLatency() : 0;
+      const ahead = this.lead && this.shouldPlay() ? joinLatency() : 0;
       const leading = ahead >= MIN_LEAD;
       const target = this.clampTarget(state.target + (leading ? ahead * base : 0));
       if (Math.abs(el.currentTime - target) > .02) {
+        // Before the seek: an element that plays pays for a seek, one that does not yet for a start.
+        const running = !el.paused && this.requested && !this.pending;
         try { el.currentTime = target; }
         catch { this.seekWhenReady = true; return; }
         if (this.shouldPlay()) {
-          this.restarted("seek", target);
+          this.restarted(running ? "seek" : "join", target);
+          joined = !running;
           if (this.lead) this.correctingSince = performance.now();
         }
       }
       this.seekWhenReady = false;
       this.lead = false;
     }
-    if (this.shouldPlay() && !this.clockHeld) this.play();
+    if (this.shouldPlay() && !this.clockHeld) this.play(false, joined);
     else {
       this.stop();
       if (!this.shouldPlay()) this.failed = false;
@@ -518,9 +555,13 @@ export class MediaPlayback {
     return now - this.restartAt >= SETTLE_MS;
   }
 
-  /** The clock was moved to the media: what was counted against the old clock is void. */
+  /**
+   * The clock was moved to the media, or is about to wait for it: what was counted
+   * against the old clock is void, and a trim that was closing that offset ends.
+   */
   clockMoved() {
     this.driftSince = null;
+    if (this.trim) this.endTrim();
   }
 
   /** Playing, with a position that can be compared with the clock. */
@@ -656,14 +697,15 @@ export class MediaPlayback {
     if (!this.disposed) this.onError(message);
   }
 
-  private play(gesture = false) {
+  /** `joined`: this start follows a seek made just now, which is timed and learned as one with it. */
+  private play(gesture = false, joined = false) {
     if (this.disposed || this.pending || (!gesture && (this.requested || this.failed))) return;
     this.requested = true;
     this.pending = true;
     const request = ++this.playRequest;
     if (gesture) this.failed = false;
     // A seek that is under way already counts as the later, costlier start.
-    if (!this.element.seeking) this.restarted("restart", this.element.currentTime);
+    if (!joined && !this.element.seeking) this.restarted("restart", this.element.currentTime);
     let promise: Promise<void>;
     record("play()");
     try { promise = this.element.play(); }

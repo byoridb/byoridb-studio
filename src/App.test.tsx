@@ -955,6 +955,30 @@ describe("Studio application", () => {
       expect((editor.sent[2].params.clips as Project["clips"]).map(({ id, duration }) => [id, duration])).toEqual([["clip-1-tail", 3]]);
     });
 
+    it("sends a cut that waits for a split before the edits made after it", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      // Split, cut, then three steps to the right: only the split has been sent so far.
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      fireEvent.keyDown(document.body, { key: "x", metaKey: true });
+      for (let step = 0; step < 3; step++)
+        fireEvent.keyDown(document.body, { key: "ArrowRight", altKey: true, shiftKey: true });
+      expect(editor.sent.map(({ method }) => method)).toEqual(["edit.batch"]);
+      await editor.answer();
+      await editor.answer();
+      // The cut took the half the split selected, on the revision the split left. The
+      // moves came after it: they were for the clip on screen, which is the half that stays.
+      expect(editor.sent[1]).toEqual({ method: "edit.delete", params: { ids: ["clip-1-tail"], expectedRevision: 2 } });
+      for (let step = 0; step < 3; step++) await editor.answer();
+      await editor.quiet();
+      expect(editor.sent.map(({ method, params }) => [method, params.expectedRevision]))
+        .toEqual([["edit.batch", 1], ["edit.delete", 2], ["edit.batch", 3], ["edit.batch", 4], ["edit.batch", 5]]);
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips.map(({ id, start, duration }) => [id, +start.toFixed(3), +duration.toFixed(3)]))
+        .toEqual([["clip-1", 1, 2]]);
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
     it("quietly drops a split, a duplicate and a second delete of a clip whose delete is on its way", async () => {
       const editor = await open(initial);
       twoSecondsIn();

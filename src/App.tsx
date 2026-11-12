@@ -561,12 +561,18 @@ export default function App() {
     /** The parameters, or for an edit a function that makes them from the project as it is when the edit is sent. */
     given: Record<string, unknown> | CommandBuilder = {},
     quiet = false,
+    /**
+     * For an edit that is made from what the edits before it leave behind (their answer
+     * and what they select): it takes its place in the queue now, and is made and sent
+     * when its turn has come and this has settled. Edits made after it wait behind it.
+     */
+    ready?: Promise<unknown>,
   ) => {
     const build = typeof given === "function" ? given : null;
     // Nothing is on its way, so the project on screen is the one the command would be
     // made from: a command with nothing to do (a cut outside the clip, a clip that is
     // gone) ends here, without touching the save state or a message that is showing.
-    if (build && !editsInFlight.current && !(current.current && build(current.current)))
+    if (build && !ready && !editsInFlight.current && !(current.current && build(current.current)))
       return undefined;
     setError("");
     const params = build ? {} : (given as Record<string, unknown>);
@@ -585,6 +591,7 @@ export default function App() {
           : undefined;
     /** Sends the command and takes the project it answers with; false when that answer is stale. */
     const send = async (): Promise<[unknown, boolean]> => {
+      if (ready) await ready.catch(() => undefined);
       // From its turn on, answers for the project being left are stale. Not earlier:
       // the edits before it still follow one another's revisions.
       if (switching) generation = ++projectGeneration.current;
@@ -640,7 +647,7 @@ export default function App() {
       // and none made after it does.
       let outcome: Promise<[unknown, boolean]>;
       if (edit || switching) {
-        outcome = editsInFlight.current ? editQueue.current.then(send) : send();
+        outcome = editsInFlight.current || ready ? editQueue.current.then(send) : send();
         editsInFlight.current++;
         const settled = outcome.then(() => {}, () => {});
         editQueue.current = settled;
@@ -671,8 +678,9 @@ export default function App() {
     method: string,
     given: Record<string, unknown> | CommandBuilder = {},
     quiet = false,
+    ready?: Promise<unknown>,
   ) => {
-    const answer = run(method, given, quiet);
+    const answer = run(method, given, quiet, ready);
     if (isEdit(method)) {
       const pending = unsettledEdits.current;
       const done = () => { pending.delete(answer); };
@@ -899,16 +907,30 @@ export default function App() {
       if (!before.length) return take();
       // An edit made before this copy is still on its way (a split, a trim): the clips
       // are read once it has answered and selected what it made, not as they look now.
-      const turn: Promise<void> = Promise.allSettled(before)
+      const settled = Promise.allSettled(before)
         // A task later, so what those edits do with their answers (select the new half) is done.
-        .then(() => new Promise<void>((resolve) => setTimeout(resolve)))
-        .then(take)
-        .finally(() => {
-          if (copying.current === turn) copying.current = null;
-        });
+        .then(() => new Promise<void>((resolve) => setTimeout(resolve)));
+      // A cut's delete takes its place among the edits now, so that one made after it
+      // (an undo, a delete, a move) is sent after it; only what it cuts is read at its turn.
+      const turn: Promise<void> = (cut
+        ? execute("edit.delete", (latest) => {
+            const chosen = selectionNow.current;
+            if (latest.id !== active.id || chosen.projectId !== latest.id) return null;
+            const ids = present(latest, chosen.ids);
+            if (!ids.length || !canEditSelection(latest, ids)) return null;
+            clipboard.current = { projectId: latest.id, clips: structuredClone(selectedClips(latest, ids)) };
+            setClipboardProject(latest.id);
+            return { ids };
+          }, false, settled).then((result) => {
+            if (result) selectMany([], null);
+          }, () => undefined)
+        : settled.then(take)
+      ).finally(() => {
+        if (copying.current === turn) copying.current = null;
+      });
       copying.current = turn;
     },
-    [safeCommand, selectMany],
+    [safeCommand, execute, selectMany],
   );
   const pasteAt = useCallback(
     (at: number) => {

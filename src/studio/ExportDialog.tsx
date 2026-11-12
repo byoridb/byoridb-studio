@@ -405,21 +405,18 @@ export default function ExportDialog({
                   />
                   하드웨어 가속 인코딩
                 </label>
-                <p className="export-hint">
-                  {codecChoice
-                    ? "하드웨어 가속이 안 되면 소프트웨어 인코더로 자동 전환하고, 비트레이트를 넣으면 품질 대신 씁니다."
-                    : "WebM은 VP9 소프트웨어 인코더로 내보냅니다."}
-                </p>
+                {codecChoice && (
+                  <p className="export-hint">
+                    하드웨어 가속이 안 되면 소프트웨어 인코더로 내보냅니다.
+                  </p>
+                )}
               </div>
             )}
             {!audioOnly && (
               <p className="export-hint export-summary">{encoding}</p>
             )}
             {audioOnly && (
-              <p className="export-hint">
-                오디오 형식은 소리만 내보내므로 해상도·프레임레이트·품질을
-                사용하지 않습니다.
-              </p>
+              <p className="export-hint">소리만 내보냅니다.</p>
             )}
           </div>
         </div>

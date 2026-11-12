@@ -85,6 +85,29 @@ class ToolBoundaryTests(unittest.TestCase):
         finally:
             mcp.rpc = old
 
+    def test_replaced_preview_frame_is_reported_as_no_frame(self):
+        """The service answers a frame its caller replaced as a result (HTTP 200);
+        to an agent and the CLI that is still not a frame."""
+        class Reply:
+            def __init__(self, value): self.value = value
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self, *args): return json.dumps(self.value).encode()
+        connection = {'url': 'http://127.0.0.1:1', 'token': 'x'}
+        old = mcp.urlopen
+        try:
+            reason = '더 새로운 미리보기 요청으로 대체되었습니다. (PREVIEW_CANCELLED)'
+            mcp.urlopen = lambda request, timeout=None: Reply({'result': {'cancelled': True, 'reason': reason}})
+            with self.assertRaises(ValueError) as raised:
+                mcp.rpc('preview.frame', {'time': 1}, connection)
+            self.assertIn('PREVIEW_CANCELLED', str(raised.exception))
+            # Another command's result may say "cancelled" without being an error.
+            self.assertEqual(mcp.rpc('export.cancel', {'id': 'a'}, connection), {'cancelled': True, 'reason': reason})
+            mcp.urlopen = lambda request, timeout=None: Reply({'result': {'assetId': 'preview-frame-1', 'path': '/nonexistent.png'}})
+            self.assertEqual(mcp.rpc('preview.frame', {'time': 1}, connection)['assetId'], 'preview-frame-1')
+        finally:
+            mcp.urlopen = old
+
     def test_trim_preserves_absolute_bounds_and_revision(self):
         old = mcp.rpc
         calls = []

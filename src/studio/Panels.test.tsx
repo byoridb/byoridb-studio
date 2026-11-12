@@ -111,6 +111,13 @@ describe("Library", () => {
     await waitFor(() => expect(command).toHaveBeenCalledWith("edit.add", { mediaId: "song", start: 0 }));
   });
 
+  it("leaves sound clean-up to the inspector's audio section", () => {
+    render(<Library project={project} selected={clip} onCommand={vi.fn()} onImport={vi.fn()} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole("tab", { name: "오디오" }));
+    expect(screen.queryByRole("button", { name: "음량 정규화" })).toBeNull();
+    expect(screen.queryByText("오디오 다듬기")).toBeNull();
+  });
+
   it("offers a revision-guarded repair for previously misclassified audio", async () => {
     const stale: Project = { ...project, media: [{ ...project.media[0], name: "음악.mp3", path: "/tmp/song.mp3" }] };
     const command = vi.fn().mockResolvedValue(stale);
@@ -317,11 +324,37 @@ describe("Inspector", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: "속도" }));
+    expect(screen.getByRole("button", { name: "1×" })).toHaveAttribute("aria-pressed", "true");
     await user.click(screen.getByRole("button", { name: "2×" }));
-    expect(command).toHaveBeenCalledWith("edit.update", {
+    // The speed alone: the editor derives the length, and keyframes follow in proportion.
+    expect(command).toHaveBeenLastCalledWith("edit.update", {
       id: "clip1",
       expectedRevision: 7,
-      patch: { speed: 2, duration: 2 },
+      patch: { speed: 2 },
+    });
+    const field = screen.getByRole("spinbutton", { name: "재생 속도" });
+    fireEvent.change(field, { target: { value: "1.5" } });
+    fireEvent.blur(field);
+    await waitFor(() =>
+      expect(command).toHaveBeenLastCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { speed: 1.5 },
+      }),
+    );
+  });
+
+  it("resets the speed without sending a length", async () => {
+    const user = userEvent.setup();
+    const command = vi.fn().mockResolvedValue(project);
+    const fast: Clip = { ...clip, speed: 2, duration: 2, reverse: true };
+    render(<Inspector project={{ ...project, clips: [fast] }} selected={fast} onCommand={command} playhead={1} />);
+    await user.click(screen.getByRole("button", { name: "속도" }));
+    await user.click(screen.getByRole("button", { name: "일반 속도 초기화" }));
+    expect(command).toHaveBeenLastCalledWith("edit.update", {
+      id: "clip1",
+      expectedRevision: 7,
+      patch: { speed: 1, reverse: false },
     });
   });
 
@@ -1466,6 +1499,24 @@ describe("Inspector animation, transitions and styles", () => {
     await waitFor(() => expect(patched(command)).toEqual({ name: "파도" }));
   });
 
+  it("writes seconds as 초 on every time field and explains nothing the controls already say", () => {
+    const fading: Clip = { ...clip, transitionOut: { type: "fade", duration: 0.5 }, fadeOut: 0.5 };
+    const { container } = render(
+      <Inspector project={{ ...project, clips: [fading] }} selected={fading} onCommand={vi.fn()} playhead={2} />,
+    );
+    const units = () => Array.from(container.querySelectorAll("small"), (unit) => unit.textContent);
+    expect(units().filter((unit) => unit === "초")).toHaveLength(3);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    fireEvent.click(screen.getByRole("button", { name: "오디오" }));
+    // The clip's timing, the exit's length and the two sound fades.
+    expect(units().filter((unit) => unit === "초")).toHaveLength(6);
+    expect(units()).not.toContain("s");
+    expect(container.querySelector(".inspector-hint")).toBeNull();
+    // Stabilisation says where it shows only once it is on.
+    fireEvent.click(screen.getByRole("button", { name: "흔들림 보정" }));
+    expect(screen.queryByText("재생 미리보기와 내보낸 영상에 적용됩니다.")).toBeNull();
+  });
+
   it("opens only the main section and remembers what was opened", () => {
     const expanded = (name: string) =>
       screen.getByRole("button", { name }).getAttribute("aria-expanded");
@@ -1679,36 +1730,56 @@ describe("Inspector animation, transitions and styles", () => {
     );
   });
 
-  it("fades a video clip's sound in and out, keeping the picture's transition kind", async () => {
-    const wiped: Clip = {
+  it("fades a video clip's sound on its own, leaving the picture's transition alone", async () => {
+    const wiped = {
       ...clip,
       transitionOut: { type: "wipeLeft", duration: 0.5 },
       fadeOut: 0.5,
-    };
-    const { command } = inspect(wiped);
+      audioFadeIn: 0.3,
+    } as Clip;
+    const { command, preview } = inspect(wiped);
     fireEvent.click(screen.getByRole("button", { name: "오디오" }));
     const fadeIn = screen.getByRole("spinbutton", { name: "페이드 인" });
+    expect(fadeIn).toHaveValue(0.3);
     fireEvent.change(fadeIn, { target: { value: "1" } });
+    expect(preview).toHaveBeenLastCalledWith("clip1", { audioFadeIn: 1 });
     fireEvent.blur(fadeIn);
-    await waitFor(() =>
-      expect(patched(command)).toEqual({
-        transitionIn: { type: "fade", duration: 1 },
-        fadeIn: 1,
-      }),
-    );
+    await waitFor(() => expect(patched(command)).toEqual({ audioFadeIn: 1 }));
+    // A clip saved before the sound had its own length still fades with the picture.
     const fadeOut = screen.getByRole("spinbutton", { name: "페이드 아웃" });
     expect(fadeOut).toHaveValue(0.5);
     fireEvent.change(fadeOut, { target: { value: "2" } });
     fireEvent.blur(fadeOut);
+    await waitFor(() => expect(patched(command)).toEqual({ audioFadeOut: 2 }));
+    expect(screen.queryByText(/같은 길이/)).not.toBeInTheDocument();
+    // Resetting the sound leaves the picture's transition as it is.
+    fireEvent.click(screen.getByRole("button", { name: "오디오 초기화" }));
     await waitFor(() =>
       expect(patched(command)).toEqual({
-        transitionOut: { type: "wipeLeft", duration: 2 },
-        fadeOut: 2,
+        volume: 1,
+        audioFadeIn: 0,
+        audioFadeOut: 0,
+        audio: {
+          normalize: false,
+          denoise: false,
+          voiceEnhance: false,
+          eq: { bass: 0, mid: 0, treble: 0 },
+        },
       }),
     );
-    expect(
-      screen.getByText("소리 페이드는 화면의 등장·퇴장 전환과 같은 길이로 움직입니다."),
-    ).toBeInTheDocument();
+  });
+
+  it("keeps a video clip's sound fade in while it is joined to the clip before", () => {
+    const previous: Clip = { ...clip, id: "clip0", start: 0, duration: 3 };
+    const joined: Clip = {
+      ...clip,
+      start: 2.5,
+      transitionIn: { type: "dissolve", duration: 0.5 },
+      fadeIn: 0.5,
+    };
+    inspect(joined, { ...project, clips: [previous, joined] });
+    fireEvent.click(screen.getByRole("button", { name: "오디오" }));
+    expect(screen.getByRole("spinbutton", { name: "페이드 인" })).toHaveValue(0.5);
   });
 
   it("fades an audio clip in and out by length", async () => {

@@ -175,6 +175,24 @@ describe("responsive preview", () => {
     expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
     await act(async () => {});
   });
+  it("fades a video clip's sound by its own fade, or by the picture's when it has none", async () => {
+    const volumeOf = async (clip: Clip, time: number) => {
+      const fading = { ...project, clips: [clip] };
+      const { container, unmount } = render(
+        <Player project={fading} time={time} playing={false} onTime={vi.fn()} onPlaying={vi.fn()} selectedId={null} onSelect={vi.fn()} onCommand={vi.fn()} />,
+      );
+      await act(async () => {});
+      const volume = container.querySelector<HTMLVideoElement>('[data-clip-id="v"]')!.volume;
+      unmount();
+      return volume;
+    };
+    // No fade of its own: the sound follows the picture's two-second fade.
+    expect(await volumeOf({ ...visual, fadeIn: 2 }, 1)).toBeCloseTo(0.4);
+    // Its own fade, shorter and longer than the picture's, and none at all.
+    expect(await volumeOf({ ...visual, fadeIn: 2, audioFadeIn: 0 }, 1)).toBeCloseTo(0.8);
+    expect(await volumeOf({ ...visual, fadeIn: 0, audioFadeIn: 4 }, 1)).toBeCloseTo(0.2);
+    expect(await volumeOf({ ...visual, fadeOut: 0, audioFadeOut: 2 }, 4.5)).toBeCloseTo(0.2);
+  });
   it("keeps future audio elements mounted and primes them silently before their start", async () => {
     const later = { ...audio, id: "later", start: 2, mediaId: "later-sound" };
     const audible = { ...project, clips: [visual, later], tracks: project.tracks.map(t => ({ ...t, muted: false })) };

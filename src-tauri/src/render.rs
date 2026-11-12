@@ -511,6 +511,22 @@ fn has_keyframe(c: &Value, property: &str) -> bool {
         .any(|k| property_alias(string(k, "property", "")) == property)
 }
 
+/// The clip's sound fades as (in, out) seconds. A video clip may give its sound
+/// fades of its own (audioFadeIn/audioFadeOut); without them the sound fades with
+/// the picture (fadeIn/fadeOut), as it did before those fields existed.
+fn audio_fades(clip: &Value, length: f64) -> (f64, f64) {
+    let fade = |own: &str, picture: &str| {
+        clip[own]
+            .as_f64()
+            .unwrap_or_else(|| number(clip, picture, 0.0))
+            .clamp(0.0, length)
+    };
+    (
+        fade("audioFadeIn", "fadeIn"),
+        fade("audioFadeOut", "fadeOut"),
+    )
+}
+
 /// The clip's entrance (`enter`) or exit animation as (type, seconds). A clip with
 /// only fadeIn/fadeOut, as older projects have, fades.
 fn transition(clip: &Value, enter: bool, length: f64) -> Option<(&str, f64)> {
@@ -1163,6 +1179,19 @@ async fn run_process(
                 } else {
                     ""
                 };
+                // A video clip reaches the resize in the decoder's own format, so that
+                // one conversion both resizes it and makes it RGBA. Converting first
+                // cost a full pass over every source frame at the source's size: a 4K
+                // clip on a 1080p timeline, or thirty small layers, took twice as long
+                // to export. A crop (exact to the pixel only in RGBA) and
+                // stabilisation keep the conversion in front, as before.
+                let crop = &clip["crop"];
+                let cropped = ["x", "y"].iter().any(|key| number(crop, key, 0.0) != 0.0)
+                    || ["width", "height"]
+                        .iter()
+                        .any(|key| number(crop, key, 1.0) != 1.0);
+                let early_rgba =
+                    reversed || kind != "video" || cropped || clip["stabilize"]["enabled"] == true;
                 let mut filters = if reversed || matches!(kind, "image" | "text") {
                     format!(
                         "[{idx}:v]{rev}setpts=(PTS-STARTPTS)/{speed}+{from}/TB,fps={fps},format=rgba"
@@ -1182,9 +1211,10 @@ async fn run_process(
                     // reproduces the full render's timestamps to the tick, so frames that
                     // fall exactly between two output frames round the same way.
                     format!(
-                        "[{idx}:v]setpts=(PTS+round({}/TB)-round({}/TB))/{speed},fps={fps}{pad},format=rgba",
+                        "[{idx}:v]setpts=(PTS+round({}/TB)-round({}/TB))/{speed},fps={fps}{pad}{}",
                         micros(source + lead * speed),
-                        micros(source)
+                        micros(source),
+                        if early_rgba { ",format=rgba" } else { "" }
                     )
                 };
                 if clip["stabilize"]["enabled"] == true {
@@ -1214,9 +1244,10 @@ async fn run_process(
                     let fit = if animated_scale { 1.0 } else { static_scale };
                     let side = |size: f64| (((size * fit / 2.0).round() as u64) * 2).max(2);
                     filters.push_str(&format!(
-                        ",scale=w={}:h={}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                        ",scale=w={}:h={}:force_original_aspect_ratio=decrease:force_divisible_by=2{}",
                         side(pw),
-                        side(ph)
+                        side(ph),
+                        if early_rgba { "" } else { ",format=rgba" }
                     ));
                     if clip["chromaKey"]["enabled"] == true {
                         let color = string(&clip["chromaKey"], "color", "#00ff00");
@@ -1453,8 +1484,7 @@ async fn run_process(
                         ));
                     }
                 }
-                let fi = number(clip, "fadeIn", 0.0).min(length);
-                let fo = number(clip, "fadeOut", 0.0).min(length);
+                let (fi, fo) = audio_fades(clip, length);
                 if fi > 0.0 {
                     a.push_str(&format!(",afade=t=in:st=0:d={fi}"));
                 }
@@ -1649,12 +1679,26 @@ fn part_plan(
     let mut parts = vec![];
     let mut from = 0.0;
     while at(from) < end {
-        // The part ends where one clip more than the limit would begin.
-        let next = inside
+        // More clips than the limit are on screen at once here: a cut would only
+        // open them all again (thirty stacked layers were re-read every two
+        // seconds), so the part lasts until enough of them have ended. Otherwise
+        // the part ends where one clip more than the limit would begin.
+        let limit = limit.max(1);
+        let mut running: Vec<f64> = inside
             .iter()
-            .filter(|(_, to)| *to > at(from) + 1e-9)
-            .nth(limit.max(1))
-            .map_or(end, |(begins, _)| *begins);
+            .filter(|(begins, to)| *begins <= at(from) + 1e-9 && *to > at(from) + 1e-9)
+            .map(|(_, to)| *to)
+            .collect();
+        let next = if running.len() > limit {
+            running.sort_by(f64::total_cmp);
+            running[running.len() - limit - 1].min(end)
+        } else {
+            inside
+                .iter()
+                .filter(|(_, to)| *to > at(from) + 1e-9)
+                .nth(limit)
+                .map_or(end, |(begins, _)| *begins)
+        };
         let to = ((next - start) * fps + 1e-6).floor().max(from + least);
         if end - at(to) < MIN_PART {
             parts.push((at(from), end));
@@ -5373,13 +5417,19 @@ mod tests {
             part_plan(&cuts, 0.0, 10.0, 30.0, 1),
             vec![(0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 8.0), (8.0, 10.0)]
         );
-        // Layers that all lie over the whole range cannot be divided usefully, and
-        // the parts still cover the range without gaps.
+        // Layers that all lie over the whole range cannot be divided usefully:
+        // every part would read all of them again. They are one run.
         let stacked = vec![(0.0, 9.0); 6];
-        let parts = part_plan(&stacked, 0.0, 9.0, 30.0, 4);
-        assert_eq!(parts.first().unwrap().0, 0.0);
-        assert_eq!(parts.last().unwrap().1, 9.0);
-        assert!(parts.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        assert_eq!(part_plan(&stacked, 0.0, 9.0, 30.0, 4), vec![(0.0, 9.0)]);
+        // A stack followed by cuts: one part while the stack lasts (until enough
+        // of it has ended), then parts by the limit again.
+        let mut mixed = vec![(0.0, 4.0); 5];
+        mixed.push((0.0, 3.0));
+        mixed.extend((4..12).map(|i| (i as f64, i as f64 + 1.0)));
+        assert_eq!(
+            part_plan(&mixed, 0.0, 12.0, 30.0, 4),
+            vec![(0.0, 4.0), (4.0, 8.0), (8.0, 12.0)]
+        );
         // Parts begin on the output's frame grid, counted from the start of the range.
         let fps = 30000.0 / 1001.0;
         let offset: Vec<(f64, f64)> = (0..12)
@@ -5470,6 +5520,131 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
             .collect()
+    }
+
+    // The loudness (RMS, 0..1) of 50 ms of sound around `time`.
+    fn level(samples: &[i16], time: f64) -> f64 {
+        let middle = (time * 48000.0) as usize;
+        let window = &samples[middle - 1200..middle + 1200];
+        (window
+            .iter()
+            .map(|s| (*s as f64 / 32768.0).powi(2))
+            .sum::<f64>()
+            / window.len() as f64)
+            .sqrt()
+    }
+
+    #[tokio::test]
+    async fn a_video_clips_sound_fades_on_its_own_or_with_the_picture() {
+        let dir = std::env::temp_dir().join(media::id("studio-audio-fade-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = cut_project(&dir).await;
+        // One 4 s clip whose picture fades in over 2 s and out over 1 s.
+        let mut clip = project["clips"][0].clone();
+        clip["start"] = json!(0.0);
+        clip["sourceIn"] = json!(0.0);
+        clip["duration"] = json!(4.0);
+        clip["fadeIn"] = json!(2.0);
+        clip["fadeOut"] = json!(1.0);
+        clip["transitionIn"] = json!({"type":"fade","duration":2.0});
+        clip["transitionOut"] = json!({"type":"fade","duration":1.0});
+        project["clips"] = json!([clip]);
+        validate_project(&project).unwrap();
+        let following = project.clone();
+        let mut same = project.clone();
+        same["clips"][0]["audioFadeIn"] = json!(2.0);
+        same["clips"][0]["audioFadeOut"] = json!(1.0);
+        let mut own = project.clone();
+        own["clips"][0]["audioFadeIn"] = json!(0.5);
+        own["clips"][0]["audioFadeOut"] = json!(0.0);
+        validate_project(&own).unwrap();
+        let make = |name: &'static str, project: &Value, format: &'static str, params: Value| {
+            let (project, dir) = (project.clone(), dir.clone());
+            async move {
+                let temp = dir.join(format!("temp-{name}"));
+                std::fs::create_dir_all(&temp).unwrap();
+                let output = dir.join(format!("{name}.{format}"));
+                let states = Arc::new(Mutex::new(HashMap::new()));
+                states
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), json!({"id":name,"progress":0.0}));
+                render(
+                    &project,
+                    &params,
+                    &output,
+                    format,
+                    &temp,
+                    name,
+                    states,
+                    Arc::new(AtomicBool::new(false)),
+                    if format == "mp4" { "libx264" } else { "" },
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+                output
+            }
+        };
+        let export = json!({"crf":8,"fps":24});
+        let before = samples(&make("following", &following, "wav", export.clone()).await).await;
+        let equal = samples(&make("same", &same, "wav", export.clone()).await).await;
+        let apart = samples(&make("own", &own, "wav", export.clone()).await).await;
+        assert_eq!(before.len(), 4 * 48000);
+        // Without the fields, and with fields equal to the picture's fades, the
+        // sound is sample for sample what it was before they existed.
+        assert_eq!(before, equal);
+        let full = level(&before, 2.5);
+        assert!(full > 0.05, "the source is audible: {full}");
+        let near = |value: f64, wanted: f64| (value / full - wanted).abs() < 0.06;
+        // Following the picture: half way up at 1 s, half way down at 3.5 s.
+        assert!(near(level(&before, 1.0), 0.5), "{}", level(&before, 1.0));
+        assert!(near(level(&before, 3.5), 0.5), "{}", level(&before, 3.5));
+        // Its own 0.5 s fade in and no fade out.
+        assert!(near(level(&apart, 0.25), 0.5), "{}", level(&apart, 0.25));
+        for time in [0.6, 1.0, 2.5, 3.5, 3.9] {
+            assert!(
+                near(level(&apart, time), 1.0),
+                "{time}: {}",
+                level(&apart, time)
+            );
+        }
+        // The export with a picture and the preview render carry the same sound,
+        // and the picture keeps its own 2 s fade: half way at 1 s (source blue 128).
+        let preview = json!({"crf":23,"fps":24,"width":320,"height":180,"preview":true});
+        for (name, params) in [("own-export", export), ("own-preview", preview)] {
+            let file = make(name, &own, "mp4", params).await;
+            let sound = samples(&file).await;
+            assert!(
+                near(level(&sound, 0.25), 0.5),
+                "{name}: {}",
+                level(&sound, 0.25)
+            );
+            assert!(
+                near(level(&sound, 1.0), 1.0),
+                "{name}: {}",
+                level(&sound, 1.0)
+            );
+            assert!(
+                near(level(&sound, 3.5), 1.0),
+                "{name}: {}",
+                level(&sound, 3.5)
+            );
+            let (half, whole) = (frame_at(&file, 1.0).await, frame_at(&file, 2.5).await);
+            assert!((half[2] as i32 - 64).abs() <= 8, "{name}: {:?}", &half[..3]);
+            assert!(
+                (whole[2] as i32 - 128).abs() <= 8,
+                "{name}: {:?}",
+                &whole[..3]
+            );
+            let leaving = frame_at(&file, 3.5).await;
+            assert!(
+                (leaving[2] as i32 - 64).abs() <= 8,
+                "{name}: {:?}",
+                &leaving[..3]
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

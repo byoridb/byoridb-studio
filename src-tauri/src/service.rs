@@ -1,5 +1,5 @@
 use crate::{
-    editor::Editor,
+    editor::{Editor, Unsynced},
     media,
     preview::PreviewFrames,
     runtime::{agent_methods, Runtime},
@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path as FsPath, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -70,6 +70,8 @@ struct ServiceState {
     media_work: Arc<Notify>,
     /// The media whose proxy is being built right now.
     proxy_in_progress: ProxyInProgress,
+    /// How many bytes `proxies/` may hold (`storage.configure`); 0 is no limit.
+    proxy_limit: Arc<AtomicU64>,
 }
 type ProxyInProgress = Arc<std::sync::Mutex<Option<String>>>;
 
@@ -80,11 +82,14 @@ pub struct StudioService {
     task: Option<JoinHandle<()>>,
     media_worker: Option<JoinHandle<()>>,
     media_cancel: Arc<AtomicBool>,
-    editor: Option<Arc<Mutex<Editor>>>,
+    /// The project files that are written but not flushed to the device yet.
+    unsynced: Option<Arc<Unsynced>>,
     autosave: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    editor: Option<Arc<Mutex<Editor>>>,
 }
 impl StudioService {
-    /// Writes the last edits, stops child processes and revokes access. Safe to
+    /// Flushes the last edits, stops child processes and revokes access. Safe to
     /// call more than once; does nothing when this instance only attached to an
     /// existing service.
     pub fn shutdown(&self) {
@@ -97,8 +102,8 @@ impl StudioService {
             worker.abort();
         }
         runtime.shutdown();
-        if let Some(editor) = self.editor.as_ref() {
-            save_on_shutdown(editor);
+        if let Some(unsynced) = self.unsynced.as_ref() {
+            save_on_shutdown(unsynced);
         }
         let file = self.root.join("connection.json");
         let ours = std::fs::read(&file)
@@ -257,8 +262,10 @@ impl StudioService {
                         task: None,
                         media_worker: None,
                         media_cancel: Arc::default(),
-                        editor: None,
+                        unsynced: None,
                         autosave: None,
+                        #[cfg(test)]
+                        editor: None,
                     })
                 }
             };
@@ -268,10 +275,12 @@ impl StudioService {
             token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
         };
         let mut editor = Editor::new(root.clone())?;
-        // Edits answer without waiting for the disk; `autosave` writes them.
+        // Edits are in the project's files when they are answered, without waiting
+        // for the device; `autosave` flushes them.
         editor.defer_saves();
+        let unsynced = editor.unsynced();
         let editor = Arc::new(Mutex::new(editor));
-        let autosave = tokio::spawn(autosave(editor.clone()));
+        let autosave = tokio::spawn(autosave(unsynced.clone()));
         let runtime = Arc::new(Runtime::new(
             root.clone(),
             connection.clone(),
@@ -285,12 +294,14 @@ impl StudioService {
         let media_work = Arc::new(Notify::new());
         let media_cancel = Arc::new(AtomicBool::new(false));
         let proxy_in_progress = ProxyInProgress::default();
+        let proxy_limit = Arc::new(AtomicU64::new(saved_proxy_limit(&root)));
         let media_worker = tokio::spawn(media_worker(
             editor.clone(),
             root.clone(),
             media_work.clone(),
             media_cancel.clone(),
             proxy_in_progress.clone(),
+            proxy_limit.clone(),
         ));
         let state = ServiceState {
             previews: Arc::new(PreviewFrames::default()),
@@ -301,6 +312,7 @@ impl StudioService {
             origins: Arc::new(origins.clone()),
             media_work,
             proxy_in_progress,
+            proxy_limit,
         };
         let cors = CorsLayer::new()
             .allow_origin(AllowOrigin::list(
@@ -353,28 +365,33 @@ impl StudioService {
             task: Some(task),
             media_worker: Some(media_worker),
             media_cancel,
-            editor: Some(editor),
+            unsynced: Some(unsynced),
             autosave: Some(autosave),
+            #[cfg(test)]
+            editor: Some(editor),
         })
     }
 }
 
-/// How often `autosave` looks whether the editor has edits due to be written.
+/// How often `autosave` looks whether written edits are due to be flushed.
 const SAVE_POLL: Duration = Duration::from_millis(100);
-/// Writes the open project once editing pauses (`editor::SAVE_IDLE`) and at the
-/// latest `editor::SAVE_LATEST` after an edit. The write happens under the editor
-/// lock, so no edit can slip between what is written and what is marked saved.
-/// A write that fails is tried again every pass; meanwhile the editor writes each
-/// edit at once, so the failure reaches the user with their next edit.
-async fn autosave(editor: Arc<Mutex<Editor>>) {
+/// Flushes the project files to the device once editing pauses (`editor::SAVE_IDLE`)
+/// and at the latest `editor::SAVE_LATEST` after an edit. Every answered edit is in
+/// those files already, so this only narrows what a power cut can lose; it never
+/// takes the editor, and editing goes on while the device is busy. A flush that
+/// fails is tried again every pass.
+async fn autosave(unsynced: Arc<Unsynced>) {
     let mut failing = false;
     loop {
         tokio::time::sleep(SAVE_POLL).await;
-        let mut editor = editor.lock().await;
-        if !editor.save_due() {
+        if !unsynced.due() {
             continue;
         }
-        match editor.flush() {
+        let files = unsynced.clone();
+        let synced = tokio::task::spawn_blocking(move || files.sync())
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+        match synced {
             Ok(()) => failing = false,
             Err(error) => {
                 if !failing {
@@ -385,27 +402,12 @@ async fn autosave(editor: Arc<Mutex<Editor>>) {
         }
     }
 }
-/// The edits `autosave` has not written yet. A command that is still running holds
-/// the editor; it gets a few seconds to finish before the wait is given up. Giving
-/// up loses no answered edit when that command is one of the editor's slow ones
-/// (imports, probes): those write what was waiting before they start, and nothing
-/// else can edit until they return.
-fn save_on_shutdown(editor: &Arc<Mutex<Editor>>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(mut editor) = editor.try_lock() {
-            if let Err(error) = editor.flush() {
-                tracing::error!("종료하면서 프로젝트를 저장하지 못했습니다: {error}");
-            }
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::error!(
-                "종료하면서 프로젝트를 저장하지 못했습니다: 편집기가 응답하지 않습니다."
-            );
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+/// Flushes what `autosave` has not flushed yet. It does not wait for the editor: a
+/// command that is still running there cannot hold the shutdown up, and no answered
+/// edit depends on it, because an edit is in the project's files before its answer.
+fn save_on_shutdown(unsynced: &Unsynced) {
+    if let Err(error) = unsynced.sync() {
+        tracing::error!("종료하면서 프로젝트를 저장하지 못했습니다: {error}");
     }
 }
 
@@ -418,9 +420,11 @@ async fn media_worker(
     wake: Arc<Notify>,
     cancel: Arc<AtomicBool>,
     proxy_in_progress: ProxyInProgress,
+    proxy_limit: Arc<AtomicU64>,
 ) {
     let mut work = MediaWork {
         proxy_in_progress,
+        proxy_limit,
         ..MediaWork::default()
     };
     loop {
@@ -458,6 +462,9 @@ struct MediaWork {
     retry_delay: Duration,
     slow_retry: Duration,
     proxy_in_progress: ProxyInProgress,
+    proxy_limit: Arc<AtomicU64>,
+    /// The project and the limit `tend_proxies` last looked after, and when.
+    tended: Option<(String, u64, std::time::Instant)>,
 }
 impl Default for MediaWork {
     fn default() -> Self {
@@ -467,6 +474,8 @@ impl Default for MediaWork {
             retry_delay: WAVEFORM_RETRY_DELAY,
             slow_retry: WAVEFORM_SLOW_RETRY,
             proxy_in_progress: ProxyInProgress::default(),
+            proxy_limit: Arc::new(AtomicU64::new(DEFAULT_PROXY_LIMIT)),
+            tended: None,
         }
     }
 }
@@ -492,6 +501,7 @@ async fn media_work_step(
     if waveform_work(editor, work, decode).await {
         return true; // look for newly imported media before starting a long proxy
     }
+    tend_proxies(editor, root, work).await;
     let attempted = &mut work.attempted;
     let next = {
         let mut editor = editor.lock().await;
@@ -564,6 +574,8 @@ async fn media_work_step(
     match built {
         Ok(()) => {
             attempted.remove(&key);
+            // One more proxy: the folder may be over its limit now.
+            work.tended = None;
         }
         Err(error) => {
             let _ = std::fs::remove_file(media::proxy_source_note(&output));
@@ -636,6 +648,102 @@ where
         }
     }
     worked
+}
+/// What `proxies/` may hold unless `storage.configure` says otherwise.
+const DEFAULT_PROXY_LIMIT: u64 = 20 * 1024 * 1024 * 1024;
+/// How often the proxies of the open project are marked as used, and the limit is
+/// looked at, while nothing else changes.
+const PROXY_TEND_EVERY: Duration = Duration::from_secs(600);
+fn storage_settings(root: &FsPath) -> PathBuf {
+    root.join("storage.json")
+}
+/// The proxy limit saved by `storage.configure`, else the default.
+fn saved_proxy_limit(root: &FsPath) -> u64 {
+    std::fs::read(storage_settings(root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|saved| saved["proxyLimitBytes"].as_u64())
+        .unwrap_or(DEFAULT_PROXY_LIMIT)
+}
+/// Keeps `proxies/` within its limit. Runs when another project is open, the limit
+/// changed or a proxy was made since the last time, and every `PROXY_TEND_EVERY`.
+/// Under the editor lock, so the project whose proxies are kept is the open one.
+async fn tend_proxies(editor: &Arc<Mutex<Editor>>, root: &FsPath, work: &mut MediaWork) {
+    let limit = work.proxy_limit.load(Ordering::Relaxed);
+    let editor = editor.lock().await;
+    let project = editor.project_id().to_owned();
+    if work.tended.as_ref().is_some_and(|(tended, limited, at)| {
+        *tended == project && *limited == limit && at.elapsed() < PROXY_TEND_EVERY
+    }) {
+        return;
+    }
+    let removed = limit_proxies(root, limit, |id| editor.proxy_path(id).is_some());
+    if !removed.is_empty() {
+        tracing::info!(
+            "프록시 용량 한도를 넘어 오래 쓰이지 않은 프록시 {}개를 지웠습니다.",
+            removed.len()
+        );
+    }
+    work.tended = Some((project, limit, std::time::Instant::now()));
+}
+/// Marks the finished proxies of the open project (`in_use` by media id) as used
+/// now, and while `proxies/` holds more than `limit` bytes removes the others, the
+/// one used longest ago first. A proxy of the open project is never removed, also
+/// when those alone exceed the limit; a limit of 0 removes nothing. Returns the
+/// proxies removed.
+///
+/// When a proxy was last used is the modification time of its ".source" note: the
+/// last time its project was open here. The proxy itself is not touched, a player
+/// may be reading it. A removed proxy is made again when its project is opened.
+fn limit_proxies(root: &FsPath, limit: u64, in_use: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let now = std::time::SystemTime::now();
+    let size = |path: &FsPath| std::fs::metadata(path).map_or(0, |info| info.len());
+    let modified = |path: &FsPath| std::fs::metadata(path).and_then(|info| info.modified());
+    let mut total = 0;
+    let mut idle = vec![];
+    for proxy in listed(&root.join("proxies")) {
+        let name = proxy
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let Some(id) = name.strip_suffix(".mp4") else {
+            continue;
+        };
+        if name.ends_with(".partial.mp4") {
+            continue;
+        }
+        let note = media::proxy_source_note(&proxy);
+        let bytes = size(&proxy) + size(&note);
+        total += bytes;
+        if in_use(id) {
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(&note)
+                .and_then(|note| note.set_modified(now));
+            continue;
+        }
+        let used = modified(&note)
+            .or_else(|_| modified(&proxy))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        idle.push((used, proxy, note, bytes));
+    }
+    let mut removed = vec![];
+    if limit == 0 {
+        return removed;
+    }
+    idle.sort();
+    for (_, proxy, note, bytes) in idle {
+        if total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&proxy).is_ok() {
+            let _ = std::fs::remove_file(note);
+            total -= bytes;
+            removed.push(proxy);
+        }
+    }
+    removed
 }
 /// Removes proxies in `proxies/` that no project mentions any more. Runs once at
 /// startup, when the saved projects are the only references (there is no undo
@@ -779,10 +887,39 @@ fn reclaimable(
         ("renders", scratch("renders")),
     ]
 }
-/// `storage.usage` (what each folder holds and how much of it `storage.clean` would
-/// free) and `storage.clean` (frees it). Both are for the app's own settings: agents
-/// cannot call them.
-async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
+/// What `storage.clean` may be asked to remove: the derived files `reclaimable`
+/// lists (the default), and the stored projects that hold nothing.
+const CLEAN_TARGETS: [&str; 2] = ["temporary", "emptyProjects"];
+/// `storage.configure {proxyLimitBytes}`: how much `proxies/` may hold (0 for no
+/// limit). Saved in the store, applied by the media worker at once. Answers like
+/// `storage.usage`.
+async fn configure_storage(state: &ServiceState, params: &Value) -> Result<Value, String> {
+    let limit = params["proxyLimitBytes"]
+        .as_u64()
+        .ok_or("proxyLimitBytes는 0 이상의 정수(바이트)여야 합니다.")?;
+    media::atomic_json(
+        &storage_settings(&state.root),
+        &json!({"proxyLimitBytes":limit}),
+    )?;
+    state.proxy_limit.store(limit, Ordering::Relaxed);
+    state.media_work.notify_one();
+    storage(state, &json!({}), false).await
+}
+/// `storage.usage` (what each folder holds, how much of it `storage.clean` would
+/// free, how many empty projects are stored, the proxy limit) and `storage.clean
+/// {targets?}` (frees the targets named, by default the derived files only). Both
+/// are for the app's own settings: agents cannot call them.
+async fn storage(state: &ServiceState, params: &Value, clean: bool) -> Result<Value, String> {
+    let targets: Vec<&str> = match params["targets"].as_array() {
+        Some(targets) if clean => targets.iter().filter_map(Value::as_str).collect(),
+        _ => vec![CLEAN_TARGETS[0]],
+    };
+    if let Some(unknown) = targets.iter().find(|name| !CLEAN_TARGETS.contains(name)) {
+        return Err(format!("정리할 수 없는 대상입니다: {unknown}"));
+    }
+    let derived = targets.contains(&"temporary");
+    let empty_projects = targets.contains(&"emptyProjects");
+    let limit = state.proxy_limit.load(Ordering::Relaxed);
     // The editor and the renderer name their files by the resolved store path.
     let root = state
         .root
@@ -794,8 +931,20 @@ async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
         .previews
         .while_idle(async |cached: Vec<PathBuf>| {
             let mut in_use: HashSet<PathBuf> = cached.into_iter().collect();
-            let open_project = {
+            let (open_project, empty) = {
                 let mut editor = state.editor.lock().await;
+                // Never the open project, and only ones that were never edited.
+                let removed =
+                    (clean && empty_projects).then(|| editor.delete_empty_unnamed_projects());
+                let left = editor.empty_unnamed_projects();
+                let mut empty = json!({
+                    "count":left.len(),
+                    "bytes":left.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+                });
+                if let Some((count, bytes)) = removed {
+                    empty["removed"] = json!(count);
+                    empty["removedBytes"] = json!(bytes);
+                }
                 in_use.extend(editor.preview_asset_paths());
                 for path in listed(&root.join("previews")) {
                     let shown = path
@@ -806,10 +955,11 @@ async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
                         in_use.insert(path);
                     }
                 }
-                editor
+                let open = editor
                     .dispatch("project.get", json!({"omitWaveforms":true}))
                     .await?
-                    .to_string()
+                    .to_string();
+                (open, empty)
             };
             let building = state
                 .proxy_in_progress
@@ -827,7 +977,9 @@ async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
                         let size = disk_use(&entry);
                         // Checked again: a render may have started since the listing.
                         if !clean
-                            || (!crate::render::scratch_in_use(&entry) && remove_entry(&entry))
+                            || (derived
+                                && !crate::render::scratch_in_use(&entry)
+                                && remove_entry(&entry))
                         {
                             sum = (sum.0 + size.0, sum.1 + size.1);
                         }
@@ -864,7 +1016,8 @@ async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
                 } else {
                     "reclaimableBytes"
                 };
-                json!({"folders":folders,"bytes":total,key:freeable})
+                json!({"folders":folders,"bytes":total,key:freeable,
+                    "emptyProjects":empty,"proxyLimitBytes":limit})
             })
             .await
             .map_err(|error| error.to_string())
@@ -1086,9 +1239,11 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
     tracing::debug!("rpc {}", request.method);
     let result = if matches!(request.method.as_str(), "storage.usage" | "storage.clean") {
         // Never in the agent allowlist, so only the UI gets here.
-        storage(&state, request.method == "storage.clean").await
+        storage(&state, &request.params, request.method == "storage.clean").await
+    } else if request.method == "storage.configure" {
+        configure_storage(&state, &request.params).await
     } else if request.method == "preview.frame" {
-        state
+        let frame = state
             .previews
             .frame(
                 &state.editor,
@@ -1096,7 +1251,16 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
                 request.project_id.as_deref(),
                 &preview_client,
             )
-            .await
+            .await;
+        match frame {
+            // Not a failure: the caller itself asked for another frame or stopped
+            // this one, or the project changed under it. Answered as a result, so a
+            // browser logs no failed request; `reason` carries the code.
+            Err(reason) if crate::preview::was_superseded(&reason) => {
+                Ok(json!({"cancelled":true,"reason":reason}))
+            }
+            frame => frame,
+        }
     } else if request.method == "preview.cancel" {
         // Not in the agent allowlist: only the UI stops its own frames.
         Ok(json!({"cancelled": state.previews.cancel(&preview_client)}))
@@ -1122,7 +1286,7 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
             .as_ref()
             .is_some_and(|id| editor.project_id() != id)
         {
-            return (StatusCode::CONFLICT, Json(json!({"error":"에이전트 작업 중 프로젝트가 변경되었습니다. 새 작업을 시작해주세요."}))).into_response();
+            return project_changed(agent);
         }
         editor.dispatch(&request.method, request.params).await
     };
@@ -1140,6 +1304,22 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
         Ok(value) => Json(json!({"result":value})).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
     }
+}
+
+/// The answer to a request that names another project than the open one: HTTP 409
+/// with the code `PROJECT_CHANGED`, worded for who asked. The UI sent it before it
+/// saw the switch; an agent job is bound to the project it was started for.
+fn project_changed(agent: bool) -> Response {
+    let error = if agent {
+        "이 작업을 시작한 프로젝트가 더 이상 열려 있지 않아 요청을 처리하지 않았습니다. 새 작업을 시작해주세요. (PROJECT_CHANGED)"
+    } else {
+        "다른 프로젝트가 열려 있어 요청을 처리하지 않았습니다. (PROJECT_CHANGED)"
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error":error,"code":"PROJECT_CHANGED"})),
+    )
+        .into_response()
 }
 
 /// Commands after which the open project may hold media that still needs a
@@ -1453,13 +1633,40 @@ mod tests {
             json!({"method":"project.new","params":{"name":"다른 프로젝트"}}),
         )
         .await;
-        let (status, _) = call(
+        let (status, refused) = call(
             &state,
             &token,
             json!({"method":"project.get","projectId":next["result"]["id"]}),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["code"], "PROJECT_CHANGED");
+        let said = refused["error"].as_str().unwrap();
+        assert!(
+            said.contains("새 작업을 시작해주세요") && said.ends_with("(PROJECT_CHANGED)"),
+            "{said}"
+        );
+        // The UI's own late request for the project it left is told so in its own
+        // words, with the same code, and nothing runs.
+        let (status, refused) = call(
+            &state,
+            "test",
+            json!({"method":"edit.add","projectId":project_id,"params":{"text":"늦은 편집","duration":1.0}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["code"], "PROJECT_CHANGED");
+        let said = refused["error"].as_str().unwrap();
+        assert!(
+            said.contains("다른 프로젝트가 열려 있어")
+                && !said.contains("에이전트")
+                && !said.contains("새 작업")
+                && said.ends_with("(PROJECT_CHANGED)"),
+            "{said}"
+        );
+        let (_, open) = call(&state, "test", json!({"method":"project.get"})).await;
+        assert_eq!(open["result"]["id"], next["result"]["id"]);
+        assert_eq!(open["result"]["clips"], json!([]));
 
         state.runtime.revoke_agent_token(&token);
         let (status, _) = call(&state, &token, json!({"method":"project.get"})).await;
@@ -1527,14 +1734,17 @@ mod tests {
         .await;
         assert_eq!(
             peaks["result"],
-            json!({"id":"media-tone","waveform":[0.5,0.25]})
+            json!({"id":"media-tone","waveform":[0.5,0.25],
+                "waveformId":slim["result"]["media"][0]["waveformId"]})
         );
+        assert!(peaks["result"]["waveformId"].is_string());
         std::fs::remove_dir_all(&state.root).unwrap();
     }
-    /// The service answers an edit before it is on disk: it is written once editing
-    /// pauses, and at once when the service shuts down.
+    /// An edit is in the project's files when it is answered. The flush to the device
+    /// follows once editing pauses, and at once when the service shuts down, also
+    /// while a command still holds the editor.
     #[tokio::test]
-    async fn edits_are_written_after_a_pause_and_on_shutdown() {
+    async fn edits_are_written_before_the_reply_and_flushed_after_a_pause_and_on_shutdown() {
         let root = temp_root("autosave");
         let service = StudioService::start_on(root.clone(), Host::Service, 0)
             .await
@@ -1554,11 +1764,14 @@ mod tests {
         let saved = || -> Value {
             serde_json::from_slice(&std::fs::read(root.join("current.json")).unwrap()).unwrap()
         };
+        let unsynced = service.unsynced.clone().unwrap();
         let first = add("하나").await;
         assert_eq!(first["revision"], 1);
+        assert_eq!(saved(), first, "written before the reply");
+        assert!(!unsynced.is_empty());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while saved()["revision"] != 1 {
-            assert!(std::time::Instant::now() < deadline, "never written");
+        while !unsynced.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never flushed");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(saved(), first);
@@ -1570,9 +1783,26 @@ mod tests {
             first
         );
 
-        let second = add("둘").await;
+        // A burst of edits: each one is in the file when its reply arrives.
+        for text in ["둘", "셋", "넷"] {
+            let edited = add(text).await;
+            assert_eq!(saved(), edited);
+        }
+        let last = add("다섯").await;
+        assert!(!unsynced.is_empty());
+        // A command that never returns holds the editor; the shutdown neither waits
+        // for it nor leaves anything unflushed.
+        let editor = service.editor.clone().unwrap();
+        let stuck = editor.lock().await;
+        let began = std::time::Instant::now();
         service.shutdown();
-        assert_eq!(saved(), second, "nothing is left for a later write");
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "waited for the editor"
+        );
+        assert!(unsynced.is_empty(), "nothing is left for a later flush");
+        assert_eq!(saved(), last);
+        drop(stuck);
         drop(service);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2483,6 +2713,394 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Empty projects that pile up under a default name are counted by storage.usage
+    /// and deleted only when storage.clean is asked for them: never the open one,
+    /// one with a name of its own, one that holds something or one that was edited.
+    #[tokio::test]
+    async fn empty_unnamed_projects_are_counted_and_removed_only_when_asked() {
+        let state = upload_fixture();
+        let root = state.root.clone();
+        // One made the way the app makes it: `project.new` after two edits, then
+        // left for a named project. Its revision is past 0 though nothing is in it.
+        for patch in [
+            json!({"background":"#222222"}),
+            json!({"background":"#111111"}),
+        ] {
+            let (status, edited) = call(
+                &state,
+                "test",
+                json!({"method":"project.update","params":{"patch":patch}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{edited}");
+        }
+        let (_, made) = call(&state, "test", json!({"method":"project.new"})).await;
+        assert!(made["result"]["revision"].as_u64().unwrap() >= 3, "{made}");
+        let made = made["result"]["id"].as_str().unwrap().to_owned();
+        let (_, open) = call(
+            &state,
+            "test",
+            json!({"method":"project.new","params":{"name":"열린 프로젝트"}}),
+        )
+        .await;
+        let open = open["result"]["id"].as_str().unwrap().to_owned();
+        assert_ne!(open, made);
+        let store = |id: &str, change: &dyn Fn(&mut Value)| {
+            let mut project = crate::editor::empty_project("새 프로젝트", 1920, 1080, 30.0);
+            project["id"] = json!(id);
+            change(&mut project);
+            let file = root.join(format!("projects/{id}.json"));
+            std::fs::write(&file, project.to_string()).unwrap();
+            file
+        };
+        let empty = [
+            store("project-empty-a", &|_| {}),
+            store("project-empty-b", &|p| {
+                p["name"] = json!("이름 없는 프로젝트");
+                p["width"] = json!(1080);
+                p["height"] = json!(1920);
+            }),
+            // An edit that was undone leaves a revision and nothing else.
+            store("project-undone", &|p| p["revision"] = json!(4)),
+            root.join(format!("projects/{made}.json")),
+        ];
+        let kept = [
+            store("project-named", &|p| p["name"] = json!("여행")),
+            store(
+                "project-with-clip",
+                &|p| p["clips"] = json!([{"id":"clip-1","kind":"text","trackId":"text-1","start":0.0,"duration":1.0,"text":{"content":"자막"}}]),
+            ),
+            store("project-with-note", &|p| {
+                p["notes"] = json!([{"id":"n","text":"메모"}])
+            }),
+            root.join(format!("projects/{open}.json")),
+        ];
+        let empty_bytes: u64 = empty
+            .iter()
+            .map(|file| std::fs::metadata(file).unwrap().len())
+            .sum();
+
+        let (status, usage) = call(&state, "test", json!({"method":"storage.usage"})).await;
+        assert_eq!(status, StatusCode::OK, "{usage}");
+        assert_eq!(
+            usage["result"]["emptyProjects"],
+            json!({"count":4,"bytes":empty_bytes})
+        );
+        // Cleaning the derived files, the default, leaves every project alone.
+        let (_, cleaned) = call(&state, "test", json!({"method":"storage.clean"})).await;
+        assert_eq!(cleaned["result"]["emptyProjects"]["count"], 4);
+        assert!(cleaned["result"]["emptyProjects"].get("removed").is_none());
+        assert!(empty.iter().chain(&kept).all(|file| file.is_file()));
+        let (status, refused) = call(
+            &state,
+            "test",
+            json!({"method":"storage.clean","params":{"targets":["projects"]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert!(empty.iter().chain(&kept).all(|file| file.is_file()));
+
+        // Asked for, the empty ones go and nothing else does: no derived file either.
+        std::fs::create_dir_all(root.join("renders/export-old")).unwrap();
+        std::fs::write(root.join("renders/export-old/filters.ffgraph"), "x").unwrap();
+        let (status, cleaned) = call(
+            &state,
+            "test",
+            json!({"method":"storage.clean","params":{"targets":["emptyProjects"]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cleaned}");
+        assert_eq!(
+            cleaned["result"]["emptyProjects"],
+            json!({"count":0,"bytes":0,"removed":4,"removedBytes":empty_bytes})
+        );
+        assert_eq!(cleaned["result"]["removedBytes"], 0);
+        assert!(root.join("renders/export-old/filters.ffgraph").is_file());
+        assert!(empty.iter().all(|file| !file.exists()));
+        assert!(kept.iter().all(|file| file.is_file()));
+        let (_, list) = call(&state, "test", json!({"method":"project.list"})).await;
+        assert_eq!(list["result"].as_array().unwrap().len(), kept.len());
+        // Both together.
+        let (_, cleaned) = call(
+            &state,
+            "test",
+            json!({"method":"storage.clean","params":{"targets":["temporary","emptyProjects"]}}),
+        )
+        .await;
+        assert_eq!(cleaned["result"]["emptyProjects"]["removed"], 0);
+        assert!(!root.join("renders/export-old").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `proxies/` is kept within its limit: the proxies used longest ago go first,
+    /// those of the open project never, and no limit removes nothing.
+    #[tokio::test]
+    async fn proxies_over_the_limit_are_removed_least_recently_used_first() {
+        let state = upload_fixture();
+        let root = state.root.clone();
+        let (_, project) = call(&state, "test", json!({"method":"project.get"})).await;
+        let mut project = project["result"].clone();
+        project["media"] = json!([
+            {"id":"media-open","name":"a.mp4","path":"/nonexistent/a.mp4","kind":"video","duration":1.0,"width":3840,"height":2160,"hasAudio":false},
+            {"id":"media-open-old","name":"b.mp4","path":"/nonexistent/b.mp4","kind":"video","duration":1.0,"width":3840,"height":2160,"hasAudio":false}]);
+        let file = root.join("exports/with-media.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, project.to_string()).unwrap();
+        let (status, opened) = call(
+            &state,
+            "test",
+            json!({"method":"project.open","params":{"path":file}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        std::fs::create_dir_all(root.join("proxies")).unwrap();
+        let day = Duration::from_secs(24 * 3600);
+        let proxy = |id: &str, bytes: usize, days_ago: u32| {
+            let path = root.join(format!("proxies/{id}.mp4"));
+            std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+            let note = media::proxy_source_note(&path);
+            std::fs::write(&note, format!("/nonexistent/{id}.mp4")).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&note)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - day * days_ago)
+                .unwrap();
+            path
+        };
+        let note_bytes = |id: &str| format!("/nonexistent/{id}.mp4").len() as u64;
+        // The open project's, one of them not used for a long time.
+        let open = [
+            proxy("media-open", 4000, 0),
+            proxy("media-open-old", 4000, 90),
+        ];
+        let oldest = proxy("media-oldest", 3000, 60);
+        let older = proxy("media-older", 3000, 30);
+        let newer = proxy("media-newer", 3000, 2);
+        // Being written: neither counted nor removed.
+        let partial = root.join("proxies/.media-open.x.partial.mp4");
+        std::fs::write(&partial, vec![b'x'; 50_000]).unwrap();
+        let editor = state.editor.clone();
+        let mut work = MediaWork::default();
+
+        // Within the default limit, and without a limit: all stay.
+        tend_proxies(&editor, &root, &mut work).await;
+        work.proxy_limit.store(0, Ordering::Relaxed);
+        tend_proxies(&editor, &root, &mut work).await;
+        for path in open.iter().chain([&oldest, &older, &newer, &partial]) {
+            assert!(path.is_file(), "{path:?}");
+        }
+        // Looking after them marked the open project's as used now.
+        let used = |path: &PathBuf| {
+            std::fs::metadata(media::proxy_source_note(path))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .elapsed()
+                .unwrap()
+        };
+        assert!(used(&open[1]) < day && used(&oldest) > day * 59);
+        assert_eq!(
+            std::fs::read_to_string(media::proxy_source_note(&open[1])).unwrap(),
+            "/nonexistent/media-open-old.mp4",
+            "the note still says what the proxy was made from"
+        );
+
+        // 17 kB and the notes are there; 12 kB may stay: the two used longest ago go.
+        let all = 17_000
+            + [
+                "media-open",
+                "media-open-old",
+                "media-oldest",
+                "media-older",
+                "media-newer",
+            ]
+            .map(note_bytes)
+            .iter()
+            .sum::<u64>();
+        work.proxy_limit.store(
+            all - 3000 - note_bytes("media-oldest") - 1,
+            Ordering::Relaxed,
+        );
+        tend_proxies(&editor, &root, &mut work).await;
+        assert!(!oldest.exists() && !media::proxy_source_note(&oldest).exists());
+        assert!(!older.exists() && !media::proxy_source_note(&older).exists());
+        for path in open.iter().chain([&newer, &partial]) {
+            assert!(path.is_file(), "{path:?}");
+        }
+        // Nothing changed since: not looked at again until something does.
+        let stray = proxy("media-stray", 9000, 10);
+        tend_proxies(&editor, &root, &mut work).await;
+        assert!(stray.is_file());
+        // A limit below what the open project alone needs removes every other proxy
+        // and none of its own.
+        work.proxy_limit.store(1, Ordering::Relaxed);
+        tend_proxies(&editor, &root, &mut work).await;
+        assert!(!stray.exists() && !newer.exists());
+        assert!(open.iter().all(|path| path.is_file()) && partial.is_file());
+
+        // Another project is opened: the proxies of the one left may go now.
+        call(
+            &state,
+            "test",
+            json!({"method":"project.new","params":{"name":"다른 프로젝트"}}),
+        )
+        .await;
+        tend_proxies(&editor, &root, &mut work).await;
+        assert!(open.iter().all(|path| !path.exists()));
+        assert!(partial.is_file());
+
+        // The limit is set through the service, saved, reported and kept by a restart.
+        let (status, set) = call(
+            &state,
+            "test",
+            json!({"method":"storage.configure","params":{"proxyLimitBytes":5_000_000_000u64}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["result"]["proxyLimitBytes"], 5_000_000_000u64);
+        assert_eq!(state.proxy_limit.load(Ordering::Relaxed), 5_000_000_000);
+        assert_eq!(saved_proxy_limit(&root), 5_000_000_000);
+        let (_, usage) = call(&state, "test", json!({"method":"storage.usage"})).await;
+        assert_eq!(usage["result"]["proxyLimitBytes"], 5_000_000_000u64);
+        for wrong in [
+            json!({}),
+            json!({"proxyLimitBytes":-1}),
+            json!({"proxyLimitBytes":"1GB"}),
+        ] {
+            let (status, _) = call(
+                &state,
+                "test",
+                json!({"method":"storage.configure","params":wrong}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(saved_proxy_limit(&root), 5_000_000_000);
+        let token = state.runtime.issue_agent_token("any");
+        let (status, _) = call(
+            &state,
+            &token,
+            json!({"method":"storage.configure","params":{"proxyLimitBytes":1}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            saved_proxy_limit(&temp_root("no-settings")),
+            DEFAULT_PROXY_LIMIT
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A frame that its own client replaced or stopped is answered as a result, not
+    /// as a failed request: `{cancelled:true}` with HTTP 200. `preview.cancel` stops
+    /// one client's frames only, and agents cannot call it.
+    #[tokio::test]
+    async fn a_replaced_or_stopped_frame_is_answered_as_a_result() {
+        let state = upload_fixture();
+        let (status, project) = call(
+            &state,
+            "test",
+            json!({"method":"edit.add","params":{"text":{"content":"미리보기"},"start":0.0,"duration":4.0}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{project}");
+        let frame = |time: f64, client: &'static str| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                call(
+                    &state,
+                    "test",
+                    json!({"method":"preview.frame","params":{"time":time,"width":320,"client":client}}),
+                )
+                .await
+            })
+        };
+        let waiting = async |count: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while state.previews.waiting() != count {
+                assert!(std::time::Instant::now() < deadline, "never queued");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        // The renderer is busy, so the requests below stay queued until it is let go.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let busy = {
+            let previews = state.previews.clone();
+            tokio::spawn(async move {
+                previews
+                    .while_idle(async move |_| {
+                        let _ = released.await;
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replaced = frame(0.5, "player");
+        waiting(1).await;
+        let newest = frame(1.5, "player");
+        waiting(2).await;
+        let stopped = frame(2.5, "export");
+        waiting(3).await;
+        // Another client has nothing to stop; the export dialog stops its one frame.
+        let cancel = async |client: &str| {
+            call(
+                &state,
+                "test",
+                json!({"method":"preview.cancel","params":{"client":client}}),
+            )
+            .await
+        };
+        assert_eq!(cancel("other").await.1["result"], json!({"cancelled":0}));
+        assert_eq!(
+            cancel("export").await,
+            (StatusCode::OK, json!({"result":{"cancelled":1}}))
+        );
+        release.send(()).unwrap();
+        busy.await.unwrap();
+        for ended in [replaced, stopped] {
+            let (status, body) = ended.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["result"]["cancelled"], true);
+            assert!(body["result"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("PREVIEW_CANCELLED"));
+            assert!(body.get("error").is_none() && body["result"].get("assetId").is_none());
+        }
+        let (status, shown) = newest.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert!(shown["result"]["assetId"].is_string(), "{shown}");
+        assert!(shown["result"].get("cancelled").is_none());
+        // A frame asked for a revision the project has left is answered the same way.
+        let (status, stale) = call(
+            &state,
+            "test",
+            json!({"method":"preview.frame","params":{"time":0.5,"expectedRevision":99}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stale}");
+        assert_eq!(stale["result"]["cancelled"], true);
+        assert!(stale["result"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("REVISION_CONFLICT"));
+        // A real failure is still an error.
+        let (status, failed) = call(
+            &state,
+            "test",
+            json!({"method":"preview.frame","params":{"time":0.5,"expectedRevision":"soon"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{failed}");
+        let token = state
+            .runtime
+            .issue_agent_token(project["result"]["id"].as_str().unwrap());
+        let (status, _) = call(&state, &token, json!({"method":"preview.cancel"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(&state.root).unwrap();
+    }
+
     /// The project list can show the cover of a project that is not open.
     #[tokio::test]
     async fn project_covers_are_served_for_projects_that_are_not_open() {
@@ -2619,6 +3237,7 @@ mod tests {
             origins: Arc::new(allowed_origins(Host::Service)),
             media_work: Arc::new(Notify::new()),
             proxy_in_progress: ProxyInProgress::default(),
+            proxy_limit: Arc::new(AtomicU64::new(DEFAULT_PROXY_LIMIT)),
         }
     }
     fn upload_headers() -> HeaderMap {

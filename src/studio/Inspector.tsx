@@ -63,6 +63,7 @@ import CurveEditor from "./CurveEditor";
 import { durationOf, timecode } from "./types";
 
 const addFontValue = "__add-font__";
+const soundFadeKey = (edge: Edge) => (edge === "in" ? "audioFadeIn" : "audioFadeOut");
 import "./panels.css";
 import "./custom-assets.css";
 
@@ -870,14 +871,10 @@ export function Inspector({
     if (edge === "in" && joined) return setJoin(type, duration);
     return patch(transitionPatch(selected, edge, type, duration));
   };
-  /**
-   * The sound of a clip fades over its fadeIn/fadeOut, the same length as the
-   * picture's transition on that edge, which keeps its type.
-   */
+  /** An audio clip fades over its fadeIn/fadeOut, which is also its transition. */
   const fadeField = (edge: Edge) => {
     if (!selected || (edge === "in" && joined)) return null;
-    const type = (length: number) =>
-      length > 0 ? (isAudio ? "fade" : (ownEdge(edge).type ?? "fade")) : null;
+    const type = (length: number) => (length > 0 ? ("fade" as const) : null);
     return (
       <NumberField
         key={edge}
@@ -886,9 +883,33 @@ export function Inspector({
         min={0}
         max={selected.duration}
         step={0.1}
-        unit="s"
+        unit="초"
         onCommit={(v) => void setTransition(edge, type(v), v)}
         onPreview={(v) => draft(transitionPatch(selected, edge, type(v), v))}
+        onCancelPreview={clearDraft}
+      />
+    );
+  };
+  /**
+   * The sound of a video clip fades on its own, apart from the picture's
+   * transition. A clip saved before the sound had its own length has none
+   * stored: its sound still follows fadeIn/fadeOut, which is what shows.
+   */
+  const soundFadeField = (edge: Edge) => {
+    if (!selected) return null;
+    const key = soundFadeKey(edge);
+    const stored = selected[key];
+    return (
+      <NumberField
+        key={edge}
+        label={edge === "in" ? "페이드 인" : "페이드 아웃"}
+        value={stored ?? (edge === "in" ? selected.fadeIn : selected.fadeOut)}
+        min={0}
+        max={selected.duration}
+        step={0.1}
+        unit="초"
+        onCommit={(v) => patch({ [key]: v })}
+        onPreview={(v) => draft({ [key]: v })}
         onCancelPreview={clearDraft}
       />
     );
@@ -1210,7 +1231,7 @@ export function Inspector({
                     step={Number((1 / project.fps).toFixed(4))}
                     onCommit={(v) => patch({ start: v })}
                   />
-                  <small>s</small>
+                  <small>초</small>
                 </label>
                 <label>
                   <span>길이</span>
@@ -1221,7 +1242,7 @@ export function Inspector({
                     step={Number((1 / project.fps).toFixed(4))}
                     onCommit={(v) => patch({ duration: v })}
                   />
-                  <small>s</small>
+                  <small>초</small>
                 </label>
                 {timed && (
                   <label>
@@ -1234,7 +1255,7 @@ export function Inspector({
                       step={Number((1 / project.fps).toFixed(4))}
                       onCommit={(v) => patch({ sourceIn: v })}
                     />
-                    <small>s</small>
+                    <small>초</small>
                   </label>
                 )}
               </div>
@@ -1786,10 +1807,11 @@ export function Inspector({
                         </select>
                       </label>
                     )}
-                    <p className="panel-help">
-                      작은 카메라 흔들림을 줄입니다. 재생 미리보기와 내보낸
-                      영상에서 확인하세요.
-                    </p>
+                    {stabilize.enabled && (
+                      <p className="panel-help">
+                        재생 미리보기와 내보낸 영상에 적용됩니다.
+                      </p>
+                    )}
                   </Section>
                 )}
                 {hasAudio && (
@@ -1799,8 +1821,10 @@ export function Inspector({
                     onReset={() =>
                       patch({
                         volume: 1,
-                        fadeIn: 0,
-                        fadeOut: 0,
+                        // A video clip's picture transition is not this section's to clear.
+                        ...(isAudio
+                          ? { fadeIn: 0, fadeOut: 0 }
+                          : { audioFadeIn: 0, audioFadeOut: 0 }),
                         audio: {
                           normalize: false,
                           denoise: false,
@@ -1862,14 +1886,7 @@ export function Inspector({
                       />
                       <span>음성 선명하게</span>
                     </label>
-                    {!isAudio && (
-                      <>
-                        {(["in", "out"] as const).map(fadeField)}
-                        <p className="inspector-hint">
-                          소리 페이드는 화면의 등장·퇴장 전환과 같은 길이로 움직입니다.
-                        </p>
-                      </>
-                    )}
+                    {!isAudio && (["in", "out"] as const).map(soundFadeField)}
                   </Section>
                 )}
                 {hasAudio && (
@@ -1981,7 +1998,7 @@ export function Inspector({
                                 min={0.1}
                                 max={selected.duration}
                                 step={0.1}
-                                unit="s"
+                                unit="초"
                                 onCommit={(v) => void setTransition(edge, type, v)}
                                 onPreview={(v) =>
                                   draft(transitionPatch(selected, edge, type, v))
@@ -1992,13 +2009,6 @@ export function Inspector({
                           </Fragment>
                         );
                       })}
-                    {ownsTransitions && (
-                      <p className="inspector-hint">
-                        등장·퇴장은 이 클립 혼자 나타나고 사라지는 방식입니다. 두 클립이
-                        겹치는 전환은 {before ? "‘앞 클립과 전환’이나 " : ""}라이브러리
-                        전환 탭에서 넣습니다.
-                      </p>
-                    )}
                     {before && (
                       <label className="inspector-select-field">
                         <span>앞 클립과 전환</span>
@@ -2029,7 +2039,7 @@ export function Inspector({
                         min={Number((1 / project.fps).toFixed(4))}
                         max={maxTransitionDuration({ before, after: selected })}
                         step={0.1}
-                        unit="s"
+                        unit="초"
                         onCommit={(v) =>
                           void setJoin(
                             selected.transitionIn?.type ??
@@ -2066,13 +2076,9 @@ export function Inspector({
                 <Section
                   title="일반 속도"
                   defaultOpen
-                  onReset={() =>
-                    patch({
-                      speed: 1,
-                      duration: selected.duration * selected.speed,
-                      reverse: false,
-                    })
-                  }
+                  // The speed alone: the editor derives the length from the source
+                  // range the clip keeps, and keyframes and fades follow in proportion.
+                  onReset={() => patch({ speed: 1, reverse: false })}
                 >
                   <NumberField
                     label="재생 속도"
@@ -2082,25 +2088,15 @@ export function Inspector({
                     step={0.1}
                     unit="×"
                     range
-                    onCommit={(v) =>
-                      patch({
-                        speed: v,
-                        duration: (selected.duration * selected.speed) / v,
-                      })
-                    }
+                    onCommit={(v) => patch({ speed: v })}
                   />
                   <div className="speed-presets">
                     {[0.5, 1, 1.5, 2, 4].map((speed) => (
                       <button
                         className={selected.speed === speed ? "active" : ""}
+                        aria-pressed={selected.speed === speed}
                         key={speed}
-                        onClick={() =>
-                          patch({
-                            speed,
-                            duration:
-                              (selected.duration * selected.speed) / speed,
-                          })
-                        }
+                        onClick={() => patch({ speed })}
                       >
                         {speed}×
                       </button>
@@ -2344,12 +2340,6 @@ export function Inspector({
                       </button>
                     ))}
                   </div>
-                  {curves.preset && curves.preset !== "none" && (
-                    <p className="panel-help">
-                      현재 프리셋이 적용되어 있습니다. 제어점을 바꾸면 사용자
-                      지정 곡선으로 전환됩니다.
-                    </p>
-                  )}
                   <CurveEditor
                     key={`${selected.id}-${curveChannel}`}
                     points={curves[curveChannel]}

@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Player from "./Player";
+import { rpc } from "./api";
 import { playbackClock } from "./playbackClock";
 import type { Clip, Project } from "./types";
 
@@ -84,6 +85,40 @@ describe("player with a large project", () => {
     project.media[0].proxy = false;
     const plain = mount(project);
     expect(plain.container.querySelector("video")!.getAttribute("src")).toBe("http://studio/film");
+    await act(async () => {});
+  });
+  it("marks a paused frame drawn from proxies and redraws it from the originals on request", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(rpc).mockImplementation(async (_method, params) => ({
+        assetId: (params as { proxy?: boolean }).proxy === false ? "original" : "light",
+        revision: 1,
+        projectId: "p",
+        proxies: (params as { proxy?: boolean }).proxy === false ? 0 : 1,
+      }));
+      const project = fixture([clip("a", 0)]);
+      project.media[0].proxy = true;
+      const { container } = mount(project);
+      const toggle = screen.getByRole("button", { name: "원본으로 보기" });
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+      expect(screen.queryByText("프록시")).toBeNull();
+      await act(() => vi.advanceTimersByTimeAsync(150));
+      expect(container.querySelector("img.rendered-preview")).toHaveAttribute("src", "http://studio/light");
+      expect(screen.getByText("프록시")).toHaveAttribute("title", expect.stringContaining("프록시 1개"));
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute("aria-pressed", "true");
+      await act(() => vi.advanceTimersByTimeAsync(150));
+      expect(rpc).toHaveBeenLastCalledWith("preview.frame", expect.objectContaining({ proxy: false, client: "player" }), "p");
+      expect(container.querySelector("img.rendered-preview")).toHaveAttribute("src", "http://studio/original");
+      expect(screen.queryByText("프록시")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("offers no originals switch when the project has no proxy", async () => {
+    mount(fixture([clip("a", 0)]));
+    expect(screen.queryByRole("button", { name: "원본으로 보기" })).toBeNull();
+    expect(screen.queryByText("프록시")).toBeNull();
     await act(async () => {});
   });
 });

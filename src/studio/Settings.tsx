@@ -52,7 +52,16 @@ interface StorageUsage {
   bytes: number;
   reclaimableBytes?: number;
   removedBytes?: number;
+  /** Stored projects that still have their default name and nothing in them. Optional: older services do not count them. */
+  emptyProjects?: { count: number; bytes?: number; removed?: number };
+  /** The most that playback proxies may take, 0 for no limit. Optional: older services have none. */
+  proxyLimitBytes?: number;
 }
+const GB = 1024 ** 3;
+/** The limits offered for playback proxies; 0 is no limit. */
+const proxyLimits = [5 * GB, 10 * GB, 20 * GB, 50 * GB, 0];
+/** What a cleanup removes: unused scratch files, or the empty default-named projects. */
+type CleanTarget = "temporary" | "emptyProjects";
 const folderNames: [string, string][] = [
   ["imports", "가져온 소재"],
   ["speech", "음성·자막 생성물"],
@@ -107,9 +116,9 @@ export default function Settings({
   };
   const [usage, setUsage] = useState<StorageUsage | null>(null);
   const [storageError, setStorageError] = useState("");
-  const [confirmClean, setConfirmClean] = useState(false);
+  const [confirmClean, setConfirmClean] = useState<CleanTarget | null>(null);
   const [cleaning, setCleaning] = useState(false);
-  const [cleaned, setCleaned] = useState<StorageUsage | null>(null);
+  const [cleaned, setCleaned] = useState<string>("");
   const loadUsage = async () => {
     try {
       const next = await rpc<StorageUsage>("storage.usage");
@@ -118,18 +127,35 @@ export default function Settings({
       setStorageError(e instanceof Error ? e.message : String(e));
     }
   };
-  const clean = async () => {
+  const clean = async (target: CleanTarget) => {
     setCleaning(true);
     setStorageError("");
     try {
-      const result = await rpc<StorageUsage>("storage.clean");
-      setCleaned(result?.folders ? result : null);
-      setConfirmClean(false);
+      if (target === "emptyProjects") {
+        const asked = usage?.emptyProjects?.count ?? 0;
+        const result = await rpc<StorageUsage>("storage.clean", { targets: ["emptyProjects"] });
+        setCleaned(`빈 프로젝트 ${result?.emptyProjects?.removed ?? asked}개를 삭제했습니다`);
+      } else {
+        const result = await rpc<StorageUsage>("storage.clean");
+        setCleaned(result?.folders ? `${byteSize(result.removedBytes ?? 0)}를 정리했습니다` : "");
+      }
+      setConfirmClean(null);
       await loadUsage();
     } catch (e) {
       setStorageError(e instanceof Error ? e.message : String(e));
     } finally {
       setCleaning(false);
+    }
+  };
+  const emptyProjects = usage?.emptyProjects?.count ?? 0;
+  /** The service keeps the proxies within the limit from then on; it answers with the usage. */
+  const setProxyLimit = async (proxyLimitBytes: number) => {
+    setStorageError("");
+    try {
+      const next = await rpc<StorageUsage>("storage.configure", { proxyLimitBytes });
+      if (next?.folders) setUsage(next);
+    } catch (e) {
+      setStorageError(e instanceof Error ? e.message : String(e));
     }
   };
   const [busy, setBusy] = useState(false);
@@ -414,7 +440,35 @@ export default function Settings({
                         </div>
                       ),
                   )}
+                  {emptyProjects > 0 && (
+                    <div className="storage-row">
+                      <dt>빈 프로젝트</dt>
+                      <dd>{emptyProjects}개</dd>
+                    </div>
+                  )}
                 </dl>
+              )}
+              {usage?.proxyLimitBytes !== undefined && (
+                <label className="storage-limit">
+                  프록시 한도
+                  <select
+                    value={usage.proxyLimitBytes}
+                    disabled={cleaning}
+                    onChange={(e) => void setProxyLimit(Number(e.target.value))}
+                  >
+                    {Array.from(new Set([...proxyLimits, usage.proxyLimitBytes]))
+                      .sort((a, b) => (a || Infinity) - (b || Infinity))
+                      .map((bytes) => (
+                        <option key={bytes} value={bytes}>
+                          {!bytes
+                            ? "제한 없음"
+                            : bytes % GB
+                              ? byteSize(bytes)
+                              : `${bytes / GB} GB`}
+                        </option>
+                      ))}
+                  </select>
+                </label>
               )}
               {usage && (
                 <div className="settings-actions">
@@ -425,14 +479,23 @@ export default function Settings({
                         // The question and its two buttons open below the fold.
                         ref={(node) => node?.parentElement?.scrollIntoView?.({ block: "nearest" })}
                       >
-                        쓰이지 않는 프록시·미리보기·렌더링 임시 파일{" "}
-                        {byteSize(usage.reclaimableBytes ?? 0)}를 삭제합니다. 원본
-                        소재와 프로젝트는 지우지 않습니다.
+                        {confirmClean === "emptyProjects" ? (
+                          <>
+                            이름을 바꾸지 않았고 아무것도 넣지 않은 프로젝트{" "}
+                            {emptyProjects}개를 삭제합니다. 되돌릴 수 없습니다.
+                          </>
+                        ) : (
+                          <>
+                            쓰이지 않는 프록시·미리보기·렌더링 임시 파일{" "}
+                            {byteSize(usage.reclaimableBytes ?? 0)}를 삭제합니다. 원본
+                            소재와 프로젝트는 지우지 않습니다.
+                          </>
+                        )}
                       </span>
                       <button
                         className="primary-button"
                         disabled={cleaning}
-                        onClick={() => void clean()}
+                        onClick={() => void clean(confirmClean)}
                       >
                         {cleaning ? (
                           <LoaderCircle className="spin" size={14} />
@@ -444,30 +507,42 @@ export default function Settings({
                       <button
                         className="secondary-button"
                         disabled={cleaning}
-                        onClick={() => setConfirmClean(false)}
+                        onClick={() => setConfirmClean(null)}
                       >
                         취소
                       </button>
                     </>
                   ) : (
-                    <button
-                      className="secondary-button"
-                      disabled={!(usage.reclaimableBytes! > 0)}
-                      onClick={() => {
-                        setCleaned(null);
-                        setConfirmClean(true);
-                      }}
-                    >
-                      <Trash2 size={14} /> 쓰지 않는 임시 파일 정리
-                      {usage.reclaimableBytes! > 0
-                        ? ` (${byteSize(usage.reclaimableBytes!)})`
-                        : ""}
-                    </button>
+                    <>
+                      <button
+                        className="secondary-button"
+                        disabled={!(usage.reclaimableBytes! > 0)}
+                        onClick={() => {
+                          setCleaned("");
+                          setConfirmClean("temporary");
+                        }}
+                      >
+                        <Trash2 size={14} /> 쓰지 않는 임시 파일 정리
+                        {usage.reclaimableBytes! > 0
+                          ? ` (${byteSize(usage.reclaimableBytes!)})`
+                          : ""}
+                      </button>
+                      {emptyProjects > 0 && (
+                        <button
+                          className="secondary-button"
+                          onClick={() => {
+                            setCleaned("");
+                            setConfirmClean("emptyProjects");
+                          }}
+                        >
+                          <Trash2 size={14} /> 빈 프로젝트 {emptyProjects}개 삭제
+                        </button>
+                      )}
+                    </>
                   )}
                   {!confirmClean && cleaned && (
                     <span className="up-to-date" role="status">
-                      <Check size={14} /> {byteSize(cleaned.removedBytes ?? 0)}를
-                      정리했습니다
+                      <Check size={14} /> {cleaned}
                     </span>
                   )}
                   {!confirmClean && !cleaned && !(usage.reclaimableBytes! > 0) && (

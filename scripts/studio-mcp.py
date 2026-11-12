@@ -42,7 +42,13 @@ def rpc(method, params, connection=None):
         raise ValueError(detail) from None
     if 'error' in value:
         raise ValueError(value['error'])
-    return value['result']
+    result = value['result']
+    # The service answers a frame that this caller's newer request replaced, or that
+    # the project left behind (PREVIEW_STALE, REVISION_CONFLICT), as a result (HTTP
+    # 200, so that a browser logs no failed request). Here it is no frame.
+    if method == 'preview.frame' and isinstance(result, dict) and result.get('cancelled'):
+        raise ValueError(result.get('reason') or 'PREVIEW_CANCELLED')
+    return result
 
 
 def list_tools():

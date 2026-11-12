@@ -21,11 +21,20 @@ export async function connectStudio(force = false): Promise<Connection> {
   }
   return connection;
 }
+/**
+ * The methods the editor answers, whose reply may carry the project. This window
+ * asks for it without the waveforms (`omitWaveforms`): each media item then says
+ * how many peaks it has, and the timeline fetches them once with `media.waveform`.
+ */
+const editorMethod = (method: string) =>
+  !/^(runtime|agent|memory|speech|preview|export|storage)\./.test(method) &&
+  method !== "media.waveform";
 export async function rpc<T = unknown>(
   method: string,
-  params: Record<string, unknown> = {},
+  given: Record<string, unknown> = {},
   projectId?: string,
 ): Promise<T> {
+  const params = editorMethod(method) ? { ...given, omitWaveforms: true } : given;
   const c = await connectStudio();
   let response = await fetch(`${c.url}/rpc`, {
     method: "POST",

@@ -12,12 +12,16 @@ measures over RPC:
   d  exports: 60 s of the 500-clip timeline and 60 s of 4K, hardware and software,
      and all 500 clips (500 s) in one export
   e  the service's peak memory (RSS), and that of its FFmpeg children
+  f  a 2000-clip timeline: edit.batch of 200 commands (and of 500 edit.add while it
+     is built), beside the same edits sent one by one
+  g  1, 10 and 30 layers on screen at the same time: exact preview frames from the
+     originals and a 10 s export, hardware and software
 
 Build the binary first:
     cargo build --release --manifest-path src-tauri/Cargo.toml --bin studio-service
 Run:
     python3 scripts/bench.py --out bench.json [--media-dir DIR] [--baseline before.json]
-        [--only a,b,c,d] [--quick]
+        [--only a,b,c,d,f,g] [--quick]
 
 --media-dir keeps the synthetic media between runs (they take a few minutes to make);
 without it they are made in a temporary folder and removed. --quick shortens the
@@ -408,6 +412,96 @@ def scenario_timeline(service, media, results, only, quick):
             'path': str(service.home / 'exports' / 'timeline-all.mp4'), 'format': 'mp4', 'start': 0, 'end': float(count)})
 
 
+def scenario_batch(service, media, results, quick):
+    """f: what one edit.batch costs on a long timeline."""
+    count, size = (200, 20) if quick else (2000, 200)
+    project = service.rpc('project.new', {'name': '벤치 배치', 'width': 1920, 'height': 1080, 'fps': 30})
+    project = service.rpc('media.importAndAdd', {'paths': [media['hd-h264-30.mp4']['path']], 'expectedRevision': project['revision']})
+    wait_until(lambda: all(m.get('waveform') for m in service.rpc('project.get')['media']), 600)
+    project = service.rpc('project.get')
+    first = next(c for c in project['clips'] if c['kind'] == 'video')
+    source = media['hd-h264-30.mp4']['seconds']
+    project = service.rpc('edit.delete', {'ids': [first['id']], 'expectedRevision': project['revision']})
+    block, built = {}, []
+    # Half-second clips end to end on one track, 500 commands (the limit) a batch.
+    for begin in range(0, count, 500):
+        commands = [{'method': 'edit.add', 'params': {
+            'mediaId': first['mediaId'], 'trackId': first['trackId'], 'start': i * 0.5, 'duration': 0.5,
+            'sourceIn': (i * 0.5) % (source - 1)}} for i in range(begin, min(count, begin + 500))]
+        seconds, project, _ = service.timed('edit.batch', {'commands': commands, 'expectedRevision': project['revision']})
+        built.append({'clips_before': begin, 'commands': len(commands), 'ms': round(seconds * 1000, 1)})
+    block['build_batches_of_edit_add'] = built
+    clips = sorted((c for c in project['clips'] if c['trackId'] == first['trackId']), key=lambda c: c['start'])
+    assert len(clips) == count, len(clips)
+    block['clips'] = len(project['clips'])
+    block['project_file_bytes'] = (service.home / 'current.json').stat().st_size
+    chosen = random.Random(11).sample(clips, size)
+    kinds = {
+        'update_volume': lambda c, i: {'method': 'edit.update', 'params': {'id': c['id'], 'patch': {'volume': 0.5 + (i % 5) / 10}}},
+        'update_transition_and_fades': lambda c, i: {'method': 'edit.update', 'params': {'id': c['id'], 'patch': {
+            'transitionIn': {'type': 'dissolve', 'duration': 0.2}, 'audioFadeIn': 0.1, 'audioFadeOut': 0.1}}},
+        'update_speed': lambda c, i: {'method': 'edit.update', 'params': {'id': c['id'], 'patch': {'speed': 2.0}}},
+        'trim_end': lambda c, i: {'method': 'edit.trim', 'params': {'id': c['id'], 'end': c['start'] + 0.4}},
+    }
+    for name, make in kinds.items():
+        commands = [make(c, i) for i, c in enumerate(chosen)]
+        took, reply = [], 0
+        for _ in range(5):
+            seconds, project, reply = service.timed('edit.batch', {'commands': commands, 'expectedRevision': project['revision']})
+            took.append(seconds)
+            project = service.rpc('history.undo')
+        block[f'batch_{size}_{name}'] = dict(summary(took), response_bytes=reply)
+    # The same edits one by one, for scale (one undo each afterwards).
+    commands = [kinds['update_volume'](c, i) for i, c in enumerate(chosen)]
+    began = time.perf_counter()
+    for command in commands:
+        project = service.rpc(command['method'], dict(command['params'], expectedRevision=project['revision']))
+    block[f'single_{size}_update_volume_total_ms'] = round((time.perf_counter() - began) * 1000, 1)
+    # A batch whose last command fails leaves the project as it was.
+    revision = project['revision']
+    seconds, status, _ = service.raw('edit.batch', {'commands': commands + [
+        {'method': 'edit.update', 'params': {'id': 'missing', 'patch': {'volume': 1}}}], 'expectedRevision': revision})
+    assert status == 400, status
+    after = service.rpc('project.get')
+    assert after['revision'] == revision and after['clips'] == project['clips']
+    block[f'batch_{size}_failing_last_command_ms'] = round(seconds * 1000, 1)
+    results['f_batch_long_timeline'] = block
+
+
+def scenario_layers(service, media, results, quick):
+    """g: many layers on screen at the same time."""
+    span = 3.0 if quick else 10.0
+    block = {}
+    for layers in ((1, 4) if quick else (1, 10, 30)):
+        project = service.rpc('project.new', {'name': f'벤치 레이어 {layers}', 'width': 1920, 'height': 1080, 'fps': 30})
+        project = service.rpc('media.importAndAdd', {'paths': [media['hd-h264-30.mp4']['path']], 'expectedRevision': project['revision']})
+        wait_until(lambda: all(m.get('waveform') for m in service.rpc('project.get')['media']), 600)
+        project = service.rpc('project.get')
+        first = next(c for c in project['clips'] if c['kind'] == 'video')
+        project = service.rpc('edit.trim', {'id': first['id'], 'end': span, 'expectedRevision': project['revision']})
+        columns = 6
+        for i in range(1, layers):
+            # A grid of small pictures, so that every layer stays visible.
+            project = service.rpc('edit.add', {
+                'mediaId': first['mediaId'], 'newTrack': f'레이어 {i + 1}', 'start': 0, 'duration': span, 'sourceIn': 15.0 * i,
+                'transform': {'scale': 0.15, 'x': (i % columns - 2.5) * 300, 'y': (i // columns - 2) * 200},
+                'expectedRevision': project['revision']})
+        if layers > 1:
+            project = service.rpc('edit.update', {'id': first['id'], 'patch': {'transform': {'scale': 0.15, 'x': -750, 'y': -400}},
+                                                  'expectedRevision': project['revision']})
+        assert sum(1 for c in project['clips'] if c['kind'] == 'video') == layers
+        row = {}
+        times = distinct_times(span, 10, 13)
+        row['frames_width_640_original'] = frames(service, times, 640, {'proxy': False})
+        row['frames_width_1280_original'] = frames(service, [t + 1 / 30 for t in times], 1280, {'proxy': False})
+        for label, hardware in (('hardware', True), ('software', False)):
+            row[f'export_{label}'] = export(service, {
+                'path': str(service.home / 'exports' / f'layers-{layers}-{label}.mp4'), 'format': 'mp4',
+                'start': 0, 'end': span, 'hardware': hardware})
+        block[f'layers_{layers}'] = row
+    results['g_layers'] = block
+
+
 def rows(results):
     """Flattens the results into (name, value) lines for the table."""
     out = []
@@ -454,7 +548,7 @@ def main():
     parser.add_argument('--binary', default=str(DEFAULT_BINARY))
     parser.add_argument('--media-dir', help='keep the synthetic media here between runs')
     parser.add_argument('--baseline', help='results of an earlier run, shown beside the new ones')
-    parser.add_argument('--only', default='a,b,c,d', help='scenarios to run, of a,b,c,d')
+    parser.add_argument('--only', default='a,b,c,d,f,g', help='scenarios to run, of a,b,c,d,f,g')
     parser.add_argument('--label', default='')
     parser.add_argument('--quick', action='store_true')
     args = parser.parse_args()
@@ -488,6 +582,12 @@ def main():
         if only & {'c', 'd'}:
             print('500-clip timeline…', flush=True)
             scenario_timeline(service, media, results, only, args.quick)
+        if 'f' in only:
+            print('2000-clip batch…', flush=True)
+            scenario_batch(service, media, results, args.quick)
+        if 'g' in only:
+            print('layers…', flush=True)
+            scenario_layers(service, media, results, args.quick)
         memory.done.set()
         memory.join()
         results['e_memory'] = {'service_peak_rss_mb': round(memory.service_kb / 1024, 1),

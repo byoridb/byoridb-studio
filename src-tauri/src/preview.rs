@@ -19,6 +19,15 @@ use tokio::sync::{Mutex, Semaphore};
 
 const STALE: &str = "미리보기 중 프로젝트가 변경되었습니다. (PREVIEW_STALE)";
 const CANCELLED: &str = "더 새로운 미리보기 요청으로 대체되었습니다. (PREVIEW_CANCELLED)";
+/// Whether a frame ended without failing: its client asked for another one or
+/// stopped it (`PreviewFrames::cancel`), or the project moved on before or while it
+/// was drawn (`PREVIEW_STALE`, `REVISION_CONFLICT`), so the caller will ask again
+/// for the project as it is now.
+pub fn was_superseded(error: &str) -> bool {
+    error == CANCELLED
+        || error.ends_with("(PREVIEW_STALE)")
+        || error.ends_with("(REVISION_CONFLICT)")
+}
 
 /// The project as far as a frame depends on it: without the waveform and the proxy
 /// flag that background work adds to a media item after an import. Neither changes
@@ -103,6 +112,12 @@ impl PreviewFrames {
         let own = pending.iter().filter(|(_, other, ..)| other == client);
         own.map(|(.., flag)| flag.store(true, Ordering::Relaxed))
             .count()
+    }
+
+    /// How many requests are queued or rendering.
+    #[cfg(test)]
+    pub fn waiting(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
 
     /// `client` names who asks ("player", "export", one agent job): see `pending`.

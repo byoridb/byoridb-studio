@@ -27,7 +27,7 @@ import {
   ArrowLeftToLine,
   ArrowRightToLine,
 } from "lucide-react";
-import type { Clip, Command, Project, Track, TransitionType } from "./types";
+import type { Clip, EditCommand, Project, Track, TransitionType } from "./types";
 import { durationOf, timecode } from "./types";
 import { assetUrl } from "./api";
 import {
@@ -35,6 +35,7 @@ import {
   clipJunctions,
   junctionTransitionCommands,
   maxTransitionDuration,
+  presentIds,
   trimClipPreview,
   waveformBars,
   waveformRange,
@@ -53,6 +54,7 @@ import {
   toggleSelection,
   trackKindForClip,
 } from "./selection";
+import type { Waveforms } from "./waveforms";
 import "./timeline.css";
 
 interface Drag {
@@ -69,6 +71,7 @@ interface Drag {
 /** Room, in pixels, the trim readout needs to sit before the dragged edge. */
 const TRIM_READOUT_ROOM = 240;
 const trackNames: Record<Track["kind"], string> = { video: "영상", audio: "오디오", text: "자막·텍스트" };
+const hasMarker = (project: Project, id: string) => project.markers.some((marker) => marker.id === id);
 
 // These visuals do not change as the playhead moves. Keep their DOM work out
 // of the playback clock while leaving all editing handlers on the live parent.
@@ -207,7 +210,13 @@ interface TimelineProps {
   selectedTrackId?: string | null;
   onTrackSelect?: (id: string) => void;
   onSelection: (ids: string[], primary?: string | null) => void;
-  onCommand: Command;
+  /**
+   * Edits are given as a function of the project: the app makes the command when
+   * its turn comes, from the project the edits before it left.
+   */
+  onCommand: EditCommand;
+  /** Waveform peaks by media id, when the project carries only their count. */
+  waveforms?: Waveforms;
   history: { canUndo: boolean; canRedo: boolean };
   playing?: boolean;
   /** The player's repeated range, drawn on the ruler. */
@@ -275,6 +284,7 @@ export default function Timeline({
   onTrackSelect,
   onSelection,
   onCommand,
+  waveforms,
   history,
   playing = false,
   loop = null,
@@ -470,38 +480,61 @@ export default function Timeline({
     setZoom(clampZoom((view > 0 ? view : 800) / Math.max(duration, 1)));
     if (workspace.current) workspace.current.scrollLeft = 0;
   };
-  const run = (method: string, params: Record<string, unknown> = {}) =>
-    onCommand(method, { ...params, expectedRevision: project.revision }).catch(
-      () => undefined,
-    );
+  /**
+   * One edit. The command is made by `build` from the project as it is when the
+   * edit is sent — after the edits still on their way have been answered — and
+   * `build` returns null when what it was for is gone by then (nothing is sent).
+   * `sentOn` receives that project, to tell what the edit added.
+   */
+  const run = (
+    method: string,
+    build: (latest: Project) => Record<string, unknown> | null,
+    sentOn?: (latest: Project) => void,
+  ) =>
+    onCommand(method, (latest) => {
+      sentOn?.(latest);
+      return build(latest);
+    }).catch(() => undefined);
+  const trackIn = (latest: Project, id: string) => latest.tracks.find((track) => track.id === id);
   const editAtPlayhead = async (action: ClipEditAction) => {
-    const commands = clipEditCommands(project, selectedIds, now(), action);
-    const result = commands.length === 1
-      ? await run(commands[0].method, commands[0].params)
-      : commands.length > 1 ? await run("edit.batch", { commands }) : undefined;
+    const at = now();
+    let basis = project;
+    const result = await run("edit.batch", (latest) => {
+      const commands = clipEditCommands(latest, presentIds(latest, selectedIds), at, action);
+      return commands.length ? { commands } : null;
+    }, (latest) => { basis = latest; });
     if (action === "split") {
-      const ids = newClipIds(project, result);
+      const ids = newClipIds(basis, result);
       if (ids.length) onSelection(ids, ids[ids.length - 1]);
     }
   };
   const createTrack = async (kind: Track["kind"], clipIds?: string[]) => {
-    const result = await run("edit.track", {
-      kind,
-      name: `${trackNames[kind]} ${project.tracks.filter((track) => track.kind === kind).length + 1}`,
-      ...(clipIds?.length ? { clipIds } : {}),
-    });
+    let basis = project;
+    const result = await run("edit.track", (latest) => {
+      const ids = clipIds && presentIds(latest, clipIds);
+      // The clips this track was for are gone: no empty track is left behind.
+      if (clipIds?.length && !ids?.length) return null;
+      return {
+        kind,
+        name: `${trackNames[kind]} ${latest.tracks.filter((track) => track.kind === kind).length + 1}`,
+        ...(ids?.length ? { clipIds: ids } : {}),
+      };
+    }, (latest) => { basis = latest; });
     if (result && typeof result === "object" && "tracks" in result && Array.isArray(result.tracks)) {
-      const added = (result.tracks as Track[]).find((track) => !project.tracks.some((existing) => existing.id === track.id));
+      const added = (result.tracks as Track[]).find((track) => !basis.tracks.some((existing) => existing.id === track.id));
       if (added) onTrackSelect?.(added.id);
     }
   };
   const moveToTrack = (trackId: string) => {
     if (!editable || !selectionKind) return;
     if (trackId === "new") { void createTrack(selectionKind, selectedIds); return; }
-    const commands = moveSelectionToTrack(project, selectedIds, trackId);
-    if (commands.length) void run("edit.batch", { commands }).then((result) => {
-      if (result) onTrackSelect?.(trackId);
-    });
+    if (moveSelectionToTrack(project, selectedIds, trackId).length)
+      void run("edit.batch", (latest) => {
+        const commands = moveSelectionToTrack(latest, presentIds(latest, selectedIds), trackId);
+        return commands.length ? { commands } : null;
+      }).then((result) => {
+        if (result) onTrackSelect?.(trackId);
+      });
   };
   const frame = (value: number) => Math.max(0, Math.round(value * project.fps) / project.fps);
   /** The closest snap target (clip edges, playhead, markers, zero) within reach. */
@@ -734,27 +767,47 @@ export default function Timeline({
     event.stopPropagation();
     event.preventDefault();
     if (event.repeat || activeDrag.current) return;
-    const target = (edge === "start" ? clip.start : clip.start + clip.duration)
-      + (event.key === "ArrowRight" ? 1 : -1) / project.fps;
-    const preview = trimClipPreview(project, clip, edge, target);
-    if (!preview) return;
-    const trimmed = { ...clip, ...preview };
-    void run("edit.trim", { id: clip.id, start: trimmed.start, end: trimmed.start + trimmed.duration });
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    // One frame from where the edge is when the edit is sent: a second press made
+    // before the first is answered moves the edge a second frame.
+    const trimmedIn = (latest: Project) => {
+      const item = latest.clips.find((candidate) => candidate.id === clip.id);
+      if (!item || trackIn(latest, item.trackId)?.locked) return null;
+      const target = (edge === "start" ? item.start : item.start + item.duration) + direction / latest.fps;
+      const preview = trimClipPreview(latest, item, edge, target);
+      return preview ? { ...item, ...preview } : null;
+    };
+    if (!trimmedIn(project)) return;
+    void run("edit.trim", (latest) => {
+      const trimmed = trimmedIn(latest);
+      return trimmed && { id: trimmed.id, start: trimmed.start, end: trimmed.start + trimmed.duration };
+    }).then((result) => {
+      // Said once the service has applied it, in the words a trim drag ends with.
+      const trimmed = (result as Project | undefined)?.clips?.find((item) => item.id === clip.id);
+      if (trimmed) setTrimNote(`${trimmed.name} · ${trimText(trimmed)}`);
+    });
   };
   const duplicate = async () => {
-    const result = await run("edit.duplicate", { ids: selectedIds });
-    const ids = newClipIds(project, result);
+    let basis = project;
+    const result = await run("edit.duplicate", (latest) => {
+      const ids = presentIds(latest, selectedIds);
+      return canEditSelection(latest, ids) ? { ids } : null;
+    }, (latest) => { basis = latest; });
+    const ids = newClipIds(basis, result);
     if (ids.length) onSelection(ids, ids[ids.length - 1]);
   };
   const remove = async (ripple = false) => {
-    const result = await run("edit.delete", { ids: selectedIds, ripple });
+    const result = await run("edit.delete", (latest) => {
+      const ids = presentIds(latest, selectedIds);
+      return canEditSelection(latest, ids) ? { ids, ripple } : null;
+    });
     if (result) onSelection([], null);
   };
   const trimming = drag && drag.mode !== "move"
     ? { ...drag.origin, ...drag.previews[drag.id], edge: drag.mode } : null;
   const trimText = (clip: Pick<Clip, "start" | "duration">) =>
     `${timecode(clip.start, project.fps)} → ${timecode(clip.start + clip.duration, project.fps)} · 길이 ${clip.duration.toFixed(2)}초`;
-  // Announced once, when a trim drag is released; the live figures stay visual.
+  // Announced once, when a trim drag is released or a keyboard trim is applied; the live figures stay visual.
   const [trimNote, setTrimNote] = useState("");
   // The transition editor closes when the pointer goes anywhere else.
   useEffect(() => {
@@ -766,9 +819,29 @@ export default function Timeline({
     return () => window.removeEventListener("pointerdown", outside, true);
   }, [transitionEdit]);
   const applyTransition = (junction: ClipJunction, transition: { type: string; duration: number } | null) => {
-    const commands = junctionTransitionCommands(project, junction, transition);
-    if (commands.length) void run("edit.batch", { commands });
+    if (!junctionTransitionCommands(project, junction, transition).length) return;
+    void run("edit.batch", (latest) => {
+      // The same two clips, where they are by then; nothing if they no longer meet.
+      const clips = latest.clips.filter((clip) => clip.trackId === junction.after.trackId);
+      const current = clipJunctions(clips, latest.fps).find(({ before, after }) =>
+        before.id === junction.before.id && after.id === junction.after.id);
+      if (!current || trackIn(latest, current.after.trackId)?.locked) return null;
+      const commands = junctionTransitionCommands(latest, current, transition);
+      return commands.length ? { commands } : null;
+    });
   };
+  const addMarker = (time: number) =>
+    void run("edit.marker", (latest) => ({ time, label: `마커 ${latest.markers.length + 1}` }));
+  /** The selected clips that are still there and editable, as `{ids}`. */
+  const selectionIn = (latest: Project, atLeast = 1) => {
+    const ids = presentIds(latest, selectedIds);
+    return ids.length >= atLeast && canEditSelection(latest, ids) ? { ids } : null;
+  };
+  const patchTrack = (id: string, patch: (track: Track) => Partial<Track>) =>
+    void run("edit.track", (latest) => {
+      const track = trackIn(latest, id);
+      return track ? { id, patch: patch(track) } : null;
+    });
   const openMenu = (event: React.MouseEvent, target: MenuTarget) => {
     event.preventDefault();
     event.stopPropagation();
@@ -785,14 +858,26 @@ export default function Timeline({
     }));
     const removeTrack = (id: string): MenuItem => {
       const track = project.tracks.find((item) => item.id === id);
-      return { label: "트랙 삭제", disabled: !track || track.locked, run: () => void run("edit.trackDelete", { id }) };
+      return {
+        label: "트랙 삭제", disabled: !track || track.locked,
+        run: () => void run("edit.trackDelete", (latest) => {
+          const target = trackIn(latest, id);
+          return target && !target.locked ? { id } : null;
+        }),
+      };
     };
     if (target.kind === "addTrack") return addTracks.map((item) => ({ ...item, separator: false }));
     if (target.kind === "track") {
       const index = project.tracks.findIndex((item) => item.id === target.id);
+      // One place up or down from where the track is when the edit is sent.
+      const moveTrack = (by: number) => void run("edit.trackMove", (latest) => {
+        const from = latest.tracks.findIndex((item) => item.id === target.id);
+        const to = from + by;
+        return from >= 0 && to >= 0 && to < latest.tracks.length ? { id: target.id, index: to } : null;
+      });
       return [
-        { label: "위로 이동", disabled: index <= 0, run: () => void run("edit.trackMove", { id: target.id, index: index - 1 }) },
-        { label: "아래로 이동", disabled: index < 0 || index === project.tracks.length - 1, run: () => void run("edit.trackMove", { id: target.id, index: index + 1 }) },
+        { label: "위로 이동", disabled: index <= 0, run: () => moveTrack(-1) },
+        { label: "아래로 이동", disabled: index < 0 || index === project.tracks.length - 1, run: () => moveTrack(1) },
         ...addTracks,
         { ...removeTrack(target.id), separator: true },
       ];
@@ -800,12 +885,13 @@ export default function Timeline({
     if (target.kind === "empty")
       return [
         { label: "여기에 붙여넣기", hint: "⌘V", disabled: !canPaste || !onPaste, run: () => onPaste?.(target.time) },
-        { label: "마커 추가", hint: "M", run: () => void run("edit.marker", { time: target.time, label: `마커 ${project.markers.length + 1}` }) },
+        { label: "마커 추가", hint: "M", run: () => addMarker(target.time) },
         ...addTracks,
         removeTrack(target.trackId),
       ];
     const clip = project.clips.find((item) => item.id === target.id);
     const at = frame(now());
+    let basis = project;
     const frozen = !!clip && clip.kind === "video" && editable &&
       at - clip.start >= 1 / project.fps - 1e-7 && clip.start + clip.duration - at >= 1 / project.fps - 1e-7;
     return [
@@ -816,8 +902,14 @@ export default function Timeline({
       { label: "재생 헤드에서 나누기", hint: "⌘B", separator: true, disabled: !cutCount, run: () => void editAtPlayhead("split") },
       {
         label: "재생 헤드에 정지 프레임 넣기", disabled: !frozen,
-        run: () => void run("edit.freeze", { id: target.id, time: at }).then((result) => {
-          const ids = newClipIds(project, result);
+        run: () => void run("edit.freeze", (latest) => {
+          basis = latest;
+          const item = latest.clips.find((candidate) => candidate.id === target.id);
+          const inside = !!item && item.kind === "video" && !trackIn(latest, item.trackId)?.locked &&
+            at - item.start >= 1 / latest.fps - 1e-7 && item.start + item.duration - at >= 1 / latest.fps - 1e-7;
+          return inside ? { id: target.id, time: at } : null;
+        }).then((result) => {
+          const ids = newClipIds(basis, result);
           const still = (result as Project | undefined)?.clips?.find((item) => ids.includes(item.id) && item.kind === "image");
           if (still) onSelection([still.id], still.id);
         }),
@@ -901,7 +993,7 @@ export default function Timeline({
           <button
             title="그룹 만들기 (⌘G)"
             disabled={!editable || selectedIds.length < 2}
-            onClick={() => void run("edit.group", { ids: selectedIds })}
+            onClick={() => void run("edit.group", (latest) => selectionIn(latest, 2))}
           >
             <Link2 size={16} />
           </button>
@@ -913,19 +1005,14 @@ export default function Timeline({
                 (clip) => typeof clip.groupId === "string",
               )
             }
-            onClick={() => void run("edit.ungroup", { ids: selectedIds })}
+            onClick={() => void run("edit.ungroup", (latest) => selectionIn(latest))}
           >
             <Unlink2 size={16} />
           </button>
           <i />
           <button
             title="마커 추가 (M)"
-            onClick={() =>
-              void run("edit.marker", {
-                time: now(),
-                label: `마커 ${project.markers.length + 1}`,
-              })
-            }
+            onClick={() => addMarker(now())}
           >
             <Flag size={16} />
           </button>
@@ -996,7 +1083,7 @@ export default function Timeline({
                   aria-pressed={selectedTrackId === track.id}>
                   {track.kind === "text" ? <Type size={15} /> : track.kind === "audio" ? <Music2 size={15} /> : <Film size={15} />}
                 </button>
-                <TrackName track={track} onRename={(name) => void run("edit.track", { id: track.id, patch: { name } })} />
+                <TrackName track={track} onRename={(name) => patchTrack(track.id, () => ({ name }))} />
               </div>
               {/* Only the switches that mean something for this kind of track. */}
               <div className="track-switches">
@@ -1005,7 +1092,7 @@ export default function Timeline({
                   title={track.locked ? "트랙 잠금 해제" : "트랙 잠금"}
                   aria-label={`${track.name} 잠금`}
                   aria-pressed={!!track.locked}
-                  onClick={() => void run("edit.track", { id: track.id, patch: { locked: !track.locked } })}
+                  onClick={() => patchTrack(track.id, () => ({ locked: !track.locked }))}
                 >
                   {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
                 </button>
@@ -1015,7 +1102,7 @@ export default function Timeline({
                     title={track.hidden ? "트랙 표시" : "트랙 숨기기"}
                     aria-label={`${track.name} 표시`}
                     aria-pressed={!track.hidden}
-                    onClick={() => void run("edit.track", { id: track.id, patch: { hidden: !track.hidden } })}
+                    onClick={() => patchTrack(track.id, () => ({ hidden: !track.hidden }))}
                   >
                     {track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}
                   </button>
@@ -1026,7 +1113,7 @@ export default function Timeline({
                     title={track.muted ? "음소거 해제" : "음소거"}
                     aria-label={`${track.name} 음소거`}
                     aria-pressed={!!track.muted}
-                    onClick={() => void run("edit.track", { id: track.id, patch: { muted: !track.muted } })}
+                    onClick={() => patchTrack(track.id, () => ({ muted: !track.muted }))}
                   >
                     {track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
                   </button>
@@ -1075,7 +1162,8 @@ export default function Timeline({
                   <input aria-label="마커 이름" defaultValue={marker.label} maxLength={80} autoFocus
                     onBlur={(event) => {
                       const label = event.target.value.trim();
-                      if (label && label !== marker.label) void run("edit.markerUpdate", { id: marker.id, label });
+                      if (label && label !== marker.label)
+                        void run("edit.markerUpdate", (latest) => hasMarker(latest, marker.id) ? { id: marker.id, label } : null);
                       if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) setMarkerEdit(null);
                     }}
                     onKeyDown={(event) => {
@@ -1086,7 +1174,7 @@ export default function Timeline({
                   <button title="마커 삭제" aria-label="마커 삭제"
                     // Keep the input focused so its blur does not send a rename ahead of the delete.
                     onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => { setMarkerEdit(null); void run("edit.markerDelete", { id: marker.id }); }}>
+                    onClick={() => { setMarkerEdit(null); void run("edit.markerDelete", (latest) => hasMarker(latest, marker.id) ? { id: marker.id } : null); }}>
                     <Trash2 size={12} />
                   </button>
                 </div>
@@ -1118,10 +1206,12 @@ export default function Timeline({
                   const compatible = media && (track.kind === "audio" ? media.hasAudio : track.kind === "video" && media.kind !== "audio");
                   if (mediaId && compatible && !track.locked) {
                     const rect = event.currentTarget.getBoundingClientRect();
-                    void run("edit.add", {
-                      mediaId,
-                      trackId: track.id,
-                      start: snapped((event.clientX - rect.left) / zoom),
+                    const start = snapped((event.clientX - rect.left) / zoom);
+                    void run("edit.add", (latest) => {
+                      const target = trackIn(latest, track.id);
+                      return target && !target.locked && latest.media.some((asset) => asset.id === mediaId)
+                        ? { mediaId, trackId: track.id, start }
+                        : null;
                     });
                   }
                 }}
@@ -1149,7 +1239,7 @@ export default function Timeline({
                       ...shown[original.id],
                     };
                     const media = project.media.find((item) => item.id === clip.mediaId);
-                    const peaks = clip.kind === "audio" ? media?.waveform : undefined;
+                    const peaks = clip.kind === "audio" && media ? media.waveform ?? waveforms?.get(media.id) : undefined;
                     const [from, to] = peaks ? waveformRange(clip, media!.duration, peaks.length) : [0, 0];
                     return (
                       <div

@@ -62,7 +62,10 @@ export default function Home({
   onOpen,
   onExample,
   onSettings,
+  reload = 0,
 }: {
+  /** Changes when the stored projects may have changed elsewhere (settings cleanup): the list is read again. */
+  reload?: number;
   /** The project the editor already holds: opening it only leaves the home screen. */
   currentId: string;
   /** A project to leave out of the list: the untouched one the app created by itself. */
@@ -90,7 +93,7 @@ export default function Home({
   );
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, reload]);
   /** Store operations answer with the new list (or one summary); either way the grid is refreshed. */
   const act = async (id: string, method: string, params: Record<string, unknown>) => {
     setError("");

@@ -370,6 +370,32 @@ describe("panel styles", () => {
   });
 });
 
+describe("shell styles", () => {
+  const css = readFileSync("src/styles/studio.css", "utf8") as string;
+  const own = /^:root \{([^}]*)\}/m.exec(css)![1];
+  const rules = css.replace(/^:root \{[^}]*\}/m, "");
+  const names = (text: string) =>
+    Array.from(text.matchAll(/^\s*(--[a-z-]+):/gm), (match) => match[1]);
+
+  it("keeps colour literals in named tokens, out of the rules", () => {
+    expect(rules.match(/#[0-9a-fA-F]{3,8}\b|\b(rgba?|hsla?|color-mix)\(/g)).toBeNull();
+    const tokens = new Set([
+      ...names(readFileSync("src/styles/index.css", "utf8") as string),
+      ...names(own),
+    ]);
+    // A variable with a fallback is a width the app sets on the element, not a token.
+    const used = new Set(Array.from(rules.matchAll(/var\((--[a-z-]+)\)/g), (match) => match[1]));
+    expect([...used].filter((name) => !tokens.has(name))).toEqual([]);
+    // A token of the shell that nothing paints with is a leftover.
+    expect(names(own).filter((name) => !used.has(name))).toEqual([]);
+  });
+
+  it("has no rule for markup that is gone", () => {
+    for (const gone of ["assistant-orbit", "agent-explanation", "assistant-intro h2", "header p"])
+      expect(rules).not.toContain(gone);
+  });
+});
+
 describe("bundled assets", () => {
   it("ships every sticker as a 512px PNG with an alpha channel", () => {
     expect(stickers.length).toBeGreaterThanOrEqual(12);

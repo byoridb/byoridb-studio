@@ -982,12 +982,6 @@
   color: var(--secondary-ink);
   margin: 3px 0;
 }
-.inspector-hint {
-  font-size: var(--fs-supporting, 10px);
-  color: var(--muted);
-  line-height: 1.6;
-  margin: 2px 0 0;
-}
 .inspector-check input {
   width: 13px;
   height: 13px;
@@ -1224,22 +1218,8 @@
   border: 1px solid var(--control-border);
   border-radius: 3px;
 }
-.audio-presets-title,
 .frames-title {
   margin-top: 23px;
-}
-.audio-preset-row {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.audio-preset-row button {
-  justify-content: flex-start;
-  padding: 10px;
-  background: var(--control-hover);
-  border: 1px solid var(--image-track);
-  font-size: var(--fs-label, 11px);
-  color: var(--secondary-ink);
 }
 .mask-preset-art {
   height: 70px;
@@ -1874,6 +1854,20 @@
 .settings-body .storage-row dd {
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+.storage-limit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 15px;
+  font-size: var(--fs-label, 11px);
+  color: var(--muted);
+}
+.storage-limit select {
+  height: 26px;
+  padding: 2px 7px;
+  font-size: var(--fs-label, 11px);
 }
 .storage-confirm {
   flex-basis: 100%;

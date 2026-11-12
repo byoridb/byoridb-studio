@@ -16,6 +16,8 @@ export interface Media {
    * themselves then come from `media.waveform {id}`.
    */
   waveformPeaks?: number;
+  /** Sent with `waveformPeaks`: names those peaks. Other peaks, another name. */
+  waveformId?: string;
   missing?: boolean;
   proxy?: boolean;
   codec?: string;
@@ -98,6 +100,9 @@ export interface Clip {
   volume: number;
   fadeIn: number;
   fadeOut: number;
+  /** A video clip's own sound fade, in seconds; absent, the sound follows fadeIn/fadeOut. */
+  audioFadeIn?: number;
+  audioFadeOut?: number;
   transform: {
     x: number;
     y: number;
@@ -186,6 +191,17 @@ export interface Project {
 export type Command = (
   method: string,
   params?: Record<string, unknown>,
+) => Promise<unknown>;
+/**
+ * Makes an edit's parameters from the project as it is when the edit is sent, after
+ * the edits made before it have been answered. Null sends nothing (what it was for
+ * is gone); the command then resolves to undefined.
+ */
+export type CommandBuilder = (project: Project) => Record<string, unknown> | null;
+/** A command whose parameters may be made when it is sent; the app guards it with that project's revision. */
+export type EditCommand = (
+  method: string,
+  params?: Record<string, unknown> | CommandBuilder,
 ) => Promise<unknown>;
 export interface Job {
   id: string;

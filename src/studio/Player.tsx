@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Crosshair,
+  FileVideo,
   LoaderCircle,
   Maximize,
   Pause,
@@ -115,10 +116,13 @@ function MediaElement({
     const target =
       clip.sourceIn +
       (clip.reverse ? Math.max(0, clip.duration - local) : local) * clip.speed;
+    // The sound's own fade when the clip has one, the picture's otherwise (as the renderer does).
+    const fadeIn = clip.audioFadeIn ?? clip.fadeIn;
+    const fadeOut = clip.audioFadeOut ?? clip.fadeOut;
     const fade = Math.min(
       1,
-      clip.fadeIn > 0 ? local / clip.fadeIn : 1,
-      clip.fadeOut > 0 ? (clip.duration - local) / clip.fadeOut : 1,
+      fadeIn > 0 ? local / fadeIn : 1,
+      fadeOut > 0 ? (clip.duration - local) / fadeOut : 1,
     );
     const volume = muted
       ? 0
@@ -225,6 +229,9 @@ export default function Player({
       });
     setLiveTransform(null);
   }, [selectedId, project.revision, size.width]);
+  // The paused frame reads lighter proxies where there are any; this reads the originals instead.
+  const [originals, setOriginals] = useState(false);
+  const hasProxy = project.media.some((media) => media.proxy);
   const frame = usePreviewFrame(
     project,
     time,
@@ -235,6 +242,8 @@ export default function Player({
       !draftActive &&
       !playbackUrl &&
       !!project.clips.length,
+    "player",
+    originals && hasProxy,
   );
   useEffect(() => {
     const element = viewport.current;
@@ -311,6 +320,14 @@ export default function Player({
             title="일부 색상·크로마키·LUT·오디오 효과는 정밀 재생에서 확인하세요."
           >
             간편 미리보기
+          </span>
+        )}
+        {!playbackUrl && !playing && !draftActive && !!frame?.proxies && (
+          <span
+            className="preview-draft-badge preview-proxy-badge"
+            title={`이 화면은 가벼운 프록시 ${frame.proxies}개로 그렸습니다 · 내보내기는 항상 원본을 씁니다`}
+          >
+            프록시
           </span>
         )}
         <span className="heading-meta">
@@ -662,6 +679,19 @@ export default function Player({
               onClick={() => onLoop(loop ? null : loopTarget ?? { start: 0, end: total })}
             >
               <Repeat size={15} />
+            </button>
+          )}
+          {hasProxy && (
+            <button
+              className={`player-loop player-originals ${originals ? "active" : ""}`}
+              aria-pressed={originals}
+              aria-label="원본으로 보기"
+              title={originals
+                ? "원본으로 보는 중 · 멈춘 화면을 원본 파일로 그립니다(느릴 수 있음). 눌러서 프록시로"
+                : "원본으로 보기 · 멈춘 화면을 프록시 대신 원본 파일로 그립니다"}
+              onClick={() => setOriginals(!originals)}
+            >
+              <FileVideo size={15} />
             </button>
           )}
           <button

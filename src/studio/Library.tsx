@@ -73,7 +73,6 @@ const tabs: { id: Tab; label: string; icon: typeof Film }[] = [
   { id: "captions", label: "자막", icon: Captions },
   { id: "filters", label: "필터", icon: Sparkles },
 ];
-const audioDefaults = { normalize: false, denoise: false, voiceEnhance: false };
 // Ids and values mirror the editor's built-in filter presets; the editor owns
 // the applied values, these copies only drive thumbnails and hover previews.
 const filters = [
@@ -612,49 +611,6 @@ export function Library({
                   소재를 타임라인으로 끌어 놓거나 +를 눌러 추가하세요.
                 </p>
               )}
-              {tab === "audio" &&
-                selected &&
-                (selected.kind === "audio" ||
-                  project.media.find((m) => m.id === selected.mediaId)
-                    ?.hasAudio) && (
-                  <>
-                    <h3 className="library-section-title audio-presets-title">
-                      오디오 다듬기
-                    </h3>
-                    <div className="audio-preset-row">
-                      <button
-                        disabled={pending !== null}
-                        onClick={() =>
-                          void patchSelected("voice", {
-                            // Only what changes when the clip has its audio settings: the service merges.
-                            audio: {
-                              ...(selected.audio ? {} : audioDefaults),
-                              denoise: true,
-                              voiceEnhance: true,
-                            },
-                          })
-                        }
-                      >
-                        <AudioLines size={17} />
-                        <span>선명한 음성</span>
-                      </button>
-                      <button
-                        disabled={pending !== null}
-                        onClick={() =>
-                          void patchSelected("normalize", {
-                            audio: {
-                              ...(selected.audio ? {} : audioDefaults),
-                              normalize: true,
-                            },
-                          })
-                        }
-                      >
-                        <SlidersHorizontal size={17} />
-                        <span>음량 정규화</span>
-                      </button>
-                    </div>
-                  </>
-                )}
             </>
           )}
           {tab === "text" && (

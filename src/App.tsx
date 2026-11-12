@@ -21,7 +21,7 @@ import {
   rpc,
   uploadFile,
 } from "./studio/api";
-import type { Clip, Command, Job, Media, Project, RuntimeStatus } from "./studio/types";
+import type { Clip, Command, CommandBuilder, EditCommand, Job, Media, Project, RuntimeStatus } from "./studio/types";
 import { durationOf } from "./studio/types";
 import {
   canEditSelection,
@@ -33,9 +33,11 @@ import {
 } from "./studio/selection";
 import Player, { type LoopRange } from "./studio/Player";
 import Home, { DEFAULT_PROJECT_NAME, EXAMPLE_PROJECT_NAME, UNNAMED, type ProjectSummary } from "./studio/Home";
-import { playbackClock, useIdleClockTime } from "./studio/playbackClock";
+import { playbackClock, runPlayback, useIdleClockTime } from "./studio/playbackClock";
+import { useWaveforms } from "./studio/waveforms";
 import { isPreviewPlaybackWaiting, primePreviewPlayback } from "./studio/mediaPlayback";
-import { clipEditCommands, overlayPlacement } from "./studio/clipEditing";
+import { clipEditCommands, overlayPlacement, presentIds as present } from "./studio/clipEditing";
+import { useCoveredInert } from "./studio/coveredInert";
 import {
   PreviewDraftContext,
   withPreviewDraft,
@@ -64,7 +66,7 @@ const flaggedKey = (project: Project | null, flag: "missing" | "proxy") =>
 /** What the service fills in without a new revision: missing files, proxies, waveforms. */
 const derivedKey = (project: Project | null) =>
   project?.media
-    .map((media) => `${media.id}:${media.missing ? 1 : 0}${media.proxy ? 1 : 0}:${media.waveform?.length ?? media.waveformPeaks ?? "-"}`)
+    .map((media) => `${media.id}:${media.missing ? 1 : 0}${media.proxy ? 1 : 0}:${media.waveform?.length ?? media.waveformPeaks ?? "-"}${media.waveformId ?? ""}`)
     .join() ?? "";
 interface Selection {
   projectId: string | null;
@@ -329,6 +331,8 @@ export default function App() {
   );
   const [assistant, setAssistant] = useState(false);
   const [settings, setSettings] = useState(false);
+  /** Counts the settings windows closed over the home screen, whose cleanup may have removed projects. */
+  const [homeReload, setHomeReload] = useState(0);
   const [exportOpen, setExportOpen] = useState(false);
   const [menu, setMenu] = useState(false);
   const [recent, setRecent] = useState<
@@ -363,6 +367,17 @@ export default function App() {
     focusInspector.current = false;
     editingSurface.current?.querySelector<HTMLElement>(".studio-inspector")?.focus();
   }, [inspectorShown]);
+  // The floating drawer hides the right of the player and the timeline as well as
+  // the inspector: nothing under it takes focus or a click.
+  useCoveredInert(
+    editingSurface,
+    () => editingSurface.current?.parentElement?.querySelector<HTMLElement>(":scope > .assistant-panel"),
+    assistant && drawer.overlay,
+    // The surface is another element after a visit to the home screen.
+    `${!!project}:${home}`,
+  );
+  // The project comes without waveforms; the timeline's are fetched once per media item.
+  const waveforms = useWaveforms(project);
   const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
   // The stored height is kept as chosen and only clamped to what fits right now.
   const timelineHeight = Math.max(200, Math.min(maxTimelineHeight, layout.timeline));
@@ -526,11 +541,16 @@ export default function App() {
   const execute = useCallback(async (
     method: string,
     /** The parameters, or for an edit a function that makes them from the project as it is when the edit is sent. */
-    given: Record<string, unknown> | ((project: Project) => Record<string, unknown> | null) = {},
+    given: Record<string, unknown> | CommandBuilder = {},
     quiet = false,
   ) => {
-    setError("");
     const build = typeof given === "function" ? given : null;
+    // Nothing is on its way, so the project on screen is the one the command would be
+    // made from: a command with nothing to do (a cut outside the clip, a clip that is
+    // gone) ends here, without touching the save state or a message that is showing.
+    if (build && !editsInFlight.current && !(current.current && build(current.current)))
+      return undefined;
+    setError("");
     const params = build ? {} : (given as Record<string, unknown>);
     const switching = ["project.new", "project.open", "project.demo"].includes(
       method,
@@ -627,9 +647,9 @@ export default function App() {
       setPending((count) => count - 1);
     }
   }, []);
-  const command: Command = useCallback((method, params) => execute(method, params), [execute]);
-  const panelCommand: Command = useCallback((method, params) => execute(method, params, true), [execute]);
-  const safeCommand: Command = useCallback(
+  const command: EditCommand = useCallback((method, params) => execute(method, params), [execute]);
+  const panelCommand: EditCommand = useCallback((method, params) => execute(method, params, true), [execute]);
+  const safeCommand: EditCommand = useCallback(
     (method, params) => command(method, params).catch(() => undefined),
     [command],
   );
@@ -790,27 +810,13 @@ export default function App() {
     const at = playbackClock.get();
     if (range ? at < range.start || at >= range.end : at >= total)
       playbackClock.seek(range?.start ?? 0);
-    let id = 0,
-      last = performance.now();
-    const tick = (now: number) => {
-      const dt = (now - last) / 1000;
-      last = now;
-      if (isPreviewPlaybackWaiting()) {
-        id = requestAnimationFrame(tick);
-        return;
-      }
-      const next = playbackClock.get() + dt;
-      const repeat = loopRef.current;
-      if (repeat && next >= repeat.end) playbackClock.seek(repeat.start);
-      else if (next >= total) {
-        playbackClock.set(total);
-        setPlaying(false);
-        return;
-      } else playbackClock.set(next);
-      id = requestAnimationFrame(tick);
-    };
-    id = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(id);
+    // Timed by the wall clock, so it goes on (and ends, and repeats) in a hidden window too.
+    return runPlayback({
+      total,
+      loop: () => loopRef.current,
+      waiting: isPreviewPlaybackWaiting,
+      onEnd: () => setPlaying(false),
+    });
   }, [playing, total]);
   useEffect(() => {
     if (!notice) return;
@@ -828,8 +834,8 @@ export default function App() {
   }, [command]);
   // The listener is registered once and reads the latest render through a ref,
   // so a key pressed right after a state change never sees stale values.
-  const live = useRef({ selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save });
-  live.current = { selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save };
+  const live = useRef({ selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save, history, pending });
+  live.current = { selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save, history, pending };
   const copySelection = useCallback(
     (cut: boolean) => {
       const active = current.current;
@@ -841,9 +847,9 @@ export default function App() {
       setClipboardProject(active.id);
       if (!cut) setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
       else
-        void safeCommand("edit.delete", {
-          ids,
-          expectedRevision: active.revision,
+        void safeCommand("edit.delete", (latest) => {
+          const remaining = present(latest, ids);
+          return canEditSelection(latest, remaining) ? { ids: remaining } : null;
         }).then((result) => {
           if (result) selectMany([], null);
         });
@@ -854,12 +860,15 @@ export default function App() {
     (at: number) => {
       const active = current.current;
       if (!active || clipboard.current?.projectId !== active.id) return;
-      void safeCommand("edit.paste", {
-        clips: clipboard.current.clips,
-        at,
-        expectedRevision: active.revision,
+      const clips = clipboard.current.clips;
+      // What the paste added is told apart from the project it was sent on, not the
+      // one on screen now: an edit still on its way may add clips of its own.
+      let basis = active;
+      void safeCommand("edit.paste", (latest) => {
+        basis = latest;
+        return { clips, at };
       }).then((result) => {
-        const ids = newClipIds(active, result);
+        const ids = newClipIds(basis, result);
         if (ids.length) selectMany(ids);
       });
     },
@@ -901,6 +910,10 @@ export default function App() {
         );
       } else if (cmd && key === "z") {
         event.preventDefault();
+        // Nothing to undo, and no edit on its way that could change that: the
+        // service would only answer with an error.
+        const { history, pending } = live.current;
+        if (!pending && !(event.shiftKey ? history.canRedo : history.canUndo)) return;
         void safeCommand(event.shiftKey ? "history.redo" : "history.undo");
       } else if (cmd && key === "s") {
         event.preventDefault();
@@ -912,26 +925,32 @@ export default function App() {
         event.preventDefault();
         if (event.repeat || event.isComposing) return;
         const action = cmd ? "split" : key === "q" ? "trim-start" : "trim-end";
-        const commands = clipEditCommands(active, selectedIds, time, action);
-        if (!commands.length) return;
-        const result = commands.length === 1
-          ? safeCommand(commands[0].method, { ...commands[0].params, expectedRevision: active.revision })
-          : safeCommand("edit.batch", { commands, expectedRevision: active.revision });
-        void result.then((updated) => {
+        // Made when it is sent: a clip moved or trimmed by an edit still on its way
+        // is cut where it then is, and one that is gone by then is left out.
+        let basis = active;
+        void safeCommand("edit.batch", (latest) => {
+          basis = latest;
+          const commands = clipEditCommands(latest, present(latest, selectedIds), time, action);
+          return commands.length ? { commands } : null;
+        }).then((updated) => {
           if (action === "split") {
-            const ids = newClipIds(active, updated);
+            const ids = newClipIds(basis, updated);
             if (ids.length) selectMany(ids, ids[ids.length - 1]);
           }
         });
       } else if (cmd && key === "d" && selectedIds.length) {
         event.preventDefault();
-        if (editable)
-          void safeCommand("edit.duplicate", { ids: selectedIds }).then(
-            (result) => {
-              const ids = newClipIds(active, result);
-              if (ids.length) selectMany(ids);
-            },
-          );
+        if (editable) {
+          let basis = active;
+          void safeCommand("edit.duplicate", (latest) => {
+            basis = latest;
+            const ids = present(latest, selectedIds);
+            return canEditSelection(latest, ids) ? { ids } : null;
+          }).then((result) => {
+            const ids = newClipIds(basis, result);
+            if (ids.length) selectMany(ids);
+          });
+        }
       } else if (
         cmd && !event.shiftKey && !event.altKey && (key === "c" || key === "x") &&
         selectedIds.length && !window.getSelection()?.toString()
@@ -945,8 +964,9 @@ export default function App() {
       } else if (cmd && key === "g" && selectedIds.length) {
         event.preventDefault();
         if (editable && (event.shiftKey || selectedIds.length > 1))
-          void safeCommand(event.shiftKey ? "edit.ungroup" : "edit.group", {
-            ids: selectedIds,
+          void safeCommand(event.shiftKey ? "edit.ungroup" : "edit.group", (latest) => {
+            const ids = present(latest, selectedIds);
+            return canEditSelection(latest, ids) && (event.shiftKey || ids.length > 1) ? { ids } : null;
           });
       } else if (
         (event.key === "Backspace" || event.key === "Delete") &&
@@ -954,9 +974,9 @@ export default function App() {
       ) {
         event.preventDefault();
         if (editable)
-          void safeCommand("edit.delete", {
-            ids: selectedIds,
-            ripple: event.shiftKey,
+          void safeCommand("edit.delete", (latest) => {
+            const ids = present(latest, selectedIds);
+            return canEditSelection(latest, ids) ? { ids, ripple: event.shiftKey } : null;
           }).then((result) => {
             if (result) selectMany([], null);
           });
@@ -1021,7 +1041,7 @@ export default function App() {
         event.preventDefault();
         seekTime(total);
       } else if (key === "m" && !cmd && !event.altKey)
-        void safeCommand("edit.marker", { time, label: "마커" });
+        void safeCommand("edit.marker", () => ({ time, label: "마커" }));
       else if ((key === "i" || key === "o") && !cmd && !event.altKey && !event.shiftKey && total) {
         // Loop range: I marks its start and O its end at the playhead.
         const at = Math.min(total, time);
@@ -1052,6 +1072,7 @@ export default function App() {
         await safeCommand("media.relink", {
           id: media.id,
           path: paths[0],
+          // Followed through this window's own edits when it is sent.
           expectedRevision: current.current?.revision,
         });
     } catch (e) {
@@ -1185,6 +1206,7 @@ export default function App() {
           onOpen={(id) => void open(id)}
           onExample={() => void example()}
           onSettings={() => setSettings(true)}
+          reload={homeReload}
         />
         {(error || busy) && (
           <div className={`studio-notification ${error ? "error" : ""}`} role={error ? "alert" : "status"}>
@@ -1198,7 +1220,13 @@ export default function App() {
           </div>
         )}
         {settings && (
-          <Settings onClose={() => setSettings(false)} onUpdate={setRuntime} />
+          <Settings
+            onClose={() => {
+              setSettings(false);
+              setHomeReload((count) => count + 1);
+            }}
+            onUpdate={setRuntime}
+          />
         )}
       </>
     );
@@ -1535,6 +1563,7 @@ export default function App() {
               selectedIds={selectedIds}
               onSelection={selectMany}
               onCommand={safeCommand}
+              waveforms={waveforms}
               history={history}
             />
           </div>

@@ -92,8 +92,95 @@ mod self_test {
     use std::time::Duration;
     use tauri::http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode};
 
+    use tauri::Manager;
+
     const REPORT_PATH: &str = "/__selftest/report";
+    /// What the native window really is (sizes, focus) and where an export may be written.
+    const WINDOW_PATH: &str = "/__selftest/window";
+    /// `?w=<logical>&h=<logical>`: the diagnosis measures the layout at several window sizes.
+    const RESIZE_PATH: &str = "/__selftest/resize";
     const DEFAULT_TIMEOUT_SECS: u64 = 240;
+
+    /// A window that is behind another one is "hidden" to WebKit: animation frames stop
+    /// and the playback clock cannot be checked. An app started by a background process
+    /// is not brought forward by macOS, so the diagnosis raises its own window.
+    pub fn bring_forward<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+        for (step, done) in [
+            ("always_on_top", window.set_always_on_top(true)),
+            ("show", window.show()),
+            ("set_focus", window.set_focus()),
+        ] {
+            if let Err(error) = done {
+                tracing::warn!("자가 진단 창을 앞으로 가져오지 못했습니다 ({step}): {error}");
+            }
+        }
+    }
+
+    fn window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> serde_json::Value {
+        let Some(window) = handle.get_webview_window("main") else {
+            return serde_json::json!({ "present": false });
+        };
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let logical = |size: tauri::Result<tauri::PhysicalSize<u32>>| {
+            size.ok().map(|size| {
+                let size = size.to_logical::<f64>(scale);
+                serde_json::json!({ "width": size.width, "height": size.height })
+            })
+        };
+        let monitor = window.current_monitor().ok().flatten().map(|monitor| {
+            let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
+            serde_json::json!({
+                "width": size.width,
+                "height": size.height,
+                "scaleFactor": monitor.scale_factor(),
+            })
+        });
+        let exports = byori_studio::service::data_root().join("exports");
+        let configured = handle.config().app.windows.first().map(|window| {
+            serde_json::json!({
+                "width": window.width,
+                "height": window.height,
+                "minWidth": window.min_width,
+                "minHeight": window.min_height,
+            })
+        });
+        serde_json::json!({
+            "present": true,
+            "configured": configured,
+            "scaleFactor": scale,
+            "inner": logical(window.inner_size()),
+            "outer": logical(window.outer_size()),
+            "visible": window.is_visible().ok(),
+            "focused": window.is_focused().ok(),
+            "minimized": window.is_minimized().ok(),
+            "alwaysOnTop": window.is_always_on_top().ok(),
+            "monitor": monitor,
+            "exportDir": std::fs::create_dir_all(&exports).is_ok().then_some(exports),
+        })
+    }
+
+    fn resize<R: tauri::Runtime>(handle: &tauri::AppHandle<R>, query: &str) -> bool {
+        let number = |name: &str| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.parse::<f64>().ok())
+                .filter(|value| (320.0..=8192.0).contains(value))
+        };
+        let (Some(width), Some(height), Some(window)) =
+            (number("w"), number("h"), handle.get_webview_window("main"))
+        else {
+            return false;
+        };
+        // Not from inside the request callback: the resize re-enters the webview's layout.
+        std::thread::spawn(move || {
+            if let Err(error) = window.set_size(tauri::LogicalSize::new(width, height)) {
+                tracing::warn!("자가 진단 창 크기를 바꾸지 못했습니다: {error}");
+            }
+        });
+        true
+    }
 
     /// Runs before any page script, so violations and errors during the first load are kept.
     const COLLECTOR: &str = r#"(function () {
@@ -185,7 +272,25 @@ mod self_test {
         builder
             .initialization_script(COLLECTOR)
             .on_web_resource_request(move |request, response| {
-                if request.method() != Method::POST || request.uri().path() != REPORT_PATH {
+                if request.method() != Method::POST {
+                    return;
+                }
+                let answer = match request.uri().path() {
+                    WINDOW_PATH => Some(window_state(&handle)),
+                    RESIZE_PATH => Some(serde_json::json!({
+                        "accepted": resize(&handle, request.uri().query().unwrap_or_default()),
+                    })),
+                    _ => None,
+                };
+                if let Some(answer) = answer {
+                    *response.status_mut() = StatusCode::OK;
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    *response.body_mut() = Cow::Owned(answer.to_string().into_bytes());
+                    return;
+                }
+                if request.uri().path() != REPORT_PATH {
                     return;
                 }
                 let last = request.uri().query().is_some_and(|q| q.contains("final=1"));
@@ -222,6 +327,75 @@ mod self_test {
     }
 }
 
+/// `kill`, a logout and a restart end the app with SIGTERM. It then leaves the way
+/// Quit does, so that the edits still waiting to be saved are written.
+///
+/// The handler is installed before anything else: until it is, SIGTERM kills the
+/// process outright, without the shutdown that saves and stops the child processes.
+#[cfg(unix)]
+mod termination {
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    struct State {
+        requested: bool,
+        app: Option<tauri::AppHandle>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State {
+        requested: false,
+        app: None,
+    });
+    /// How long a start-up that was told to stop may take to reach the event loop.
+    const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+    fn state() -> std::sync::MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn install() {
+        // Registered here, synchronously; only the waiting happens in the task.
+        let stream = tauri::async_runtime::block_on(async { signal(SignalKind::terminate()) });
+        let Ok(mut stream) = stream else {
+            return;
+        };
+        tauri::async_runtime::spawn(async move {
+            if stream.recv().await.is_none() {
+                return;
+            }
+            let app = {
+                let mut state = state();
+                state.requested = true;
+                state.app.clone()
+            };
+            if let Some(app) = app {
+                return app.exit(0);
+            }
+            // Still starting: `main` and `ready` leave as soon as they see the request.
+            // A start-up that hangs must not make the app immune to SIGTERM.
+            tokio::time::sleep(STARTUP_GRACE).await;
+            if state().app.is_none() {
+                byori_studio::runtime::kill_children_of(std::process::id());
+                byori_studio::render::remove_partial_outputs();
+                std::process::exit(0);
+            }
+        });
+    }
+
+    pub fn requested() -> bool {
+        state().requested
+    }
+
+    /// From here on the signal quits through the event loop (`RunEvent::Exit`).
+    pub fn ready(app: tauri::AppHandle) {
+        let mut state = state();
+        if state.requested {
+            app.exit(0);
+        }
+        state.app = Some(app);
+    }
+}
+
 /// Startup problems are shown to the user instead of crashing silently.
 fn fail(message: &str) -> ! {
     tracing::error!("{message}");
@@ -240,6 +414,8 @@ fn fail(message: &str) -> ! {
 }
 
 fn main() {
+    #[cfg(unix)]
+    termination::install();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -252,6 +428,14 @@ fn main() {
         Ok(service) => service,
         Err(error) => fail(&error),
     };
+    // Told to stop while the service was starting: there is no window to open any more.
+    #[cfg(unix)]
+    if termination::requested() {
+        service.shutdown();
+        byori_studio::runtime::kill_children_of(std::process::id());
+        byori_studio::render::remove_partial_outputs();
+        std::process::exit(0);
+    }
     let app = tauri::Builder::default()
         .setup(|app| {
             let demo = app.path().resource_dir()?.join("demo");
@@ -269,20 +453,22 @@ fn main() {
                 .ok_or("tauri.conf.json에 창 설정이 없습니다")?;
             let handle = app.handle().clone();
             let mut window = tauri::WebviewWindowBuilder::from_config(&handle, &config)?;
-            if let Some(path) = self_test::target() {
+            let diagnosis = self_test::target();
+            if let Some(path) = diagnosis.clone() {
                 window = self_test::attach(window, handle.clone(), path);
             }
-            window.build()?;
-            // `kill`, a logout and a restart end the app with SIGTERM. It then leaves
-            // the way Quit does, so that the edits still waiting to be saved are written.
+            let window = window.build()?;
+            if diagnosis.is_some() {
+                self_test::bring_forward(&window);
+                // Once more when the app has finished launching: an activation asked for
+                // during start-up is dropped when another app is in front.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    self_test::bring_forward(&window);
+                });
+            }
             #[cfg(unix)]
-            tauri::async_runtime::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-                    terminate.recv().await;
-                    handle.exit(0);
-                }
-            });
+            termination::ready(handle);
             Ok(())
         })
         .manage(service.connection.clone())

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from urllib.error import HTTPError
@@ -121,6 +122,14 @@ class Service:
                 self.process.wait()
         if self.process:
             self.log.close()
+
+    def kill(self):
+        """Ends the process as a crash or a forced quit would: no shutdown code runs."""
+        self.process.kill()
+        self.process.wait()
+        self.log.close()
+        # A killed service leaves its connection file; the next start must write its own.
+        (self.home / 'connection.json').unlink()
 
     def close(self):
         self.stop()
@@ -482,8 +491,79 @@ class IntegrationTests(unittest.TestCase):
         # Not part of the agent tools, so no agent token can reach them.
         tools = json.loads((REPO / 'scripts/studio-tools.json').read_text())
         allowed = {method for tool in tools['tools'] for method in tool.get('methods', [])}
-        self.assertFalse({'storage.usage', 'storage.clean'} & allowed)
+        self.assertFalse({'storage.usage', 'storage.clean', 'storage.configure'} & allowed)
         self.assertEqual(s.call('storage.clean', token='wrong')[0], 401)
+
+    def test_empty_unnamed_projects_are_reported_and_removed_only_on_request(self):
+        s = self.service
+        # What the home screen used to leave behind: projects nobody named or touched.
+        first = s.rpc('project.get')
+        template = json.loads((s.home / 'projects' / f"{first['id']}.json").read_text())
+        piled = []
+        for index in range(3):
+            copy = dict(template, id=f'project-piled-{index}', name='새 프로젝트', revision=0)
+            piled.append(s.home / 'projects' / f"{copy['id']}.json")
+            piled[-1].write_text(json.dumps(copy))
+        named = s.rpc('project.new', {'name': '여행'})
+        worked = s.rpc('edit.add', {'text': '자막', 'duration': 1, 'expectedRevision': named['revision']})
+        # The first project is as untouched as the piled ones, and no longer open.
+        expected = piled + [s.home / 'projects' / f"{first['id']}.json"]
+        usage = s.rpc('storage.usage')
+        self.assertEqual(usage['emptyProjects'], {'count': 4, 'bytes': sum(p.stat().st_size for p in expected)})
+        self.assertEqual(s.rpc('storage.clean')['emptyProjects']['count'], 4, 'not removed unless asked for')
+        self.assertTrue(all(p.is_file() for p in expected))
+        self.assertIn('정리할 수 없는 대상', s.error('storage.clean', {'targets': ['everything']}))
+        cleaned = s.rpc('storage.clean', {'targets': ['emptyProjects']})
+        self.assertEqual((cleaned['emptyProjects']['removed'], cleaned['emptyProjects']['count']), (4, 0))
+        self.assertFalse(any(p.exists() for p in expected))
+        self.assertEqual([p['id'] for p in s.rpc('project.list')], [named['id']])
+        self.assertEqual(s.rpc('project.get'), worked, 'the open project is untouched')
+        # An open project that is empty and unnamed is never offered.
+        s.rpc('project.new')
+        self.assertEqual(s.rpc('storage.usage')['emptyProjects']['count'], 0)
+        self.assertEqual(s.rpc('storage.clean', {'targets': ['emptyProjects']})['emptyProjects']['removed'], 0)
+
+    def test_proxies_are_kept_within_the_configured_limit(self):
+        s = self.service
+        self.assertEqual(s.rpc('storage.usage')['proxyLimitBytes'], 20 * 1024 ** 3)
+        # 2560 wide: large enough to get a proxy.
+        source = self.media / 'large.mp4'
+        make_video(source, seconds=1, size='2560x1440')
+        project = s.rpc('project.new', {'name': '프록시 한도'})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        media_id = project['media'][0]['id']
+        own = s.home / 'proxies' / f'{media_id}.mp4'
+        wait_for(own.is_file, 120)
+        # Proxies of projects that are not open: one used long ago, one recently.
+        stored = dict(project, id='project-elsewhere', media=[
+            dict(project['media'][0], id='media-old'), dict(project['media'][0], id='media-recent')], clips=[])
+        (s.home / 'projects/project-elsewhere.json').write_text(json.dumps(stored))
+        others = {}
+        for name, days in (('media-old', 40), ('media-recent', 1)):
+            others[name] = s.home / 'proxies' / f'{name}.mp4'
+            others[name].write_bytes(b'x' * 300_000)
+            note = others[name].with_suffix('.source')
+            note.write_text(str(source))
+            at = time.time() - days * 86400
+            os.utime(note, (at, at))
+        # Room for the open project's proxy and one of the others.
+        limit = own.stat().st_size + own.with_suffix('.source').stat().st_size + 400_000
+        configured = s.rpc('storage.configure', {'proxyLimitBytes': limit})
+        self.assertEqual(configured['proxyLimitBytes'], limit)
+        wait_for(lambda: not others['media-old'].exists(), 30)
+        self.assertFalse(others['media-old'].with_suffix('.source').exists())
+        self.assertTrue(others['media-recent'].is_file() and own.is_file())
+        # Below what the open project needs: its own proxy still stays.
+        s.rpc('storage.configure', {'proxyLimitBytes': 1})
+        wait_for(lambda: not others['media-recent'].exists(), 30)
+        self.assertTrue(own.is_file())
+        self.assertEqual(s.request(f'/assets/{media_id}/proxy')[0], 200)
+        self.assertIn('proxyLimitBytes', s.error('storage.configure', {'proxyLimitBytes': -5}))
+        # The limit outlives the service.
+        s.stop()
+        s.start()
+        self.assertEqual(s.rpc('storage.usage')['proxyLimitBytes'], 1)
+        self.assertTrue(own.is_file())
 
     def test_cover_of_a_project_that_is_not_open_is_served(self):
         s = self.service
@@ -602,6 +682,135 @@ print('TOKEN ' + c['token'], flush=True)
         self.assertEqual(cli.returncode, 0, cli.stderr)
         seen = json.loads(cli.stdout)
         self.assertEqual((seen['id'], [m['label'] for m in seen['markers']]), (project['id'], ['mcp']))
+
+
+    def texts(self, project):
+        return [clip['text']['content'] for clip in sorted(project['clips'], key=lambda c: c['start'])]
+
+    def test_killed_service_keeps_an_edit_answered_a_moment_before(self):
+        s = self.service
+        project = s.rpc('project.new', {'name': '강제 종료'})
+        project = s.rpc('edit.add', {'text': '첫 자막', 'start': 0, 'duration': 1, 'expectedRevision': project['revision']})
+        time.sleep(1.5)  # on the device by now
+        edited = s.rpc('edit.add', {'text': '죽기 직전', 'start': 1, 'duration': 1, 'expectedRevision': project['revision']})
+        s.kill()
+        saved = json.loads((s.home / 'current.json').read_text())
+        self.assertEqual(saved, edited, 'the answered edit is in the autosave')
+        s.start()
+        reopened = s.rpc('project.get')
+        self.assertEqual((reopened['id'], reopened['revision']), (edited['id'], edited['revision']))
+        self.assertEqual(self.texts(reopened), ['첫 자막', '죽기 직전'])
+        self.assertIsNone(s.rpc('project.notice')['notice'])
+        # The stored copy caught up when the service started.
+        stored = json.loads((s.home / 'projects' / f"{edited['id']}.json").read_text())
+        self.assertEqual(stored['clips'], reopened['clips'])
+
+    def test_killed_service_keeps_every_edit_of_a_burst(self):
+        s = self.service
+        project = s.rpc('project.new', {'name': '연속 편집'})
+        for index in range(17):
+            project = s.rpc('edit.add', {'text': f'자막 {index + 1}', 'start': index, 'duration': 1,
+                                         'expectedRevision': project['revision']})
+            time.sleep(0.1)
+        s.kill()
+        s.start()
+        reopened = s.rpc('project.get')
+        self.assertEqual(reopened['revision'], project['revision'])
+        self.assertEqual(self.texts(reopened), [f'자막 {index + 1}' for index in range(17)])
+        self.assertEqual(reopened['clips'], project['clips'])
+        # The same without a pause between the edits and the kill.
+        for index in range(17, 40):
+            project = s.rpc('edit.add', {'text': f'자막 {index + 1}', 'start': index, 'duration': 1,
+                                         'expectedRevision': project['revision']})
+        s.kill()
+        s.start()
+        self.assertEqual(self.texts(s.rpc('project.get')), [f'자막 {index + 1}' for index in range(40)])
+
+    def test_shutdown_keeps_edits_answered_just_before_it(self):
+        s = self.service
+        project = s.rpc('project.new', {'name': '종료'})
+        for index in range(5):
+            project = s.rpc('edit.add', {'text': f'자막 {index + 1}', 'start': index, 'duration': 1,
+                                         'expectedRevision': project['revision']})
+        began = time.time()
+        s.stop()
+        self.assertLess(time.time() - began, 5)
+        self.assertEqual(s.process.returncode, 0)
+        for file in (s.home / 'current.json', s.home / 'projects' / f"{project['id']}.json"):
+            self.assertEqual(json.loads(file.read_text()), project, file.name)
+        s.start()
+        self.assertEqual(s.rpc('project.get')['clips'], project['clips'])
+
+    def test_request_for_a_project_that_is_no_longer_open_is_refused_in_plain_words(self):
+        s = self.service
+        left = s.rpc('project.new', {'name': '먼저 열린 프로젝트'})
+        now = s.rpc('project.new', {'name': '지금 열린 프로젝트'})
+        status, _, raw = s.request('/rpc', json.dumps({'method': 'edit.add', 'projectId': left['id'], 'params': {
+            'text': '늦게 도착한 편집', 'duration': 1}}).encode(), headers={'Content-Type': 'application/json'})
+        refused = json.loads(raw)
+        self.assertEqual((status, refused['code']), (409, 'PROJECT_CHANGED'))
+        self.assertIn('다른 프로젝트가 열려 있어', refused['error'])
+        self.assertTrue(refused['error'].endswith('(PROJECT_CHANGED)'))
+        self.assertNotIn('에이전트', refused['error'])
+        self.assertEqual(s.rpc('project.get'), now)
+        self.assertEqual(s.call('project.get', project=now['id'])[0], 200)
+
+    def test_replaced_preview_frame_is_a_result_not_a_failed_request(self):
+        s = self.service
+        source = self.media / 'frames.mp4'
+        make_video(source, seconds=4, size='1920x1080')
+        project = s.rpc('project.new', {'name': '미리보기'})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        replies = {}
+
+        def frame(index, client='player', time=None):
+            at = 0.2 + index * 0.5 if time is None else time
+            replies[index] = s.call('preview.frame', {'time': at, 'width': 1280, 'client': client})
+
+        # A scrub: each request replaces the one before it.
+        requests = [threading.Thread(target=frame, args=(index,)) for index in range(6)]
+        for request in requests:
+            request.start()
+            time.sleep(0.02)
+        for request in requests:
+            request.join()
+        self.assertEqual({status for status, _ in replies.values()}, {200}, replies)
+        self.assertIn('assetId', replies[5][1])
+        replaced = [value for _, value in replies.values() if value.get('cancelled')]
+        self.assertTrue(replaced, replies)
+        for value in replaced:
+            self.assertEqual(set(value), {'cancelled', 'reason'})
+            self.assertIn('PREVIEW_CANCELLED', value['reason'])
+        # A frame for a revision the project has left is answered the same way: the
+        # window that asked will ask again for the project as it is now.
+        current = s.rpc('project.get')['revision']
+        status, behind = s.call('preview.frame', {'time': 0.2, 'width': 320, 'expectedRevision': current - 1})
+        self.assertEqual(status, 200, behind)
+        self.assertEqual(set(behind), {'cancelled', 'reason'})
+        self.assertIn('REVISION_CONFLICT', behind['reason'])
+        # A request that could never be drawn is still a failed request.
+        self.assertEqual(s.call('preview.frame', {'time': 0.2, 'expectedRevision': 'soon'})[0], 400)
+        # Playback starts: the player stops its frame; other clients are not its business.
+        self.assertEqual(s.rpc('preview.cancel', {'client': 'player'}), {'cancelled': 0})
+        for attempt in range(10):
+            replies.clear()
+            request = threading.Thread(target=frame, args=(attempt + 10, 'export', 0.33 + attempt * 0.3))
+            request.start()
+            time.sleep(0.03)
+            self.assertEqual(s.rpc('preview.cancel', {'client': 'player'}), {'cancelled': 0})
+            stopped = s.rpc('preview.cancel', {'client': 'export'})['cancelled']
+            request.join()
+            self.assertEqual(replies[attempt + 10][0], 200)
+            if stopped:
+                self.assertTrue(replies[attempt + 10][1].get('cancelled'), replies)
+                break
+        else:
+            self.fail('no frame was still being rendered when preview.cancel arrived')
+        # Stopping frames is the player's own business: agents get frames only.
+        tools = json.loads((REPO / 'scripts/studio-tools.json').read_text())
+        allowed = {method for tool in tools['tools'] for method in tool.get('methods', [])}
+        self.assertIn('preview.frame', allowed)
+        self.assertNotIn('preview.cancel', allowed)
 
 
 class StalenessCheckTests(unittest.TestCase):

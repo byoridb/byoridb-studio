@@ -1,3 +1,49 @@
+/* The shell's own colours, named by what they paint so that no rule below carries
+   a literal. The shared palette (DESIGN.md) is in index.css. */
+:root {
+  --mark-bg: #293935;
+  --mark-border: #4b5c5a;
+  --mark-ink: #a8f4d9;
+  --accent-border: #3c7773;
+  --accent-border-hover: #5c8c89;
+  --notice-bg: #293c37;
+  --notice-border: #4a6b5e;
+  --notice-ink: #d1f1e0;
+  --notice-shadow: 0 8px 24px #0005;
+  --composition-shadow: 0 4px 16px #0003;
+  --dialog-shadow: 0 20px 65px #0008;
+  --backdrop: #090d12bf;
+  /* Timeline clips: the outline, label band and ink of each track colour. */
+  --video-clip-border: #62898a;
+  --video-clip-ink: #dceff2;
+  --video-clip-label: #223f47e6;
+  --image-clip-border: #6e9aab;
+  --audio-clip-border: #5f9874;
+  --audio-clip-ink: #c4ecd5;
+  --audio-clip-label: #244031e6;
+  --audio-waveform: #98cfa8;
+  --text-clip-border: #a1895a;
+  --text-clip-ink: #fae7bf;
+  /* Service state: dots and badges. */
+  --state-idle: #a08e6c;
+  --state-online: #6acfab;
+  --online-bg: #294b42;
+  --online-border: #4b7765;
+  --online-ink: #b3e6d1;
+  --done-ink: #a2d8bd;
+  --job-ink: #cce9e1;
+  /* Assistant drawer. */
+  --chip-bg: #344b4b;
+  --chip-ink: #b9d9d6;
+  --provider-dot: #dcad85;
+  --stop-bg: #6a4b31;
+  --stop-ink: #f2d7b6;
+  --run-ink: #a4d9d1;
+  --subtle-bg: #2a3d40;
+  --subtle-ink: #b7d7d3;
+  --note-icon: #d4b97f;
+  --search-action: #a6dbd4;
+}
 .studio-app {
   display: flex;
   flex-direction: column;
@@ -43,10 +89,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #4b5c5a;
+  border: 1px solid var(--mark-border);
   border-radius: var(--radius-panel);
-  background: #293935;
-  color: #a8f4d9;
+  background: var(--mark-bg);
+  color: var(--mark-ink);
   font-size: 24px;
   font-weight: 700;
   line-height: 1;
@@ -88,7 +134,7 @@
   border: 1px solid var(--control-border);
   border-radius: var(--radius-panel);
   z-index: 60;
-  box-shadow: 0 9px 28px #0007;
+  box-shadow: var(--overlay-shadow);
 }
 .app-menu button {
   display: flex;
@@ -188,7 +234,7 @@
 .assistant-toggle.active {
   color: var(--accent);
   background: var(--accent-soft);
-  border-color: #3c7773;
+  border-color: var(--accent-border);
 }
 .icon-button {
   height: 30px;
@@ -218,11 +264,11 @@
   align-items: center;
   gap: 9px;
   padding: 10px 13px;
-  background: #293c37;
-  border: 1px solid #4a6b5e;
-  color: #d1f1e0;
+  background: var(--notice-bg);
+  border: 1px solid var(--notice-border);
+  color: var(--notice-ink);
   border-radius: var(--radius-control);
-  box-shadow: 0 8px 24px #0005;
+  box-shadow: var(--notice-shadow);
   font-size: var(--fs-label);
 }
 .studio-notification > span {
@@ -270,7 +316,7 @@
   display: grid;
   /* library | separator | player | separator | inspector; App sets the variables for chosen widths. */
   grid-template-columns: var(--library-width, minmax(282px, 28%)) 6px minmax(250px, 1fr) 6px var(--inspector-width, 278px);
-  gap: 6px;
+  gap: 0;
   min-width: 0;
   min-height: 0;
 }
@@ -358,7 +404,7 @@
   flex: none;
   overflow: hidden;
   isolation: isolate;
-  box-shadow: 0 4px 16px #0003;
+  box-shadow: var(--composition-shadow);
 }
 .composition-layer {
   position: absolute;
@@ -648,12 +694,12 @@
   height: 58px;
   overflow: hidden;
   border-radius: var(--radius-control);
-  border: 1px solid #62898a;
+  border: 1px solid var(--video-clip-border);
   background: var(--video-track);
   user-select: none;
   touch-action: none;
   cursor: grab;
-  color: #dceff2;
+  color: var(--video-clip-ink);
 }
 .timeline-clip:active {
   cursor: grabbing;
@@ -665,19 +711,19 @@
 }
 .timeline-clip.image {
   background: var(--image-track);
-  border-color: #6e9aab;
+  border-color: var(--image-clip-border);
 }
 .timeline-clip.audio {
   height: 32px;
   background: var(--audio-track);
-  border-color: #5f9874;
-  color: #c4ecd5;
+  border-color: var(--audio-clip-border);
+  color: var(--audio-clip-ink);
 }
 .timeline-clip.text {
   height: 32px;
   background: var(--text-track);
-  border-color: #a1895a;
-  color: #fae7bf;
+  border-color: var(--text-clip-border);
+  color: var(--text-clip-ink);
 }
 .clip-label {
   display: flex;
@@ -686,7 +732,7 @@
   min-width: 0;
   height: 17px;
   padding: 0 6px;
-  background: #223f47e6;
+  background: var(--video-clip-label);
   font-size: var(--fs-supporting);
   white-space: nowrap;
 }
@@ -704,7 +750,7 @@
   max-width: 100%;
   height: 15px;
   border-bottom-right-radius: var(--radius-badge);
-  background: #244031e6;
+  background: var(--audio-clip-label);
 }
 .clip-label > span {
   flex: 1;
@@ -737,7 +783,7 @@
   display: block;
   width: 2px;
   flex: 0 0 2px;
-  background: #98cfa8;
+  background: var(--audio-waveform);
   border-radius: 1px;
 }
 .clip-trim {
@@ -826,10 +872,10 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #a08e6c;
+  background: var(--state-idle);
 }
 .status-dot.online {
-  background: #6acfab;
+  background: var(--state-online);
 }
 .assistant-panel {
   width: 320px;
@@ -888,23 +934,6 @@
 .assistant-intro {
   padding-top: 12px;
 }
-.assistant-orbit {
-  margin-bottom: 18px;
-}
-.assistant-orbit .byori-mark {
-  width: 39px;
-  height: 42px;
-  border-radius: var(--radius-dialog);
-  font-size: 33px;
-}
-.assistant-intro h2 {
-  font-size: var(--fs-title);
-  line-height: 1.6;
-  letter-spacing: -0.6px;
-  font-weight: 500;
-  margin: 0 0 12px;
-  color: var(--text);
-}
 .assistant-intro > p {
   font-size: var(--fs-label);
   color: var(--muted);
@@ -931,14 +960,7 @@
   border-radius: var(--radius-control);
 }
 .suggestion-list > button:hover {
-  border-color: #5c8c89;
-}
-.agent-explanation {
-  display: block;
-  color: var(--muted);
-  font-size: var(--fs-label);
-  line-height: 1.8;
-  margin-top: 17px;
+  border-color: var(--accent-border-hover);
 }
 .assistant-compose {
   margin: 8px 12px 0;
@@ -971,9 +993,9 @@
   gap: 6px;
   padding: 3px 6px;
   font-size: var(--fs-label);
-  color: #b9d9d6;
+  color: var(--chip-ink);
   border-radius: var(--radius-badge);
-  background: #344b4b;
+  background: var(--chip-bg);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1001,7 +1023,7 @@
 .provider-dot {
   width: 6px;
   height: 6px;
-  background: #dcad85;
+  background: var(--provider-dot);
   border-radius: 50%;
   flex: none;
 }
@@ -1030,8 +1052,8 @@
   background: var(--action-hover);
 }
 .send-button.stop {
-  color: #f2d7b6;
-  background: #6a4b31;
+  color: var(--stop-ink);
+  background: var(--stop-bg);
 }
 .assistant-footnote {
   color: var(--muted);
@@ -1047,7 +1069,7 @@
   gap: 8px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--control-border);
-  color: #a4d9d1;
+  color: var(--run-ink);
   font-size: var(--fs-label);
 }
 .agent-run-heading > strong {
@@ -1080,8 +1102,8 @@
 .subtle-button {
   padding: 7px 8px;
   font-size: var(--fs-supporting);
-  color: #b7d7d3;
-  background: #2a3d40;
+  color: var(--subtle-ink);
+  background: var(--subtle-bg);
 }
 .brief-editor,
 .memory-panel {
@@ -1133,7 +1155,7 @@
 }
 .brief-note > svg {
   margin-top: 2px;
-  color: #d4b97f;
+  color: var(--note-icon);
 }
 .memory-status {
   display: flex;
@@ -1171,7 +1193,7 @@
 }
 .memory-search > button {
   padding: 4px;
-  color: #a6dbd4;
+  color: var(--search-action);
 }
 .memory-list {
   margin-bottom: 20px;
@@ -1275,7 +1297,7 @@
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: #090d12bf;
+  background: var(--backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1291,7 +1313,7 @@
   background: var(--panel-raised);
   border: 1px solid var(--control-border);
   border-radius: var(--radius-dialog);
-  box-shadow: 0 20px 65px #0008;
+  box-shadow: var(--dialog-shadow);
   overflow: hidden;
 }
 .settings-modal > header,
@@ -1313,12 +1335,6 @@
   letter-spacing: -0.3px;
   color: var(--text);
   margin: 0;
-}
-.settings-modal header p,
-.export-modal header p {
-  color: var(--muted);
-  font-size: var(--fs-label);
-  margin: 6px 0 0;
 }
 .settings-modal header > button,
 .export-modal header > button,
@@ -1364,11 +1380,6 @@
   line-height: 1.75;
   margin: 9px 0 13px;
 }
-.settings-body section > small {
-  color: var(--muted);
-  font-size: var(--fs-supporting);
-  overflow-wrap: anywhere;
-}
 .state-badge {
   display: inline-flex;
   align-items: center;
@@ -1381,9 +1392,9 @@
   white-space: nowrap;
 }
 .state-badge.online {
-  background: #294b42;
-  color: #b3e6d1;
-  border-color: #4b7765;
+  background: var(--online-bg);
+  color: var(--online-ink);
+  border-color: var(--online-border);
 }
 .settings-body dl {
   display: grid;
@@ -1422,7 +1433,7 @@
   align-items: center;
   gap: 5px;
   font-size: var(--fs-supporting);
-  color: #a2d8bd;
+  color: var(--done-ink);
 }
 .settings-body p.status-detail {
   font-size: var(--fs-supporting);
@@ -1475,7 +1486,7 @@
   display: block;
   font-size: var(--fs-label);
   font-weight: 500;
-  color: #cce9e1;
+  color: var(--job-ink);
 }
 .installation-job > pre {
   font-family: ui-monospace, "SFMono-Regular", monospace;
@@ -1530,15 +1541,6 @@
   border: 1px solid var(--control-border);
   border-radius: var(--radius-control);
   margin-bottom: 3px;
-}
-.export-preview > span {
-  font-size: var(--fs-panel);
-  color: var(--text);
-  overflow-wrap: anywhere;
-}
-.export-preview > small {
-  font-size: var(--fs-supporting);
-  color: var(--muted);
 }
 .export-options {
   display: flex;
@@ -1732,12 +1734,6 @@ progress::-moz-progress-bar {
   .assistant-intro {
     padding-top: 0;
   }
-  .assistant-intro h2 {
-    font-size: var(--fs-title);
-  }
-  .assistant-orbit {
-    margin-bottom: 12px;
-  }
   .assistant-intro > p {
     margin-bottom: 14px;
   }
@@ -1790,9 +1786,6 @@ progress::-moz-progress-bar {
 }
 
 /* Panel width separators (library | player | inspector). */
-.upper-workspace {
-  gap: 0;
-}
 .panel-resizer {
   display: flex;
   align-items: center;

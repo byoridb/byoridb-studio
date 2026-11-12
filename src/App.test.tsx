@@ -273,8 +273,9 @@ describe("Studio application", () => {
     fireEvent.keyDown(document.body, { key: "a", metaKey: true });
     fireEvent.keyDown(document.body, { key: "ArrowRight", shiftKey: true });
     fireEvent.keyDown(document.body, { key, metaKey });
+    // One clip or many, the cut is one batch made from the project it is sent on.
     await waitFor(() => expect(rpc).toHaveBeenCalledWith(
-      method, { id: "clip-1", ...bounds, expectedRevision: 1 }, "test-project",
+      "edit.batch", { commands: [{ method, params: { id: "clip-1", ...bounds } }], expectedRevision: 1 }, "test-project",
     ));
   });
   it("ignores trim shortcuts while typing, composing, repeating, or at a clip boundary", async () => {
@@ -388,6 +389,11 @@ describe("Studio application", () => {
     await screen.findByLabelText("프로젝트 이름");
     await waitFor(() => expect(historyReads).toBe(1));
     expect(screen.getByTitle("실행 취소 (⌘Z)")).toBeDisabled();
+    // With nothing to undo or redo the keys send nothing: the service would only refuse.
+    fireEvent.keyDown(window, { key: "z", code: "KeyZ", metaKey: true });
+    fireEvent.keyDown(window, { key: "z", code: "KeyZ", metaKey: true, shiftKey: true });
+    await act(async () => {});
+    expect(vi.mocked(rpc).mock.calls.filter(([method]) => /^history\.(undo|redo)$/.test(method))).toEqual([]);
 
     const file = new File(["image bytes"], "업로드.jpg", {
       type: "image/jpeg",
@@ -403,6 +409,8 @@ describe("Studio application", () => {
       expect(screen.getByTitle("실행 취소 (⌘Z)")).toBeEnabled();
     });
     expect(screen.getByText("업로드.jpg")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "z", code: "KeyZ", metaKey: true });
+    await waitFor(() => expect(vi.mocked(rpc).mock.calls.some(([method]) => method === "history.undo")).toBe(true));
   });
 
   it("ignores old-project polls started before and during a project switch", async () => {
@@ -489,7 +497,7 @@ describe("Studio application", () => {
     fireEvent.keyDown(document.body, { key: "ArrowRight", shiftKey: true });
     fireEvent.keyDown(document.body, { key: "ㅂ", code: "KeyQ" });
     await waitFor(() => expect(rpc).toHaveBeenCalledWith(
-      "edit.trim", { id: "clip-1", start: 1, expectedRevision: 1 }, "test-project",
+      "edit.batch", { commands: [{ method: "edit.trim", params: { id: "clip-1", start: 1 } }], expectedRevision: 1 }, "test-project",
     ));
     fireEvent.keyDown(document.body, { key: "ㅡ", code: "KeyM" });
     await waitFor(() => expect(rpc).toHaveBeenCalledWith(
@@ -559,6 +567,54 @@ describe("Studio application", () => {
       expect(polls).toHaveLength(2);
       await act(async () => { polls[1].resolve({ ...structuredClone(initial), revision: 2, name: "에이전트 편집" }); });
       expect(screen.getByLabelText("프로젝트 이름")).toHaveValue("에이전트 편집");
+    } finally {
+      view?.unmount();
+      vi.useRealTimers();
+    }
+  });
+  it("fetches a waveform once when the poll reports it at the same revision, and keeps it across edits", async () => {
+    vi.useFakeTimers();
+    const fallback = vi.mocked(rpc).getMockImplementation()!;
+    // The project as the service sends it to this window: the number of peaks, not the peaks.
+    const withSound = (peaks?: number, revision = 1) => {
+      const project = structuredClone(initial);
+      project.revision = revision;
+      project.media.push({ id: "sound", name: "소리.wav", path: "/tmp/sound.wav", kind: "audio", duration: 5, width: 0, height: 0, hasAudio: true, ...(peaks === undefined ? {} : { waveformPeaks: peaks }) });
+      project.tracks.push({ id: "audio-1", name: "오디오", kind: "audio", muted: false, hidden: false, locked: false });
+      project.clips.push({ ...project.clips[0], id: "clip-sound", mediaId: "sound", trackId: "audio-1", kind: "audio", name: "소리.wav" });
+      return project;
+    };
+    const polls: ((value: unknown) => void)[] = [];
+    let initialized = false;
+    vi.mocked(rpc).mockImplementation(async (method, params, projectId) => {
+      if (method === "media.waveform") return { id: "sound", waveform: [0.2, 0.4, 0.6, 0.8] };
+      if (method === "edit.marker") return withSound(4, 2);
+      if (method !== "project.get") return fallback(method, params, projectId);
+      if (!initialized) { initialized = true; return withSound(); }
+      return new Promise((resolve) => polls.push(resolve));
+    });
+    const waveformReads = () => vi.mocked(rpc).mock.calls.filter(([method]) => method === "media.waveform");
+    const bars = () => document.querySelectorAll(".clip-waveform > i").length;
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      await act(async () => { view = render(<App />); });
+      // Not computed yet: nothing to fetch, the clip is drawn without bars.
+      expect(document.querySelector(".timeline-clip.audio")).not.toBeNull();
+      expect(waveformReads()).toHaveLength(0);
+      expect(bars()).toBe(0);
+      await act(async () => { vi.advanceTimersByTime(1200); });
+      // The background worker stored the waveform: no new revision, but the project differs.
+      await act(async () => { polls[0](withSound(4)); });
+      await act(async () => {});
+      expect(waveformReads()).toEqual([["media.waveform", { id: "sound" }, "test-project"]]);
+      expect(bars()).toBe(4);
+      // An edit answers with a new project, again without the peaks: they are kept.
+      fireEvent.keyDown(document.body, { key: "m" });
+      await act(async () => {});
+      await act(async () => {});
+      expect(vi.mocked(rpc).mock.calls.some(([method]) => method === "edit.marker")).toBe(true);
+      expect(waveformReads()).toHaveLength(1);
+      expect(bars()).toBe(4);
     } finally {
       view?.unmount();
       vi.useRealTimers();
@@ -696,6 +752,222 @@ describe("Studio application", () => {
     await waitFor(() => expect(rpc).toHaveBeenCalledWith(
       "edit.delete", { ids: ["clip-2"], expectedRevision: 2 }, "test-project",
     ));
+  });
+  describe("edits made while an answer is awaited", () => {
+    /**
+     * The service's side of the edit queue: one project, every edit checked against
+     * its revision (a stale `expectedRevision` is refused, as the editor does) and
+     * answered only when the test lets it, so edits can be made while one is on its way.
+     */
+    const service = (start: Project) => {
+      let project = structuredClone(start);
+      const held: (() => void)[] = [];
+      const sent: { method: string; params: Record<string, unknown> }[] = [];
+      const refused: string[] = [];
+      let copies = 0;
+      const apply = (method: string, params: Record<string, unknown>) => {
+        const clipOf = (id: unknown) => {
+          const clip = project.clips.find((item) => item.id === id);
+          if (!clip) throw new Error("클립을 찾을 수 없습니다.");
+          return clip;
+        };
+        if (method === "edit.batch")
+          for (const command of params.commands as { method: string; params: Record<string, unknown> }[])
+            apply(command.method, command.params);
+        else if (method === "edit.update") Object.assign(clipOf(params.id), params.patch);
+        else if (method === "edit.split") {
+          const clip = clipOf(params.id), time = params.time as number;
+          if (!(time > clip.start && time < clip.start + clip.duration))
+            throw new Error("분할 위치가 클립 안에 있어야 합니다.");
+          project.clips.push({ ...clip, id: `${clip.id}-tail`, start: time, duration: clip.start + clip.duration - time });
+          clip.duration = time - clip.start;
+        } else if (method === "edit.trim") {
+          const clip = clipOf(params.id);
+          const start = (params.start as number | undefined) ?? clip.start;
+          const end = (params.end as number | undefined) ?? clip.start + clip.duration;
+          if (!(end > start)) throw new Error("클립 길이가 0보다 커야 합니다.");
+          Object.assign(clip, { start, duration: end - start });
+        } else if (method === "edit.delete") {
+          const ids = params.ids as string[];
+          ids.forEach(clipOf);
+          project.clips = project.clips.filter((clip) => !ids.includes(clip.id));
+        } else if (method === "edit.duplicate")
+          for (const id of params.ids as string[]) {
+            const clip = clipOf(id);
+            project.clips.push({ ...clip, id: `${id}-copy`, start: clip.start + clip.duration });
+          }
+        else if (method === "edit.paste")
+          for (const clip of params.clips as Project["clips"])
+            project.clips.push({ ...clip, id: `pasted-${++copies}`, start: params.at as number });
+        else throw new Error(`mock service: ${method}`);
+      };
+      const fallback = vi.mocked(rpc).getMockImplementation()!;
+      vi.mocked(rpc).mockImplementation(async (method, params = {}, projectId) => {
+        if (method === "project.get") return structuredClone(project);
+        if (!method.startsWith("edit.")) return fallback(method, params, projectId);
+        sent.push({ method, params });
+        await new Promise<void>((resolve) => held.push(resolve));
+        if (params.expectedRevision !== project.revision) {
+          refused.push(method);
+          throw new Error(`프로젝트가 변경되었습니다. (REVISION_CONFLICT: ${String(params.expectedRevision)} != ${project.revision})`);
+        }
+        const before = structuredClone(project);
+        try {
+          apply(method, params);
+        } catch (error) {
+          project = before;
+          refused.push(method);
+          throw error;
+        }
+        project.revision++;
+        return structuredClone(project);
+      });
+      return {
+        sent,
+        refused,
+        project: () => project,
+        /** Lets the oldest waiting edit through, once it has arrived. */
+        answer: async () => {
+          await waitFor(() => expect(held.length).toBeGreaterThan(0));
+          await act(async () => held.shift()!());
+        },
+        /** Nothing more arrives: every edit that was going to be sent has been. */
+        quiet: async () => {
+          await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+          expect(held).toHaveLength(0);
+        },
+      };
+    };
+    const twoSecondsIn = () => {
+      fireEvent.keyDown(document.body, { key: "ArrowRight", shiftKey: true });
+      fireEvent.keyDown(document.body, { key: "ArrowRight", shiftKey: true });
+    };
+    const open = async (start: Project) => {
+      const editor = service(start);
+      render(<App />);
+      await screen.findByLabelText("프로젝트 이름");
+      fireEvent.keyDown(document.body, { key: "a", metaKey: true });
+      return editor;
+    };
+    /** One clip from 2 s to 5 s: the playhead at 2 s sits on its edge, where nothing can be cut. */
+    const late = () => {
+      const project = structuredClone(initial);
+      project.clips[0].start = 2;
+      project.clips[0].duration = 3;
+      return project;
+    };
+
+    it("splits right after a move where the clip has moved to", async () => {
+      const editor = await open(late());
+      twoSecondsIn();
+      // A second to the left, in three steps; none has been answered yet.
+      for (let step = 0; step < 3; step++)
+        fireEvent.keyDown(document.body, { key: "ArrowLeft", altKey: true, shiftKey: true });
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      expect(editor.sent).toHaveLength(1);
+      for (let step = 0; step < 3; step++) await editor.answer();
+      await editor.answer();
+      await editor.quiet();
+      // Each step moved on from where the one before left the clip, on its revision.
+      expect(editor.sent.map(({ params }) => params.expectedRevision)).toEqual([1, 2, 3, 4]);
+      expect(editor.sent[3]).toEqual({
+        method: "edit.batch",
+        params: { commands: [{ method: "edit.split", params: { id: "clip-1", time: 2 } }], expectedRevision: 4 },
+      });
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips.map(({ id, start, duration }) => [id, +start.toFixed(3), +duration.toFixed(3)]))
+        .toEqual([["clip-1", 1, 1], ["clip-1-tail", 2, 2]]);
+      expect(screen.queryByRole("alert")).toBeNull();
+      // The new half is selected, told apart from the project the split was sent on.
+      await waitFor(() => expect(screen.getByRole("button", { name: "풍경.jpg, 2.0초, 2.0초" })).toHaveAttribute("aria-pressed", "true"));
+    });
+
+    it("does not split a clip that a move still on its way takes off the playhead", async () => {
+      const project = structuredClone(initial);
+      project.clips[0].duration = 3;
+      const editor = await open(project);
+      twoSecondsIn();
+      // On screen the playhead (2 s) is still inside the clip (0–3 s) when ⌘B is pressed.
+      for (let step = 0; step < 6; step++)
+        fireEvent.keyDown(document.body, { key: "ArrowRight", altKey: true, shiftKey: true });
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      for (let step = 0; step < 6; step++) await editor.answer();
+      await editor.quiet();
+      expect(editor.sent).toHaveLength(6);
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips).toHaveLength(1);
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("pastes right after a delete, on the revision the delete left", async () => {
+      const editor = await open(initial);
+      fireEvent.keyDown(document.body, { key: "c", metaKey: true });
+      twoSecondsIn();
+      fireEvent.keyDown(document.body, { key: "Delete" });
+      fireEvent.keyDown(document.body, { key: "v", metaKey: true });
+      expect(editor.sent.map(({ method }) => method)).toEqual(["edit.delete"]);
+      await editor.answer();
+      await editor.answer();
+      await editor.quiet();
+      expect(editor.sent.map(({ method, params }) => [method, params.expectedRevision])).toEqual([["edit.delete", 1], ["edit.paste", 2]]);
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips.map(({ id, start }) => [id, start])).toEqual([["pasted-1", 2]]);
+      expect(screen.queryByRole("alert")).toBeNull();
+      await waitFor(() => expect(screen.getByRole("button", { name: "풍경.jpg, 2.0초, 5.0초" })).toHaveAttribute("aria-pressed", "true"));
+    });
+
+    it("quietly drops a split, a duplicate and a second delete of a clip whose delete is on its way", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      fireEvent.keyDown(document.body, { key: "Delete" });
+      // The clip is still on screen: keyboard and toolbar act on it as it was.
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      fireEvent.keyDown(document.body, { key: "d", metaKey: true });
+      fireEvent.click(screen.getByTitle("선택 복제 (⌘D)"));
+      fireEvent.click(screen.getByRole("button", { name: "나누기" }));
+      fireEvent.click(screen.getByTitle("선택 삭제 (Delete)"));
+      await editor.answer();
+      await editor.quiet();
+      expect(editor.sent.map(({ method }) => method)).toEqual(["edit.delete"]);
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips).toEqual([]);
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("cuts with the toolbar where a keyboard trim still on its way leaves the clip", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      // Q: the clip now starts at the playhead (2 s). The toolbar's cut, pressed before
+      // the answer, is made from that clip: there is nothing left to cut at its edge.
+      fireEvent.keyDown(document.body, { key: "q" });
+      const cut = screen.getByRole("button", { name: "앞부분 자르기" });
+      expect(cut).toBeEnabled();
+      fireEvent.click(cut);
+      // Its other end can still be cut there... one frame further on.
+      fireEvent.keyDown(document.body, { key: "ArrowRight" });
+      fireEvent.click(screen.getByRole("button", { name: "나누기" }));
+      await editor.answer();
+      await editor.answer();
+      await editor.quiet();
+      expect(editor.sent).toEqual([
+        { method: "edit.batch", params: { commands: [{ method: "edit.trim", params: { id: "clip-1", start: 2 } }], expectedRevision: 1 } },
+        { method: "edit.batch", params: { commands: [{ method: "edit.split", params: { id: "clip-1", time: 2 + 1 / 30 } }], expectedRevision: 2 } },
+      ]);
+      expect(editor.refused).toEqual([]);
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("stops an edit made on a revision someone else has replaced", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      // An agent edits the project before this window's split reaches the service.
+      editor.project().revision = 5;
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      await editor.answer();
+      expect(editor.refused).toEqual(["edit.batch"]);
+      expect(editor.project().clips).toHaveLength(1);
+      expect(await screen.findByRole("alert")).toBeInTheDocument();
+    });
   });
   it("closes the open-project dialog with Escape", async () => {
     const fallback = vi.mocked(rpc).getMockImplementation()!;

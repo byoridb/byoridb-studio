@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import Timeline from "./Timeline";
+import TimelineView from "./Timeline";
+import { sent } from "../test/commands";
 import {
   clipGroup,
   moveSelection,
@@ -12,6 +13,14 @@ import {
   toggleSelection,
 } from "./selection";
 import type { Clip, Command, Project } from "./types";
+
+/**
+ * The timeline as the app mounts it: an edit given as a function is made from the
+ * project and sent on its revision (the app's edit queue), so `onCommand` records
+ * what reaches the service.
+ */
+const Timeline = (props: Omit<React.ComponentProps<typeof TimelineView>, "onCommand"> & { onCommand: Command }) =>
+  <TimelineView {...props} onCommand={sent(props.onCommand, () => props.project)} />;
 
 vi.mock("./api", () => ({ assetUrl: (id: string) => `/${id}` }));
 const clip = (id: string, start: number, extra: Partial<Clip> = {}): Clip => ({
@@ -359,9 +368,9 @@ describe("timeline clip editing", () => {
     fireEvent.click(screen.getByRole("button", { name: "앞부분 자르기" }));
     fireEvent.click(screen.getByRole("button", { name: "뒷부분 자르기" }));
     expect(command.mock.calls).toEqual([
-      ["edit.split", { id: "a", time: 2, expectedRevision: 7 }],
-      ["edit.trim", { id: "a", start: 2, expectedRevision: 7 }],
-      ["edit.trim", { id: "a", end: 2, expectedRevision: 7 }],
+      ["edit.batch", { commands: [{ method: "edit.split", params: { id: "a", time: 2 } }], expectedRevision: 7 }],
+      ["edit.batch", { commands: [{ method: "edit.trim", params: { id: "a", start: 2 } }], expectedRevision: 7 }],
+      ["edit.batch", { commands: [{ method: "edit.trim", params: { id: "a", end: 2 } }], expectedRevision: 7 }],
     ]);
   });
   it("cuts selected video and subtitle layers in one atomic command", () => {
@@ -495,6 +504,30 @@ describe("timeline clip editing", () => {
     expect(command.mock.calls[0][1].start - 1.01).toBeCloseTo(1 / 30, 12);
     expect(command.mock.calls[0][1].end).toBeCloseTo(3.01, 12);
     expect(command.mock.calls[0][1].expectedRevision).toBe(7);
+  });
+  it("announces a keyboard trim once the service has applied it, in the words of a trim drag", async () => {
+    const project = fixture();
+    const trimmed = { ...project, revision: 8, clips: [{ ...project.clips[0], duration: 2 + 1 / 30 }, ...project.clips.slice(1)] };
+    let answer: (value: unknown) => void = () => {};
+    const command = vi.fn().mockImplementation(() => new Promise((resolve) => { answer = resolve; }));
+    render(<Harness project={project} initial={["a"]} command={command} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "a 끝점 트림" }), { key: "ArrowRight" });
+    expect(command).toHaveBeenCalledWith("edit.trim", { id: "a", start: 1, end: 3 + 1 / 30, expectedRevision: 7 });
+    const note = document.querySelector(".trim-result")!;
+    expect(note).toHaveAttribute("aria-live", "polite");
+    // Not said before the trim is real.
+    expect(note).toBeEmptyDOMElement();
+    await act(async () => answer(trimmed));
+    expect(note).toHaveTextContent("a · 00:00:01:00 → 00:00:03:01 · 길이 2.03초");
+  });
+  it("says nothing for a keyboard trim the service refused", async () => {
+    const command = vi.fn().mockRejectedValue(new Error("거절"));
+    render(<Harness initial={["a"]} command={command} />);
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("button", { name: "a 끝점 트림" }), { key: "ArrowRight" });
+    });
+    expect(command).toHaveBeenCalledOnce();
+    expect(document.querySelector(".trim-result")).toBeEmptyDOMElement();
   });
   it("keeps editor shortcuts bubbling after a trim drag leaves the handle focused", () => {
     const command = vi.fn().mockResolvedValue(undefined);
@@ -716,6 +749,21 @@ describe("timeline basics", () => {
     expect(bars()).toHaveLength(60);
     rerender(<Timeline {...props} project={audioProject({ sourceIn: 2, duration: 3, reverse: true })} />);
     expect(bars()[0]).toBe("49%");
+  });
+
+  it("draws the waveform it is handed when the project carries only the number of peaks", () => {
+    const project = audioProject({ sourceIn: 2, duration: 3 });
+    const peaks = project.media[1].waveform!;
+    project.media[1] = { ...project.media[1], waveform: undefined, waveformPeaks: peaks.length };
+    const { container, rerender, props } = mount({ project });
+    const bars = () => Array.from(container.querySelectorAll<HTMLElement>(".clip-waveform > i")).map((bar) => bar.style.height);
+    // Not fetched yet: the clip is there, without bars.
+    expect(container.querySelector(".timeline-clip.audio")).not.toBeNull();
+    expect(bars()).toHaveLength(0);
+    rerender(<Timeline {...props} waveforms={new Map([["sound", peaks]])} />);
+    expect(bars()).toHaveLength(30);
+    expect(bars()[0]).toBe("20%");
+    expect(bars()[29]).toBe("49%");
   });
 
   it("follows the playhead during playback but not while paused", () => {

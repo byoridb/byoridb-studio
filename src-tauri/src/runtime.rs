@@ -484,6 +484,7 @@ impl Runtime {
         }
         let tokens = self.tokens.clone();
         let children = self.children.clone();
+        let editor = self.editor.clone();
         tokio::spawn(async move {
             // Keep authentication files leased until this session has stopped.
             let _mcp_lease = run.higgsfield;
@@ -496,6 +497,18 @@ impl Runtime {
             signal_group(pid, "-KILL").await;
             children.remove(pid);
             tokens.revoke(&run.token);
+            // The agent can edit no more: what it did goes to the device now, before
+            // the job is reported as finished, instead of with the next autosave.
+            let unsynced = editor.lock().await.unsynced();
+            match tokio::task::spawn_blocking(move || unsynced.sync()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!("에이전트 작업 뒤 프로젝트를 저장하지 못했습니다: {error}")
+                }
+                Err(error) => {
+                    tracing::error!("에이전트 작업 뒤 프로젝트를 저장하지 못했습니다: {error}")
+                }
+            }
             for reader in readers {
                 let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
             }
@@ -2002,6 +2015,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again["state"], "cancelled");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    /// What was edited while an agent ran is flushed to the device when its job ends,
+    /// not with the autosave some time later.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_agent_job_flushes_the_project_at_once() {
+        let (runtime, root) = runtime_fixture();
+        let unsynced = {
+            let mut editor = runtime.editor.lock().await;
+            editor.defer_saves();
+            editor.unsynced()
+        };
+        let (id, _, _) = start_script(&runtime, &root, "sleep 0.3").await;
+        let edited = runtime
+            .editor
+            .lock()
+            .await
+            .dispatch("edit.add", json!({"text":"에이전트 편집","duration":1.0}))
+            .await
+            .unwrap();
+        assert!(!unsynced.is_empty(), "written, not flushed yet");
+        let job = finished(&runtime, &id).await;
+        assert_eq!(job["state"], "completed");
+        assert!(unsynced.is_empty(), "flushed before the job was finished");
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(root.join("current.json")).unwrap()).unwrap();
+        assert_eq!(stored, edited);
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[cfg(unix)]

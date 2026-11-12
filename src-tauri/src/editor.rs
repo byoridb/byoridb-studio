@@ -5,17 +5,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// With deferred saves (`Editor::defer_saves`), an edit is written this long after
-/// the last edit, so a burst of edits (a drag) is one write once it pauses ...
+/// Every edit is in the autosave (written beside it and renamed) before it is
+/// answered, so a killed process loses no answered edit. With deferred syncing
+/// (`Editor::defer_saves`) only the flush to the device waits (see `Unsynced`): this
+/// long after the last edit, so a burst of edits (a drag) is one flush once it
+/// pauses ...
 pub const SAVE_IDLE: Duration = Duration::from_millis(300);
-/// ... and no later than this after the first unsaved edit. Together with the write
-/// itself this bounds what a crash or a forced quit can lose: the edits of about
-/// the last second, although they were answered as done. A normal quit, a project
-/// switch, `project.save` and the start of a command that keeps the editor busy
-/// (`SLOW_COMMANDS`) write at once.
+/// ... and no later than this after the first edit that is not flushed. This bounds
+/// what a power cut or a kernel panic can lose: the edits of about the last second.
+/// A normal quit, a project switch, `project.save`, the end of an agent job and the
+/// start of a command that keeps the editor busy (`SLOW_COMMANDS`) flush at once.
 pub const SAVE_LATEST: Duration = Duration::from_secs(1);
-/// Commands that probe or transcode files while they hold the editor. Nothing can
-/// be written until they return, so the edits still waiting are written first.
+/// Commands that probe or transcode files while they hold the editor; the edits
+/// before them are flushed to the device first.
 const SLOW_COMMANDS: [&str; 7] = [
     "media.import",
     "media.importAndAdd",
@@ -68,7 +70,10 @@ impl Snapshot {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+/// Replaces `path` whole: written beside it, then renamed. With `sync` the data is
+/// flushed to the device before the rename; without, it is in the system's cache,
+/// which a killed process keeps and a power cut may not.
+fn atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<(), String> {
     use std::io::Write;
     let parent = path.parent().ok_or("저장 위치가 올바르지 않습니다.")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -76,13 +81,142 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let result = (|| {
         let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
         file.write_all(data).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
+        if sync {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
         std::fs::rename(&temporary, path).map_err(|e| e.to_string())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// What `atomic_write` left beside `current.json` and the stored projects when
+/// the process died between writing and renaming (`current.tmp-<uuid>`,
+/// `projects/<id>.tmp-<uuid>`): never a project, and nothing else removes it.
+/// For startup only, when this is the one process using `root`.
+fn remove_abandoned_writes(root: &Path) {
+    for folder in [root.to_path_buf(), root.join("projects")] {
+        for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let abandoned = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| extension.strip_prefix("tmp-"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+            if abandoned && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The latest state of the open project that is in its autosave (`current.json`)
+/// but not on the device yet. Shared with the service, which flushes it without
+/// waiting for the editor: a command that keeps the editor busy cannot hold a flush
+/// back, not even at shutdown.
+///
+/// Between two flushes only the autosave is replaced, without waiting for the
+/// device. The stored project file is replaced by a flush alone, and only by a copy
+/// that is on the device already. So a killed process finds every answered edit in
+/// the autosave, and after a power cut the stored file is whole and at most
+/// `SAVE_LATEST` old, whatever became of the autosave (`Editor::new` falls back to
+/// the stored projects when it cannot read the autosave).
+#[derive(Default)]
+pub struct Unsynced {
+    waiting: std::sync::Mutex<Option<Waiting>>,
+    /// Held while the files are replaced by a flush, so that two flushes cannot
+    /// leave the older state in them.
+    flushing: std::sync::Mutex<()>,
+    /// The last flush failed. Until one succeeds the editor flushes every edit
+    /// itself, so that an edit that cannot be stored is refused instead of piling up.
+    failed: std::sync::atomic::AtomicBool,
+}
+struct Waiting {
+    /// When the first and the latest write that is not flushed yet were made.
+    first: Instant,
+    latest: Instant,
+    /// The stored project file, the autosave, and what both are to hold.
+    stored: PathBuf,
+    autosave: PathBuf,
+    data: Vec<u8>,
+}
+impl Unsynced {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Option<Waiting>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn flushing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.flushing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Notes that `autosave` holds `data` now, and `stored` does not yet.
+    fn note(&self, stored: PathBuf, autosave: PathBuf, data: &[u8]) {
+        let now = Instant::now();
+        let mut waiting = self.waiting();
+        match waiting.as_mut() {
+            Some(entry) => {
+                entry.latest = now;
+                entry.stored = stored;
+                entry.autosave = autosave;
+                entry.data.clear();
+                entry.data.extend_from_slice(data);
+            }
+            None => {
+                *waiting = Some(Waiting {
+                    first: now,
+                    latest: now,
+                    stored,
+                    autosave,
+                    data: data.to_vec(),
+                })
+            }
+        }
+    }
+
+    /// Whether nothing waits for a flush and none is under way.
+    pub fn is_empty(&self) -> bool {
+        let _flushing = self.flushing();
+        self.waiting().is_none()
+    }
+
+    /// Whether writes are waiting and it is time to flush them.
+    pub fn due(&self) -> bool {
+        self.waiting().as_ref().is_some_and(|waiting| {
+            waiting.latest.elapsed() >= SAVE_IDLE || waiting.first.elapsed() >= SAVE_LATEST
+        })
+    }
+
+    /// Puts what waits on the device, if anything: the stored project file is
+    /// replaced by a flushed copy, then the autosave is flushed as it is now (it
+    /// holds this state or a later one). What could not be flushed keeps waiting.
+    pub fn sync(&self) -> Result<(), String> {
+        let _flushing = self.flushing();
+        let Some(taken) = self.waiting().take() else {
+            return Ok(());
+        };
+        let flushed = atomic_write(&taken.stored, &taken.data, true).and_then(|()| {
+            std::fs::File::open(&taken.autosave)
+                .and_then(|autosave| autosave.sync_all())
+                .map_err(|e| format!("{}: {e}", taken.autosave.display()))
+        });
+        self.failed
+            .store(flushed.is_err(), std::sync::atomic::Ordering::Relaxed);
+        if flushed.is_err() {
+            let mut waiting = self.waiting();
+            match waiting.as_mut() {
+                // An edit made meanwhile carries a later state of the same project.
+                Some(later) => later.first = later.first.min(taken.first),
+                None => *waiting = Some(taken),
+            }
+        }
+        flushed
+    }
 }
 
 pub struct Editor {
@@ -98,14 +232,13 @@ pub struct Editor {
     waveforms: HashMap<String, Value>,
     /// Derived media state (waveform, proxy, missing) changed without a revision.
     derived_changed: bool,
-    /// Edits are written by `flush` (the service calls it when `save_due`) instead
-    /// of each on its own. Off unless `defer_saves` was called.
+    /// Edits are written at once but flushed to the device by `flush` (the service
+    /// calls it when `save_due`). Off unless `defer_saves` was called.
     deferred: bool,
-    /// When the first and the latest change that is not on disk yet were made.
-    unsaved: Option<(Instant, Instant)>,
-    /// The last write failed. Until one succeeds every edit is written at once
-    /// again, so that it fails visibly instead of piling up unsaved.
-    save_failed: bool,
+    /// What `flush` has to flush.
+    unsynced: Arc<Unsynced>,
+    /// The serialized project of the last write; kept for its allocation.
+    save_buffer: Vec<u8>,
 }
 
 impl Drop for Editor {
@@ -117,7 +250,7 @@ impl Drop for Editor {
     }
 }
 
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 const DEFAULT_PROJECT_NAME: &str = "새 프로젝트";
 /// The names a project has when the user did not give it one: this one and the
 /// one the home screen creates projects under.
@@ -150,6 +283,8 @@ const CLIP_FIELDS: &[&str] = &[
     "volume",
     "fadeIn",
     "fadeOut",
+    "audioFadeIn",
+    "audioFadeOut",
     "transform",
     "color",
     "text",
@@ -181,6 +316,30 @@ pub fn empty_project(name: &str, width: u64, height: u64, fps: f64) -> Value {
           {"id":"audio-1","name":"오디오 1","kind":"audio","muted":false,"hidden":false,"locked":false},
           {"id":"text-1","name":"텍스트 1","kind":"text","muted":false,"hidden":false,"locked":false}],
         "updatedAt":media::now()})
+}
+
+/// Whether a project is still exactly what `project.new` made without a name of
+/// its own, whatever its size and frame rate (and its revision: an edit that was
+/// undone leaves it untouched too).
+fn untouched(p: &Value) -> bool {
+    if !UNNAMED_PROJECTS.contains(&string(p, "name", "")) {
+        return false;
+    }
+    let mut fresh = empty_project(DEFAULT_PROJECT_NAME, 1920, 1080, 30.0);
+    let mut p = p.clone();
+    for own in [
+        "id",
+        "name",
+        "revision",
+        "updatedAt",
+        "width",
+        "height",
+        "fps",
+    ] {
+        fresh[own] = Value::Null;
+        p[own] = Value::Null;
+    }
+    p == fresh
 }
 
 fn safe_project_id(id: &str) -> bool {
@@ -294,9 +453,24 @@ fn round_peak(level: f64) -> f64 {
     (level * 1000.0).round() / 1000.0
 }
 
+/// Names the content of a waveform (FNV-1a over its peaks as stored, in
+/// thousandths): the same peaks always get the same name, in every process, and a
+/// file that was replaced by another of the same length gets a different one. A
+/// client that keeps fetched peaks knows by it whether they are still the ones.
+fn waveform_id(peaks: &[Value]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for peak in peaks {
+        let stored = (peak.as_f64().unwrap_or(0.0) * 1000.0).round() as i64;
+        for byte in stored.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
 /// Takes the waveforms out of a reply that carries the project (`omitWaveforms`):
-/// each media item says how many peaks it has in `waveformPeaks` instead, and
-/// `media.waveform` returns them.
+/// each media item says how many peaks it has in `waveformPeaks` and which ones in
+/// `waveformId` instead, and `media.waveform` returns them.
 pub fn omit_waveforms(reply: &mut Value) {
     fn strip(project: &mut Value) {
         for item in project
@@ -310,6 +484,7 @@ pub fn omit_waveforms(reply: &mut Value) {
             };
             if let Some(Value::Array(peaks)) = item.remove("waveform") {
                 item.insert("waveformPeaks".into(), json!(peaks.len()));
+                item.insert("waveformId".into(), json!(waveform_id(&peaks)));
             }
         }
     }
@@ -379,6 +554,9 @@ pub fn migrate_project(p: &mut Value) -> Result<(), String> {
     }
     if version < 2 {
         migrate_v1(p);
+    }
+    if version < 3 {
+        migrate_v2(p);
     }
     p["schemaVersion"] = json!(SCHEMA_VERSION);
     Ok(())
@@ -496,10 +674,24 @@ fn migrate_v1(p: &mut Value) {
     }
 }
 
+// Version 3 gave a video clip's sound its own fade (audioFadeIn/audioFadeOut).
+// A clip without them keeps fading its sound with fadeIn/fadeOut, which is what
+// every version 2 project did, so their output does not change. Nothing before
+// version 3 wrote the two fields; one found in an older file has no meaning.
+fn migrate_v2(p: &mut Value) {
+    for clip in p["clips"].as_array_mut().into_iter().flatten() {
+        if let Some(clip) = clip.as_object_mut() {
+            clip.remove(AUDIO_FADES[0].0);
+            clip.remove(AUDIO_FADES[1].0);
+        }
+    }
+}
+
 impl Editor {
     pub fn new(root: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(root.join("projects")).map_err(|e| e.to_string())?;
         let root = root.canonicalize().map_err(|e| e.to_string())?;
+        remove_abandoned_writes(&root);
         let current = root.join("current.json");
         let mut notice = None;
         let project = match load_project(&current) {
@@ -541,10 +733,10 @@ impl Editor {
             waveforms: HashMap::new(),
             derived_changed: false,
             deferred: false,
-            unsaved: None,
-            save_failed: false,
+            unsynced: Arc::default(),
+            save_buffer: Vec::new(),
         };
-        editor.write()?;
+        editor.write(true)?;
         remove_orphaned_frames(&editor.root);
         editor.refresh_missing();
         Ok(editor)
@@ -702,26 +894,6 @@ impl Editor {
     /// without a name of its own (whatever its size and frame rate): the open one
     /// first, else the most recently touched.
     fn untouched_project(&self) -> Option<String> {
-        let untouched = |p: &Value| {
-            let mut fresh = empty_project(DEFAULT_PROJECT_NAME, 1920, 1080, 30.0);
-            let mut p = p.clone();
-            if !UNNAMED_PROJECTS.contains(&string(&p, "name", "")) {
-                return false;
-            }
-            for own in [
-                "id",
-                "name",
-                "revision",
-                "updatedAt",
-                "width",
-                "height",
-                "fps",
-            ] {
-                fresh[own] = Value::Null;
-                p[own] = Value::Null;
-            }
-            p == fresh
-        };
         if untouched(&self.project) {
             return Some(self.project_id().to_owned());
         }
@@ -746,6 +918,47 @@ impl Editor {
             })
             .max()
             .map(|(_, id)| id)
+    }
+
+    /// The stored projects that hold nothing: still exactly what `project.new` made
+    /// without a name of its own. Their revision does not matter: a new project
+    /// starts one past the project that was open before it, and an edit that was
+    /// undone leaves nothing behind either. Never the open one. As (id, bytes of
+    /// its file); for `storage.usage` and `storage.clean`.
+    pub fn empty_unnamed_projects(&self) -> Vec<(String, u64)> {
+        let open = self.project_id();
+        let mut found: Vec<(String, u64)> = std::fs::read_dir(self.root.join("projects"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter_map(|entry| {
+                let bytes = std::fs::read(entry.path()).ok()?;
+                let mut p: Value = serde_json::from_slice(&bytes).ok()?;
+                migrate_project(&mut p).ok()?;
+                let id = p["id"].as_str()?.to_owned();
+                (id != open
+                    && untouched(&p)
+                    && safe_project_id(&id)
+                    && entry.path() == self.project_file(&id))
+                .then_some((id, bytes.len() as u64))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Deletes the projects `empty_unnamed_projects` names, each looked at again
+    /// first. Returns how many were deleted and the bytes of their files.
+    pub fn delete_empty_unnamed_projects(&self) -> (u64, u64) {
+        let mut removed = (0, 0);
+        for (id, bytes) in self.empty_unnamed_projects() {
+            if std::fs::remove_file(self.project_file(&id)).is_ok() {
+                let _ = std::fs::remove_dir_all(self.assets_dir(&id));
+                removed = (removed.0 + 1, removed.1 + bytes);
+            }
+        }
+        removed
     }
 
     fn list_projects(&self) -> Result<Value, String> {
@@ -924,54 +1137,75 @@ impl Editor {
         self.preview_assets.remove(id);
     }
 
-    /// Records a change of the open project: written now, or noted for `flush`
-    /// when saves are deferred.
+    /// Records a change of the open project in its files before the change is
+    /// answered. The flush to the device is left to `flush` when saves are deferred,
+    /// unless the last flush failed.
     fn persist(&mut self) -> Result<(), String> {
-        if self.deferred && !self.save_failed {
-            let now = Instant::now();
-            self.unsaved = Some((self.unsaved.map_or(now, |(first, _)| first), now));
-            return Ok(());
-        }
-        self.write()
+        let failing = self
+            .unsynced
+            .failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.write(!self.deferred || failing)
     }
 
-    /// Writes the open project to its stored file and the autosave, each replaced
-    /// whole (written beside it, synced, renamed).
-    fn write(&mut self) -> Result<(), String> {
+    /// Writes the open project, each file replaced whole (written beside it, renamed):
+    /// with `sync` to its stored file and the autosave, both flushed to the device;
+    /// without, to the autosave alone and without waiting for the device.
+    fn write(&mut self, sync: bool) -> Result<(), String> {
         let id = string(&self.project, "id", "");
         if !safe_project_id(id) {
             return Err("프로젝트 ID가 올바르지 않습니다.".into());
         }
-        let data = serde_json::to_vec_pretty(&self.project).map_err(|e| e.to_string())?;
-        let written = atomic_write(&self.project_file(id), &data)
-            .and_then(|()| atomic_write(&self.root.join("current.json"), &data));
-        self.save_failed = written.is_err();
-        if written.is_ok() {
-            self.unsaved = None;
-        }
+        let (stored, autosave) = (self.project_file(id), self.root.join("current.json"));
+        let mut data = std::mem::take(&mut self.save_buffer);
+        data.clear();
+        let written = serde_json::to_writer(&mut data, &self.project)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                if !sync {
+                    // In the autosave before the answer; the stored file follows
+                    // with the flush (see `Unsynced`).
+                    atomic_write(&autosave, &data, false)?;
+                    self.unsynced.note(stored, autosave, &data);
+                    return Ok(());
+                }
+                // No flush of an earlier state may land in the files after this one.
+                let _flushing = self.unsynced.flushing();
+                atomic_write(&stored, &data, true)?;
+                atomic_write(&autosave, &data, true)?;
+                // What waited is an earlier state of this project: the project that
+                // was open before was flushed when it was left.
+                *self.unsynced.waiting() = None;
+                self.unsynced
+                    .failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            });
+        self.save_buffer = data;
         written
     }
 
-    /// Debounces saving: edits return without waiting for the disk and are written
-    /// by `flush`. The caller must call `flush` whenever `save_due` and before it
-    /// lets go of the editor; see `SAVE_IDLE` and `SAVE_LATEST` for what is at stake.
+    /// Edits still reach the project's files before they are answered, but return
+    /// without waiting for the device. The caller must call `flush` (or the shared
+    /// `unsynced().sync()`) whenever `save_due`; see `SAVE_IDLE` and `SAVE_LATEST`
+    /// for what is at stake.
     pub fn defer_saves(&mut self) {
         self.deferred = true;
     }
 
-    /// Whether changes are waiting and it is time to write them.
+    /// Whether written changes are waiting and it is time to flush them.
     pub fn save_due(&self) -> bool {
-        self.unsaved.is_some_and(|(first, latest)| {
-            latest.elapsed() >= SAVE_IDLE || first.elapsed() >= SAVE_LATEST
-        })
+        self.unsynced.due()
     }
 
-    /// Writes the changes that are not on disk yet, if any.
+    /// The files that wait for a flush, to flush them without holding the editor.
+    pub fn unsynced(&self) -> Arc<Unsynced> {
+        self.unsynced.clone()
+    }
+
+    /// Flushes the changes that are in the files but not on the device yet, if any.
     pub fn flush(&mut self) -> Result<(), String> {
-        if self.unsaved.is_none() {
-            return Ok(());
-        }
-        self.write()
+        self.unsynced.sync()
     }
 
     fn expected(&self, params: &Value) -> Result<(), String> {
@@ -1027,7 +1261,7 @@ impl Editor {
         project["revision"] = json!(self.project["revision"].as_u64().unwrap_or(0) + 1);
         project["updatedAt"] = json!(media::now());
         let before = std::mem::replace(&mut self.project, project);
-        if let Err(e) = self.write() {
+        if let Err(e) = self.write(true) {
             self.project = before;
             return Err(e);
         }
@@ -1071,7 +1305,11 @@ impl Editor {
                     .find(|m| m["id"] == id)
                     .ok_or("소재를 찾을 수 없습니다.")?;
                 // null until the background work has filled it in.
-                Ok(json!({"id":id,"waveform":item["waveform"]}))
+                let mut reply = json!({"id":id,"waveform":item["waveform"]});
+                if let Some(peaks) = item["waveform"].as_array() {
+                    reply["waveformId"] = json!(waveform_id(peaks));
+                }
+                Ok(reply)
             }
             "project.get" => {
                 self.refresh_missing();
@@ -1251,7 +1489,7 @@ impl Editor {
                 Ok(opened)
             }
             "project.save" => {
-                self.write()?;
+                self.write(true)?;
                 let explicit = params["path"].as_str().map(PathBuf::from);
                 let Some(path) = explicit.or_else(|| self.file_path.clone()) else {
                     let path = self.project_file(string(&self.project, "id", ""));
@@ -1674,10 +1912,11 @@ impl Editor {
                 if commands.is_empty() || commands.len() > 500 {
                     return Err("배치 명령은 1~500개여야 합니다.".into());
                 }
-                let mut p = self.project.clone();
+                let mut list = Vec::with_capacity(commands.len());
                 for command in commands {
-                    mutate(&mut p, required(command, "method")?, &command["params"])?;
+                    list.push((required(command, "method")?, &command["params"]));
                 }
+                let p = mutate_all(&self.project, list.into_iter())?;
                 self.commit_valid(p)
             }
             m if m.starts_with("edit.") => {
@@ -1720,8 +1959,9 @@ impl Editor {
                     .map_err(|e| format!("자막 파일 읽기 실패: {e}"))?;
                 let captions = parse_srt(&content)?;
                 let mut p = self.project.clone();
+                // Checked once, by commit: a long subtitle file is many commands.
                 for (start, end, text) in captions {
-                    mutate(
+                    apply(
                         &mut p,
                         "edit.add",
                         &json!({"start":start,"duration":end-start,"text":{"content":text}}),
@@ -2179,6 +2419,40 @@ fn trim_keyframes(clip: &Value, start: f64, duration: f64) -> Value {
     json!(result)
 }
 
+/// A video clip's own sound fade and the picture fade it follows while unset.
+const AUDIO_FADES: [(&str, &str); 2] = [("audioFadeIn", "fadeIn"), ("audioFadeOut", "fadeOut")];
+
+// The sound fades of a video clip obey the rule of the picture fades: neither
+// outlasts the clip, and together they are no longer than it. Two fades of the
+// sound's own shrink by the same ratio; one beside a fade that still follows the
+// picture gives way to it, because that one is the picture's to set.
+fn fit_audio_fades(clip: &mut Value) {
+    let duration = number(clip, "duration", 0.0);
+    // Anything but a number is left for validation to refuse.
+    let own = |clip: &Value, key: &str| clip.get(key).and_then(Value::as_f64).filter(|v| *v >= 0.0);
+    for (audio, _) in AUDIO_FADES {
+        if own(clip, audio).is_some_and(|length| length > duration) {
+            clip[audio] = json!(duration);
+        }
+    }
+    let [(fade_in, picture_in), (fade_out, picture_out)] = AUDIO_FADES;
+    let following = |clip: &Value, key: &str| number(clip, key, 0.0).clamp(0.0, duration.max(0.0));
+    match (own(clip, fade_in), own(clip, fade_out)) {
+        (Some(a), Some(b)) if a + b > duration => {
+            let a = a * duration / (a + b);
+            clip[fade_in] = json!(a);
+            clip[fade_out] = json!(duration - a);
+        }
+        (Some(a), None) if a + following(clip, picture_out) > duration => {
+            clip[fade_in] = json!(duration - following(clip, picture_out));
+        }
+        (None, Some(b)) if b + following(clip, picture_in) > duration => {
+            clip[fade_out] = json!(duration - following(clip, picture_in));
+        }
+        _ => {}
+    }
+}
+
 // No fade or transition outlasts its clip, and the two never overlap: each is
 // first limited to the clip's length, and if together they are still longer than
 // the clip, both shrink by the same ratio so that they meet.
@@ -2199,6 +2473,7 @@ fn fit_clip_fades(clip: &mut Value) {
     }
     sync_transition(clip, "fadeIn", "transitionIn");
     sync_transition(clip, "fadeOut", "transitionOut");
+    fit_audio_fades(clip);
 }
 
 // New edits place clips on the project's frame grid. Stored projects are never
@@ -2252,10 +2527,10 @@ fn set_clip_length(p: &Value, clip: &mut Value, length: f64, mut snapped: f64) {
     }
     clip["duration"] = json!(snapped);
     if let Some(frames) = clip["keyframes"].as_array_mut() {
-        for frame in frames {
-            let time = number(frame, "time", 0.0);
+        for frame in frames.iter_mut().filter_map(Value::as_object_mut) {
+            let time = frame.get("time").and_then(Value::as_f64).unwrap_or(0.0);
             if time > snapped && time < snapped + 1.0 / fps {
-                frame["time"] = json!(snapped);
+                frame.insert("time".into(), json!(snapped));
             }
         }
     }
@@ -2370,7 +2645,8 @@ fn shift_track(p: &mut Value, track: &Value, from: f64, delta: f64) -> Result<()
     Ok(())
 }
 
-// fadeIn/fadeOut time the audio fade (and the picture's too for fade/dissolve);
+// fadeIn/fadeOut time the picture's fade (for fade/dissolve/zoom) and, unless the
+// clip has audioFadeIn/audioFadeOut of its own, the sound's;
 // a transition object keeps its type and always has the same length.
 fn sync_transition(clip: &mut Value, fade: &str, transition: &str) {
     if clip.get(transition).is_some_and(Value::is_object) {
@@ -2398,7 +2674,52 @@ fn filter_color(filter: &str) -> Option<Value> {
     )
 }
 
+/// One edit command on `p`, which is valid again afterwards or the command failed.
 fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
+    apply(p, method, args)?;
+    validate_project(p)
+}
+
+/// A list of edit commands on `project` as one change: the valid project they
+/// lead to, or the error and nothing changed. Checking the whole project after
+/// every command made a batch cost commands x clips (200 commands on 2000 clips:
+/// 0.44 s), so the project is checked once, after the last one. A command still
+/// fails at once for what it refuses itself (an unknown clip, a locked track).
+/// When the result is not valid the list runs again one checked command at a time
+/// to report the error of the first command that broke the project.
+fn mutate_all<'a>(
+    project: &Value,
+    commands: impl Iterator<Item = (&'a str, &'a Value)> + Clone,
+) -> Result<Value, String> {
+    // Between two commands the project has not been checked, so a later command
+    // may meet a shape it never sees otherwise (a keyframe that is a number). It
+    // must not bring the request down: whatever goes wrong in this pass, a panic
+    // included, is settled by the checked pass below.
+    let unchecked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut p = project.clone();
+        for (method, args) in commands.clone() {
+            // What a command refuses itself is the batch's answer at once.
+            if let Err(error) = apply(&mut p, method, args) {
+                return Err((error, true));
+            }
+        }
+        validate_project(&p).map(|()| p).map_err(|e| (e, false))
+    }));
+    let error = match unchecked {
+        Ok(Ok(p)) => return Ok(p),
+        Ok(Err((error, true))) => return Err(error),
+        Ok(Err((error, false))) => error,
+        Err(_) => "편집을 적용하지 못했습니다.".to_owned(),
+    };
+    let mut replay = project.clone();
+    for (method, args) in commands {
+        mutate(&mut replay, method, args)?;
+    }
+    Err(error)
+}
+
+// The command itself; what it leaves is checked by `mutate` or `mutate_all`.
+fn apply(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
     match method {
         "edit.add" => {
             let is_text = args.get("text").is_some();
@@ -2606,9 +2927,45 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 }
                 sync_transition(&mut p["clips"][index], fade, transition);
             }
+            // The sound fade of a video clip: a whole number of frames of its own,
+            // or null to follow the picture again. An audio clip has one fade only,
+            // so there the same name sets fadeIn/fadeOut.
+            let fps = number(p, "fps", 30.0);
+            for (audio, fade) in AUDIO_FADES {
+                if !patch.contains_key(audio) {
+                    continue;
+                }
+                let clip = &mut p["clips"][index];
+                let kind = string(clip, "kind", "").to_owned();
+                let on_grid = |value: &Value| match value.as_f64() {
+                    Some(length) if length.is_finite() && length >= 0.0 => {
+                        json!(snap(length, fps) + 0.0)
+                    }
+                    _ => value.clone(),
+                };
+                match kind.as_str() {
+                    "video" if clip[audio].is_null() => {
+                        clip.as_object_mut().unwrap().remove(audio);
+                    }
+                    "video" => clip[audio] = on_grid(&clip[audio]),
+                    "audio" => {
+                        let value = clip.as_object_mut().unwrap().remove(audio);
+                        if let Some(value) = value.filter(|value| !value.is_null()) {
+                            clip[fade] = on_grid(&value);
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "소리 페이드(audioFadeIn/audioFadeOut)는 영상·오디오 클립에만 쓸 수 있습니다."
+                                .into(),
+                        )
+                    }
+                }
+            }
             // A speed change keeps the clip's source span. It comes either alone or
-            // with the length that follows from it (what the inspector sends); any
-            // other length given with a speed is a resize and is taken as given.
+            // with the length that follows from it (what older inspectors sent): the
+            // two are one command with one result. Any other length given with a
+            // speed is a resize and is taken as given.
             let speed = number(&p["clips"][index], "speed", 1.0);
             let length = number(&original, "duration", 1.0);
             let retimed = patch.contains_key("speed")
@@ -2616,7 +2973,21 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 && speed > 0.0
                 && patch.get("duration").is_none_or(|wanted| {
                     wanted.as_f64().is_some_and(|wanted| {
-                        (wanted - length * number(&original, "speed", 1.0) / speed).abs() < 1e-6
+                        // From the clip's length, from its remembered span, or either
+                        // already rounded to the frame the editor will choose.
+                        let mut probe = original.clone();
+                        [
+                            length * number(&original, "speed", 1.0),
+                            source_span(p, &original),
+                        ]
+                        .into_iter()
+                        .any(|span| {
+                            probe["speed"] = json!(speed);
+                            probe["duration"] = json!(span / speed);
+                            snap_clip_length(p, &mut probe);
+                            (wanted - span / speed).abs() < 1e-6
+                                || (wanted - number(&probe, "duration", 0.0)).abs() < 1e-6
+                        })
                     })
                 });
             let mut clip = p["clips"][index].take();
@@ -2639,15 +3010,18 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 p["clips"][index] = clip;
                 // Keyframes follow the length the clip really got.
                 let ratio = number(&p["clips"][index], "duration", length) / length;
-                if !patch.contains_key("duration") && !patch.contains_key("keyframes") {
+                if !patch.contains_key("keyframes") {
                     if let Some(frames) = p["clips"][index]["keyframes"].as_array_mut() {
-                        for frame in frames {
-                            frame["time"] = json!(number(frame, "time", 0.0) * ratio);
+                        // Inside a batch an earlier command may have left a keyframe
+                        // that is not an object; the check after the batch refuses it.
+                        for frame in frames.iter_mut().filter_map(Value::as_object_mut) {
+                            let time = frame.get("time").and_then(Value::as_f64).unwrap_or(0.0);
+                            frame.insert("time".into(), json!(time * ratio));
                         }
                     }
                 }
             }
-            if patch.contains_key("duration") && !patch.contains_key("keyframes") {
+            if patch.contains_key("duration") && !retimed && !patch.contains_key("keyframes") {
                 let length = number(&p["clips"][index], "duration", 0.0);
                 if length > 0.0 && length < number(&original, "duration", 0.0) {
                     let (left, _) = split_keyframes(&original, length);
@@ -2659,6 +3033,8 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                 "duration",
                 "fadeIn",
                 "fadeOut",
+                "audioFadeIn",
+                "audioFadeOut",
                 "transitionIn",
                 "transitionOut",
             ]
@@ -2806,6 +3182,13 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
             p["clips"][i]["duration"] = json!(relative);
             p["clips"][i]["fadeOut"] = json!(0.0);
             right["fadeIn"] = json!(0.0);
+            // A sound fade of the clip's own ends at the cut as well.
+            if p["clips"][i].get("audioFadeOut").is_some() {
+                p["clips"][i]["audioFadeOut"] = json!(0.0);
+            }
+            if right.get("audioFadeIn").is_some() {
+                right["audioFadeIn"] = json!(0.0);
+            }
             fit_clip_fades(&mut p["clips"][i]);
             fit_clip_fades(&mut right);
             let (left_keys, right_keys) = split_keyframes(&clip, relative);
@@ -3099,7 +3482,7 @@ fn mutate(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
         }
         _ => return Err(format!("배치에서 지원하지 않는 편집 명령입니다: {method}")),
     }
-    validate_project(p)
+    Ok(())
 }
 
 // `p` already has `clip` split at `time`: open a gap there and hold `still` in it.
@@ -3244,11 +3627,19 @@ fn refresh_media_metadata(p: &mut Value, id: &str, asset: Value) -> Result<Value
                 if clip["stabilize"]["enabled"] == true {
                     clip["stabilize"]["enabled"] = json!(false);
                 }
-                // Audio clips only fade and have no blend mode.
-                for transition in ["transitionIn", "transitionOut"] {
+                // Audio clips only fade and have no blend mode. Their one fade is
+                // the sound's: a fade the sound had of its own becomes it.
+                for (audio, fade) in AUDIO_FADES {
+                    if let Some(length) = clip.as_object_mut().unwrap().remove(audio) {
+                        clip[fade] = length;
+                    }
+                }
+                for (transition, fade) in [("transitionIn", "fadeIn"), ("transitionOut", "fadeOut")]
+                {
                     if clip[transition].is_object() {
                         clip[transition]["type"] = json!("fade");
                     }
+                    sync_transition(clip, fade, transition);
                 }
                 clip.as_object_mut().unwrap().remove("blendMode");
             }
@@ -3413,6 +3804,17 @@ pub fn validate_project(p: &Value) -> Result<(), String> {
         bounded(c, "volume", 0.0, 4.0)?;
         bounded(c, "fadeIn", 0.0, 86400.0)?;
         bounded(c, "fadeOut", 0.0, 86400.0)?;
+        for (audio, _) in AUDIO_FADES {
+            if c.get(audio).is_some() {
+                if kind != "video" {
+                    return Err(
+                        "소리 페이드(audioFadeIn/audioFadeOut)는 영상 클립에만 따로 둘 수 있습니다."
+                            .into(),
+                    );
+                }
+                bounded(c, audio, 0.0, 86400.0)?;
+            }
+        }
         if !short_text(c.get("name")) {
             return Err("클립 이름이 올바르지 않습니다.".into());
         }
@@ -4981,9 +5383,9 @@ mod tests {
         );
         assert!(corrupt_files(&dir).is_empty());
         let p = e.dispatch("project.get", json!({})).await.unwrap();
-        assert_eq!(p["schemaVersion"], 2);
+        assert_eq!(p["schemaVersion"], SCHEMA_VERSION);
         let mut expected = legacy.clone();
-        expected["schemaVersion"] = json!(2);
+        expected["schemaVersion"] = json!(SCHEMA_VERSION);
         expected["media"][0]["missing"] = json!(true);
         expected["clips"][0]["filter"] = json!("cinematic");
         expected["clips"][0]["transitionIn"]["duration"] = json!(0.5);
@@ -5139,8 +5541,8 @@ mod tests {
         assert_eq!(p["notes"], json!([{"body":"ok"}]));
         let migrated = p.clone();
         migrate_project(&mut p).unwrap();
-        assert_eq!(p, migrated, "v2 files are left alone");
-        p["schemaVersion"] = json!(3);
+        assert_eq!(p, migrated, "files of the current version are left alone");
+        p["schemaVersion"] = json!(SCHEMA_VERSION + 1);
         assert!(migrate_project(&mut p.clone()).is_err());
         assert!(validate_project(&p).is_err());
         assert!(migrate_project(&mut json!([])).is_err());
@@ -5219,7 +5621,7 @@ mod tests {
             (second["width"].clone(), second["fps"].clone()),
             (json!(1080), json!(24.0))
         );
-        assert_eq!(second["schemaVersion"], 2);
+        assert_eq!(second["schemaVersion"], SCHEMA_VERSION);
         assert!(e.undo.is_empty());
         let second_id = second["id"].as_str().unwrap().to_owned();
         let list = e.dispatch("project.list", json!({})).await.unwrap();
@@ -6904,7 +7306,7 @@ mod tests {
         let clip = e.project["clips"][0]["id"].clone();
         e.dispatch(
             "edit.update",
-            json!({"id":clip,"patch":{"blendMode":"screen",
+            json!({"id":clip,"patch":{"blendMode":"screen","audioFadeOut":0.1,
                 "transitionIn":{"type":"wipeLeft","duration":0.25},
                 "transitionOut":{"type":"zoom","duration":0.5}}}),
         )
@@ -6917,11 +7319,13 @@ mod tests {
         let clip = &p["clips"][0];
         assert_eq!(clip["kind"], "audio");
         assert_eq!(clip["transitionIn"], json!({"type":"fade","duration":0.25}));
-        assert_eq!(clip["transitionOut"], json!({"type":"fade","duration":0.5}));
+        // The sound's own fade out is the one an audio clip keeps.
+        assert_eq!(clip["transitionOut"], json!({"type":"fade","duration":0.1}));
         assert_eq!(
             (&clip["fadeIn"], &clip["fadeOut"]),
-            (&json!(0.25), &json!(0.5))
+            (&json!(0.25), &json!(0.1))
         );
+        assert!(clip.get("audioFadeOut").is_none());
         assert!(clip.get("blendMode").is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7475,6 +7879,391 @@ mod tests {
     }
 
     #[test]
+    fn a_video_clips_sound_fade_is_its_own_and_follows_the_picture_while_unset() {
+        let update = |p: &mut Value, patch: Value| -> Result<Value, String> {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch}))?;
+            Ok(p["clips"][0].clone())
+        };
+        let mut p = trim_project("video", false, 1.0); // 30 fps, a 4 s clip
+                                                       // Unset: the clip stores nothing, the picture's fade is the sound's.
+        let clip = update(
+            &mut p,
+            json!({"transitionIn":{"type":"wipeLeft","duration":1.0}}),
+        )
+        .unwrap();
+        assert!(clip.get("audioFadeIn").is_none() && clip.get("audioFadeOut").is_none());
+        // Its own, on the frame grid; the picture's transition is untouched.
+        let clip = update(&mut p, json!({"audioFadeIn":0.26,"audioFadeOut":0.0})).unwrap();
+        assert_eq!(frames(&clip["audioFadeIn"]).round(), 8.0);
+        assert_eq!(clip["audioFadeOut"], 0.0);
+        assert_eq!(clip["fadeIn"], 1.0);
+        assert_eq!(
+            clip["transitionIn"],
+            json!({"type":"wipeLeft","duration":1.0})
+        );
+        // The picture's fade no longer moves the sound's, and the other way round.
+        let clip = update(&mut p, json!({"fadeIn":2.0,"fadeOut":1.5})).unwrap();
+        assert_eq!(frames(&clip["audioFadeIn"]).round(), 8.0);
+        assert_eq!(clip["audioFadeOut"], 0.0);
+        // Neither outlasts the clip; together they share it in proportion.
+        let clip = update(&mut p, json!({"audioFadeIn":9.0})).unwrap();
+        assert_eq!(
+            (&clip["audioFadeIn"], &clip["audioFadeOut"]),
+            (&json!(4.0), &json!(0.0))
+        );
+        let clip = update(&mut p, json!({"audioFadeIn":1.0,"audioFadeOut":7.0})).unwrap();
+        assert_eq!(
+            (&clip["audioFadeIn"], &clip["audioFadeOut"]),
+            (&json!(0.8), &json!(3.2))
+        );
+        assert_eq!(
+            (&clip["fadeIn"], &clip["fadeOut"]),
+            (&json!(2.0), &json!(1.5))
+        );
+        // A shorter clip: both pairs fit again, each on its own.
+        let clip = update(&mut p, json!({"duration":2.0})).unwrap();
+        assert_close(number(&clip, "audioFadeIn", 0.0), 0.8 * 2.0 / 2.8);
+        assert_close(number(&clip, "audioFadeOut", 0.0), 2.0 * 2.0 / 2.8);
+        assert_close(
+            number(&clip, "fadeIn", 0.0) + number(&clip, "fadeOut", 0.0),
+            2.0,
+        );
+        // One of its own beside one that follows the picture gives way to it.
+        let clip = update(&mut p, json!({"audioFadeOut":null,"audioFadeIn":2.0})).unwrap();
+        assert!(clip.get("audioFadeOut").is_none());
+        assert_close(
+            number(&clip, "audioFadeIn", 0.0) + number(&clip, "fadeOut", 0.0),
+            2.0,
+        );
+        // null: the sound follows the picture again.
+        let clip = update(&mut p, json!({"audioFadeIn":null})).unwrap();
+        assert!(clip.get("audioFadeIn").is_none());
+        validate_project(&p).unwrap();
+        // A split ends the sound's own fade at the cut, like the picture's.
+        update(&mut p, json!({"audioFadeIn":0.5,"audioFadeOut":0.5})).unwrap();
+        mutate(&mut p, "edit.split", &json!({"id":"trim-clip","time":11.0})).unwrap();
+        assert_eq!(
+            (
+                &p["clips"][0]["audioFadeIn"],
+                &p["clips"][0]["audioFadeOut"]
+            ),
+            (&json!(0.5), &json!(0.0))
+        );
+        assert_eq!(
+            (
+                &p["clips"][1]["audioFadeIn"],
+                &p["clips"][1]["audioFadeOut"]
+            ),
+            (&json!(0.0), &json!(0.5))
+        );
+        // Refused: not a length, and clips without sound.
+        for bad in [json!("1"), json!(-1.0), json!(true)] {
+            assert!(update(&mut p, json!({"audioFadeIn":bad})).is_err());
+        }
+        let text = p["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == "text")
+            .unwrap()["id"]
+            .clone();
+        let error = mutate(
+            &mut p.clone(),
+            "edit.update",
+            &json!({"id":text,"patch":{"audioFadeIn":0.5}}),
+        )
+        .unwrap_err();
+        assert!(error.contains("영상·오디오"), "{error}");
+        let mut stored = p.clone();
+        let index = stored["clips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c["kind"] == "text")
+            .unwrap();
+        stored["clips"][index]["audioFadeIn"] = json!(0.5);
+        assert!(validate_project(&stored).is_err());
+
+        // An audio clip has one fade: the same name sets it.
+        let mut p = trim_project("audio", false, 1.0);
+        let clip = update(&mut p, json!({"audioFadeIn":0.52,"audioFadeOut":1.0})).unwrap();
+        assert!(clip.get("audioFadeIn").is_none() && clip.get("audioFadeOut").is_none());
+        assert_eq!(frames(&clip["fadeIn"]).round(), 16.0);
+        assert_eq!(clip["fadeOut"], 1.0);
+        let clip = update(&mut p, json!({"audioFadeIn":null})).unwrap();
+        assert_eq!(frames(&clip["fadeIn"]).round(), 16.0);
+        validate_project(&p).unwrap();
+    }
+
+    #[test]
+    fn version_2_projects_migrate_without_changing_what_they_render() {
+        let mut p = trim_project("video", false, 1.0);
+        p["schemaVersion"] = json!(2);
+        p["clips"][0]["fadeIn"] = json!(1.0);
+        p["clips"][0]["fadeOut"] = json!(0.4);
+        p["clips"][0]["transitionIn"] = json!({"type":"slideLeft","duration":1.0});
+        let mut expected = p.clone();
+        expected["schemaVersion"] = json!(SCHEMA_VERSION);
+        migrate_project(&mut p).unwrap();
+        assert_eq!(p, expected, "only the version changes");
+        validate_project(&p).unwrap();
+        // A field that version 2 never wrote has no meaning there.
+        let mut odd = expected.clone();
+        odd["schemaVersion"] = json!(2);
+        odd["clips"][0]["audioFadeIn"] = json!("soon");
+        migrate_project(&mut odd).unwrap();
+        assert_eq!(odd, expected);
+    }
+
+    /// Inside a batch the project is not checked between commands, so a command
+    /// can meet what an earlier one left invalid. It is refused with that earlier
+    /// command's error, never a panic (which closed the connection).
+    #[tokio::test]
+    async fn a_batch_command_after_an_invalid_one_is_refused_not_a_panic() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.replace(trim_project("video", false, 1.0)).unwrap();
+        let before = e.project.clone();
+        let update = |patch: Value| json!({"method":"edit.update","params":{"id":"trim-clip","patch":patch}});
+        for (broken, next) in [
+            // Retiming rescales keyframe times; these keyframes are not objects.
+            (json!({"keyframes":[1]}), update(json!({"speed":2.0}))),
+            (
+                json!({"keyframes":["a", null]}),
+                update(json!({"duration":2.0})),
+            ),
+            // A split copies the clip, its transform and its keyframes.
+            (
+                json!({"transform":5}),
+                json!({"method":"edit.split","params":{"id":"trim-clip","time":11.0}}),
+            ),
+            (
+                json!({"keyframes":[1]}),
+                json!({"method":"edit.split","params":{"id":"trim-clip","time":11.0}}),
+            ),
+        ] {
+            let alone = mutate(
+                &mut before.clone(),
+                "edit.update",
+                &json!({"id":"trim-clip","patch":broken}),
+            )
+            .unwrap_err();
+            let error = e
+                .dispatch(
+                    "edit.batch",
+                    json!({"commands":[update(broken.clone()), next]}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error, alone, "{broken}");
+            assert_eq!(e.project, before);
+        }
+        assert!(e.undo.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A write that was cut off between its temporary file and the rename leaves
+    /// that file behind; the next start removes it and nothing else.
+    #[test]
+    fn abandoned_temporary_writes_are_removed_at_start() {
+        let dir = temp();
+        let e = Editor::new(dir.clone()).unwrap();
+        let id = e.project_id().to_owned();
+        drop(e);
+        let abandoned = [
+            dir.join(format!("current.tmp-{}", uuid::Uuid::new_v4())),
+            dir.join(format!("projects/{id}.tmp-{}", uuid::Uuid::new_v4())),
+        ];
+        let kept = [
+            dir.join("current.json.corrupt-1"),
+            dir.join("projects/notes.tmp-backup"),
+            dir.join("projects/other.json"),
+        ];
+        for file in abandoned.iter().chain(&kept) {
+            std::fs::write(file, "{").unwrap();
+        }
+        std::fs::create_dir_all(dir.join(format!("frames.tmp-{}", uuid::Uuid::new_v4()))).unwrap();
+        let reopened = Editor::new(dir.clone()).unwrap();
+        assert_eq!(reopened.project_id(), id);
+        assert!(abandoned.iter().all(|file| !file.exists()));
+        assert!(kept.iter().all(|file| file.is_file()));
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            // projects/ and the folder that only looks like a temporary file.
+            2 + usize::from(dir.join("frames").is_dir()),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `project.new` starts a project one revision past the one that was open, so
+    /// an empty project is told by what is in it, not by its revision.
+    #[tokio::test]
+    async fn an_empty_project_made_after_edits_counts_as_empty() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.dispatch("project.new", json!({"name":"여행"}))
+            .await
+            .unwrap();
+        for text in ["하나", "둘"] {
+            e.dispatch("edit.add", json!({"text":text,"start":0.0,"duration":1.0}))
+                .await
+                .unwrap();
+        }
+        let travel = e.project_id().to_owned();
+        let empty = e.dispatch("project.new", json!({})).await.unwrap();
+        assert!(empty["revision"].as_u64().unwrap() >= 3, "{empty}");
+        let empty = empty["id"].as_str().unwrap().to_owned();
+        // Open, it is not offered.
+        assert!(e
+            .empty_unnamed_projects()
+            .iter()
+            .all(|(id, _)| *id != empty));
+        e.dispatch("project.open", json!({"id":travel}))
+            .await
+            .unwrap();
+        let found = e.empty_unnamed_projects();
+        assert!(found.iter().any(|(id, _)| *id == empty), "{found:?}");
+        assert!(found.iter().all(|(id, _)| *id != travel));
+        let (removed, _) = e.delete_empty_unnamed_projects();
+        assert_eq!(removed as usize, found.len());
+        assert!(!e.project_file(&empty).exists());
+        assert!(e.project_file(&travel).is_file());
+        assert!(e.empty_unnamed_projects().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_checked_once_and_fails_with_its_first_bad_commands_error() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.replace(trim_project("video", false, 1.0)).unwrap();
+        let before = e.project.clone();
+        let saved = std::fs::read(dir.join("current.json")).unwrap();
+        let update = |patch: Value| json!({"method":"edit.update","params":{"id":"trim-clip","patch":patch}});
+        // The second command leaves an invalid clip; the third would be refused by
+        // itself. The error is the one the second command gives on its own.
+        let alone = mutate(
+            &mut before.clone(),
+            "edit.update",
+            &json!({"id":"trim-clip","patch":{"volume":9.0}}),
+        )
+        .unwrap_err();
+        let error = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})), update(json!({"volume":9.0})),
+                    update(json!({"start":-3.0}))]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, alone);
+        assert!(error.contains("volume"), "{error}");
+        // A command that refuses itself stops the batch at once.
+        let error = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})),
+                    {"method":"edit.update","params":{"id":"missing","patch":{"volume":1.0}}}]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "클립을 찾을 수 없습니다.");
+        // Nothing changed, in memory or on disk, and nothing can be undone.
+        assert_eq!(e.project, before);
+        assert_eq!(std::fs::read(dir.join("current.json")).unwrap(), saved);
+        assert!(e.undo.is_empty());
+        // The whole batch is one valid change and one undo step.
+        let after = e
+            .dispatch(
+                "edit.batch",
+                json!({"commands":[update(json!({"volume":0.5})), update(json!({"speed":2.0})),
+                    {"method":"edit.split","params":{"id":"trim-clip","time":11.0}}],
+                    "expectedRevision":before["revision"]}),
+            )
+            .await
+            .unwrap();
+        validate_project(&after).unwrap();
+        assert_eq!(after["clips"].as_array().unwrap().len(), 3);
+        assert_eq!(e.undo.len(), 1);
+        let undone = e.dispatch("history.undo", json!({})).await.unwrap();
+        assert_eq!(undone["clips"], before["clips"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_speed_alone_and_a_speed_with_its_length_are_the_same_change() {
+        let project = || {
+            let mut p = trim_project("video", false, 1.0); // 4 s at 30 fps
+            p["clips"][0]["keyframes"] = json!([
+                {"property":"scale","time":0.0,"value":1.0},
+                {"property":"scale","time":2.0,"value":1.5},
+                {"property":"scale","time":4.0,"value":2.0}
+            ]);
+            p["clips"][0]["fadeIn"] = json!(1.0);
+            p
+        };
+        let update = |p: &mut Value, patch: Value| {
+            mutate(p, "edit.update", &json!({"id":"trim-clip","patch":patch})).unwrap();
+            p["clips"][0].clone()
+        };
+        for speed in [2.0_f64, 1.7, 0.5, 0.3] {
+            let alone = update(&mut project(), json!({"speed":speed}));
+            // The length as a caller derives it, exact and rounded to a frame.
+            let exact = update(
+                &mut project(),
+                json!({"speed":speed,"duration":4.0 / speed}),
+            );
+            let rounded = update(
+                &mut project(),
+                json!({"speed":speed,"duration":(4.0 / speed * 30.0).round() / 30.0}),
+            );
+            assert_eq!(alone, exact, "speed {speed}");
+            assert_eq!(alone, rounded, "speed {speed}");
+            // Length and keyframes follow by the same ratio; nothing is cut off.
+            let length = number(&alone, "duration", 0.0);
+            assert_eq!(
+                frames(&alone["duration"]).round(),
+                (4.0 / speed * 30.0_f64).round()
+            );
+            let times: Vec<f64> = alone["keyframes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| number(k, "time", -1.0))
+                .collect();
+            assert_eq!(times.len(), 3);
+            assert_close(times[1], length / 2.0);
+            assert_close(times[2], length);
+            assert_eq!(alone["sourceSpan"], 4.0);
+        }
+        // Back again: both forms restore the length and the keyframes.
+        for with_length in [false, true] {
+            let mut p = project();
+            update(&mut p, json!({"speed":1.7}));
+            let length = number(&p["clips"][0], "duration", 0.0);
+            let patch = if with_length {
+                json!({"speed":1.0,"duration":length * 1.7})
+            } else {
+                json!({"speed":1.0})
+            };
+            let clip = update(&mut p, patch);
+            assert_eq!(clip["duration"], 4.0);
+            assert_close(number(&clip["keyframes"][1], "time", 0.0), 2.0);
+            assert_close(number(&clip["keyframes"][2], "time", 0.0), 4.0);
+        }
+        // Keyframes given with the speed are taken as given.
+        let clip = update(
+            &mut project(),
+            json!({"speed":2.0,"keyframes":[{"property":"scale","time":1.0,"value":1.2}]}),
+        );
+        assert_eq!(clip["keyframes"][0]["time"], 1.0);
+    }
+
+    #[test]
     fn a_speed_change_and_back_restores_the_length() {
         // Frames 60..180 of the timeline, 4 s of a 30 s source.
         let project = || {
@@ -7629,10 +8418,11 @@ mod tests {
         serde_json::from_slice(&std::fs::read(dir.join("current.json")).unwrap()).unwrap()
     }
 
-    /// With deferred saves an edit is in memory at once and on disk after `flush`:
-    /// due once editing pauses, written before the project is left, and on drop.
+    /// With deferred saves an edit is in the project's files before it is answered
+    /// (a killed process keeps it); only the flush to the device waits: due once
+    /// editing pauses, done before the project is left, and on drop.
     #[tokio::test]
-    async fn deferred_saves_are_flushed_when_due_before_a_switch_and_on_drop() {
+    async fn deferred_saves_are_written_at_once_and_flushed_when_due() {
         let dir = temp();
         let mut e = Editor::new(dir.clone()).unwrap();
         e.defer_saves();
@@ -7646,12 +8436,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(added["revision"], 1);
-        assert_eq!(stored(&dir)["revision"], 0, "not written yet");
+        assert_eq!(stored(&dir), added, "written before the reply");
+        assert!(!e.unsynced.is_empty(), "the flush is what waits");
+        // The stored file is replaced by a flush only, by a copy that is on the device.
+        let in_store: Value =
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap();
+        assert_eq!(in_store["revision"], 0);
         assert!(!e.save_due(), "not while editing goes on");
         std::thread::sleep(SAVE_IDLE + Duration::from_millis(20));
         assert!(e.save_due());
         e.flush().unwrap();
-        assert!(!e.save_due());
+        assert!(!e.save_due() && e.unsynced.is_empty());
         assert_eq!(stored(&dir), added);
         assert_eq!(
             serde_json::from_slice::<Value>(&std::fs::read(e.project_file(&first)).unwrap())
@@ -7663,19 +8458,27 @@ mod tests {
         e.dispatch("project.update", json!({"patch":{"name":"이름"}}))
             .await
             .unwrap();
-        e.unsaved = e
-            .unsaved
-            .map(|(first, latest)| (first - SAVE_LATEST, latest));
+        assert!(!e.save_due());
+        e.unsynced.waiting().as_mut().unwrap().first -= SAVE_LATEST;
         assert!(e.save_due());
+        // The shared handle flushes without the editor.
+        let unsynced = e.unsynced();
+        unsynced.sync().unwrap();
+        assert!(!e.save_due() && e.unsynced.is_empty());
+        e.dispatch("project.update", json!({"patch":{"name":"이름"}}))
+            .await
+            .unwrap();
         // The list shows the open project as it is, not as it was last written.
         let list = e.dispatch("project.list", json!({})).await.unwrap();
         assert_eq!(list[0]["name"], "이름");
 
-        // Leaving the project writes it first; opening it again reads all of it.
+        // Leaving the project flushes it first; opening it again reads all of it.
         let renamed = e.project.clone();
+        assert!(!e.unsynced.is_empty());
         e.dispatch("project.new", json!({"name":"다른 프로젝트"}))
             .await
             .unwrap();
+        assert!(e.unsynced.is_empty(), "both projects are on the device");
         assert_eq!(stored(&dir)["name"], "다른 프로젝트");
         let reopened = e
             .dispatch("project.open", json!({"id":first}))
@@ -7684,7 +8487,7 @@ mod tests {
         assert_eq!(reopened["clips"], renamed["clips"]);
         assert_eq!(reopened["name"], "이름");
 
-        // Undo and a reopen of the open project keep unsaved edits too.
+        // Undo and a reopen of the open project keep the latest edits too.
         e.dispatch("edit.add", json!({"text":"둘","start":2.0,"duration":1.0}))
             .await
             .unwrap();
@@ -7697,15 +8500,17 @@ mod tests {
             .dispatch("edit.add", json!({"text":"셋","start":4.0,"duration":1.0}))
             .await
             .unwrap();
-        assert_eq!(stored(&dir)["clips"].as_array().unwrap().len(), 2);
+        assert_eq!(stored(&dir), last);
+        let unsynced = e.unsynced();
+        assert!(!unsynced.is_empty());
         drop(e);
-        assert_eq!(stored(&dir), last, "written when the editor goes away");
+        assert!(unsynced.is_empty(), "flushed when the editor goes away");
+        assert_eq!(stored(&dir), last);
         assert_eq!(Editor::new(dir.clone()).unwrap().project, last);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `project.new` must not take the open project for an untouched one because
-    /// its file has not caught up with an edit yet.
+    /// `project.new` must not take an edited project for an untouched one.
     #[tokio::test]
     async fn a_new_project_keeps_an_edited_one_whose_save_is_still_waiting() {
         let dir = temp();
@@ -7716,11 +8521,7 @@ mod tests {
             .dispatch("edit.add", json!({"text":"사용자 자막","duration":1.0}))
             .await
             .unwrap();
-        assert_eq!(
-            stored(&dir)["revision"],
-            0,
-            "the file is still the empty one"
-        );
+        assert_eq!(stored(&dir), edited);
         let fresh = e.dispatch("project.new", json!({})).await.unwrap();
         assert_ne!(fresh["id"], json!(first));
         assert_eq!(fresh["clips"], json!([]));
@@ -7737,10 +8538,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A command that keeps the editor busy for long writes the waiting edits before
-    /// it starts: the autosave cannot get at the editor until it returns.
+    /// A command that keeps the editor busy for long flushes the edits before it to
+    /// the device when it starts.
     #[tokio::test]
-    async fn slow_commands_write_waiting_edits_before_they_start() {
+    async fn slow_commands_flush_waiting_edits_before_they_start() {
         for (method, params) in [
             ("media.import", json!({"paths":["/nonexistent/clip.mp4"]})),
             (
@@ -7762,34 +8563,54 @@ mod tests {
                 .dispatch("edit.add", json!({"text":"중요한 편집","duration":1.0}))
                 .await
                 .unwrap();
-            assert_eq!(stored(&dir)["revision"], 0);
+            assert_eq!(stored(&dir), edited);
+            assert!(!e.unsynced.is_empty());
             // Whatever becomes of the command itself.
-            let _ = e.dispatch(method, params).await;
+            let failed = e.dispatch(method, params).await.is_err();
+            assert!(failed && e.unsynced.is_empty(), "{method}");
             assert_eq!(stored(&dir), edited, "{method}");
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
-    /// A failed write is not silent: the edits stay in memory, and until a write
-    /// succeeds every further edit is written at once and refused when it cannot be.
+    /// A failed write is not silent. An edit that cannot reach the autosave is
+    /// refused and leaves no trace. When the flush to the stored file fails nothing
+    /// answered is lost, and until a flush succeeds every further edit is flushed at
+    /// once and refused when it cannot be.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_failed_deferred_save_makes_later_edits_fail_visibly_until_it_succeeds() {
+    async fn an_edit_that_cannot_be_written_is_refused_with_deferred_saves_too() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp();
         let mut e = Editor::new(dir.clone()).unwrap();
         e.defer_saves();
-        let writable = |on: bool| {
+        let first = e.project["id"].as_str().unwrap().to_owned();
+        let writable = |folder: &Path, on: bool| {
             let mode = if on { 0o700 } else { 0o500 };
-            std::fs::set_permissions(dir.join("projects"), std::fs::Permissions::from_mode(mode))
-                .unwrap();
+            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let in_store = |e: &Editor| -> Value {
+            serde_json::from_slice(&std::fs::read(e.project_file(&first)).unwrap()).unwrap()
         };
         let add = json!({"text":"자막","duration":1.0});
         let kept = e.dispatch("edit.add", add.clone()).await.unwrap();
-        writable(false);
+        assert_eq!(stored(&dir), kept);
+
+        // The autosave cannot be replaced: the edit is refused.
+        writable(&dir, false);
+        assert!(e.dispatch("edit.add", add.clone()).await.is_err());
+        writable(&dir, true);
+        assert_eq!(e.project, kept);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(stored(&dir), kept);
+
+        // The stored file cannot be replaced: the flush fails and keeps waiting.
+        writable(&dir.join("projects"), false);
         assert!(e.flush().is_err());
+        assert!(!e.unsynced.is_empty());
         assert_eq!(e.project, kept, "the edit is not lost");
-        assert!(e.unsaved.is_some() && e.save_failed);
+        assert_eq!(stored(&dir), kept);
+        assert_eq!(in_store(&e)["revision"], 0);
         assert!(e.dispatch("edit.add", add.clone()).await.is_err());
         assert_eq!(e.project, kept);
         assert_eq!(e.undo.len(), 1);
@@ -7798,12 +8619,19 @@ mod tests {
             "the project is not left unsaved"
         );
         assert_eq!(e.project, kept);
-        writable(true);
-        e.flush().unwrap();
         assert_eq!(stored(&dir), kept);
-        assert!(!e.save_failed);
-        e.dispatch("edit.add", add).await.unwrap();
-        assert_eq!(stored(&dir), kept, "deferred again");
+
+        // Writable again: the next edit is flushed at once, and deferring returns.
+        writable(&dir.join("projects"), true);
+        let next = e.dispatch("edit.add", add.clone()).await.unwrap();
+        assert_eq!(stored(&dir), next);
+        assert_eq!(in_store(&e), next);
+        assert!(e.unsynced.is_empty());
+        assert_eq!(e.undo.len(), 2);
+        let last = e.dispatch("edit.add", add).await.unwrap();
+        assert_eq!(stored(&dir), last);
+        assert_eq!(in_store(&e), next, "deferred again");
+        assert!(!e.unsynced.is_empty());
         drop(e);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -8046,6 +8874,21 @@ mod tests {
             .unwrap();
         assert!(slim["media"][0].get("waveform").is_none());
         assert_eq!(slim["media"][0]["waveformPeaks"], 3);
+        // The peaks have a name that `media.waveform` repeats; other peaks of the
+        // same number (the file was replaced by one as long) have another.
+        let named = slim["media"][0]["waveformId"].as_str().unwrap().to_owned();
+        let fetched = e
+            .dispatch("media.waveform", json!({"id":"tone"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched,
+            json!({"id":"tone","waveform":[0.1, 0.333, 1.0],"waveformId":named})
+        );
+        assert!(full["media"][0].get("waveformId").is_none());
+        assert_eq!(named, waveform_id(&[json!(0.1), json!(0.333), json!(1.0)]));
+        assert_ne!(named, waveform_id(&[json!(0.1), json!(0.334), json!(1.0)]));
+        assert_ne!(named, waveform_id(&[json!(0.333), json!(0.1), json!(1.0)]));
         // An edit's reply and a saved project's too; the stored project keeps them.
         let edited = e
             .dispatch(
@@ -8069,7 +8912,7 @@ mod tests {
             e.dispatch("media.waveform", json!({"id":"tone"}))
                 .await
                 .unwrap(),
-            json!({"id":"tone","waveform":[0.1, 0.333, 1.0]})
+            json!({"id":"tone","waveform":[0.1, 0.333, 1.0],"waveformId":named})
         );
         assert!(e
             .dispatch("media.waveform", json!({"id":"none"}))

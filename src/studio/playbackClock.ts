@@ -55,3 +55,97 @@ export function useIdleClockTime(playing: boolean) {
     playing ? held.current : (held.current = time),
   );
 }
+
+/** How often the clock is moved on while no animation frame arrives (a hidden or covered window). */
+export const BACKGROUND_TICK_MS = 250;
+/** A wrap this late (seconds past the end of a repeat) starts exactly at the range's start. */
+const WRAP_SLACK = 0.25;
+
+export interface PlaybackRun {
+  /** Where playback stops, in seconds. */
+  total: number;
+  /** The repeated range right now, if any. */
+  loop: () => { start: number; end: number } | null;
+  /** True while a media element is buffering: the clock holds, and that time is not played. */
+  waiting: () => boolean;
+  /** The clock has reached `total` and stopped. */
+  onEnd: () => void;
+}
+
+/**
+ * Moves the playback clock on until stopped (the function it returns) or the end.
+ *
+ * The position is where playback was last anchored plus the wall-clock time since
+ * (`performance.now`), not a sum of frame intervals. Animation frames only decide
+ * how often it is drawn: when they stop arriving because the window is hidden,
+ * covered or the screen is locked, a slow timer keeps the clock going, so playback
+ * still stops at the end, repeats, and starts and stops each clip's sound; when
+ * frames come back the playhead is where the sound is.
+ */
+export function runPlayback({ total, loop, waiting, onEnd }: PlaybackRun): () => void {
+  let stopped = false;
+  let frame = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  /** The wall-clock time of the latest step; steps never go back in time. */
+  let last = performance.now();
+  let anchor = { wall: last, time, epoch };
+  /** What this run last put on the clock: anything else was put there by someone else. */
+  let shown = time;
+  const hold = (now: number) => {
+    anchor = { wall: now, time, epoch };
+    shown = time;
+  };
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    cancelAnimationFrame(frame);
+    clearInterval(timer);
+    document.removeEventListener("visibilitychange", background);
+  };
+  const step = (now: number) => {
+    if (stopped || now < last) return;
+    last = now;
+    // A seek, or a clamp after an edit, moved the playhead: playback goes on from there.
+    // So does a wait for buffering: the time spent waiting is not played.
+    if (epoch !== anchor.epoch || time !== shown || waiting()) {
+      hold(now);
+      return;
+    }
+    const next = anchor.time + (now - anchor.wall) / 1000;
+    const repeat = loop();
+    if (repeat && next >= repeat.end) {
+      const length = repeat.end - repeat.start;
+      const over = next - repeat.end;
+      // A frame's delay wraps to the start itself; a long gap (a hidden window) keeps
+      // its place in the range. That is only for a playhead that ran past the end
+      // just now: one that was already past it (a seek beyond the range, or the
+      // repeat was turned on for a range behind the playhead) starts the range.
+      const ran = shown < repeat.end && over >= WRAP_SLACK && length > 0;
+      playbackClock.seek(repeat.start + (ran ? over % length : 0));
+      hold(now);
+    } else if (next >= total) {
+      playbackClock.set(total);
+      stop();
+      onEnd();
+    } else {
+      playbackClock.set(next);
+      shown = time;
+    }
+  };
+  const animate = (now: number) => {
+    step(now);
+    if (!stopped) frame = requestAnimationFrame(animate);
+  };
+  const tick = () => {
+    const now = performance.now();
+    // Frames are arriving: they move the clock.
+    if (document.visibilityState !== "hidden" && now - last < BACKGROUND_TICK_MS - 50) return;
+    step(now);
+  };
+  // Hidden or shown again: the clock is put right at once, before any frame or tick.
+  const background = () => step(performance.now());
+  frame = requestAnimationFrame(animate);
+  timer = setInterval(tick, BACKGROUND_TICK_MS);
+  document.addEventListener("visibilitychange", background);
+  return stop;
+}

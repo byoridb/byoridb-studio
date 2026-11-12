@@ -1,8 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import Timeline from "./Timeline";
+import TimelineView from "./Timeline";
+import { sent } from "../test/commands";
 import { playbackClock } from "./playbackClock";
 import type { Clip, Command, Project } from "./types";
+
+/**
+ * The timeline as the app mounts it: an edit given as a function is made from the
+ * project and sent on its revision (the app's edit queue), so `onCommand` records
+ * what reaches the service.
+ */
+const Timeline = (props: Omit<React.ComponentProps<typeof TimelineView>, "onCommand"> & { onCommand: Command }) =>
+  <TimelineView {...props} onCommand={sent(props.onCommand, () => props.project)} />;
 
 const assetUrl = vi.hoisted(() => vi.fn((id: string) => `/${id}`));
 vi.mock("./api", () => ({ assetUrl }));
@@ -98,7 +107,7 @@ describe("timeline with a large project", () => {
     expect(split).toBeEnabled();
     expect(split).toHaveAttribute("title", "나누기 (⌘B)");
     fireEvent.click(split);
-    expect(props.onCommand).toHaveBeenCalledWith("edit.split", { id: "a", time: 1, expectedRevision: 7 });
+    expect(props.onCommand).toHaveBeenCalledWith("edit.batch", { commands: [{ method: "edit.split", params: { id: "a", time: 1 } }], expectedRevision: 7 });
   });
 });
 
@@ -175,7 +184,7 @@ describe("timeline context menus", () => {
     expect(props.onSelection).toHaveBeenLastCalledWith(["still"], "still");
     fireEvent.contextMenu(body, { clientX: 40, clientY: 50 });
     fireEvent.click(screen.getByRole("menuitem", { name: /재생 헤드에서 나누기/ }));
-    expect(onCommand).toHaveBeenCalledWith("edit.split", { id: "film", time: 1, expectedRevision: 7 });
+    expect(onCommand).toHaveBeenCalledWith("edit.batch", { commands: [{ method: "edit.split", params: { id: "film", time: 1 } }], expectedRevision: 7 });
   });
   it("selects an unselected clip, disables freeze outside a video clip, and closes with Escape", () => {
     const { props } = mount();

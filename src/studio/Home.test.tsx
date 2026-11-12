@@ -138,6 +138,14 @@ describe("home screen", () => {
     // The section heading and the one project that has work in it.
     expect(screen.getAllByText("새 프로젝트")).toHaveLength(2);
   });
+  it("reads the list again when told the stored projects may have changed", async () => {
+    const { props, rerender } = mount();
+    await screen.findByText("오래된 편집");
+    vi.mocked(rpc).mockImplementation(async () => [list[1]]);
+    rerender(<Home {...props} reload={1} />);
+    await waitFor(() => expect(screen.queryByText("오래된 편집")).toBeNull());
+    expect(screen.getByText("최신 편집")).toBeInTheDocument();
+  });
   it("writes dates relative to today", () => {
     const now = new Date(2026, 10, 12, 15, 0);
     expect(relativeDate(new Date(2026, 10, 12, 2, 35).getTime(), now)).toBe("오늘 오전 2:35");

@@ -76,6 +76,10 @@ export function canvasTransformPatch(
     : { transform };
 }
 
+/** The clips of `ids` that `project` still has: an edit that waited its turn may outlive some. */
+export const presentIds = (project: Project, ids: string[]) =>
+  ids.filter((id) => project.clips.some((clip) => clip.id === id));
+
 /** The share of a media waveform that a clip actually plays, as peak indices. */
 export function waveformRange(clip: Clip, mediaDuration: number, peaks: number): [number, number] {
   // Stored peaks cover the whole source file (media.rs).

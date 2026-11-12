@@ -104,3 +104,9 @@ export async function savePath(
     extension: extension ?? null,
   });
 }
+/** Shows an exported file in Finder; false in the browser, which has no way to. */
+export async function revealFile(path: string): Promise<boolean> {
+  if (!isTauri()) return false;
+  await invoke("studio_reveal_file", { path });
+  return true;
+}

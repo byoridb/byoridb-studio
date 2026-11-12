@@ -89,6 +89,13 @@ describe("home screen", () => {
     vi.mocked(rpc).mockResolvedValueOnce([]);
     const first = mount();
     expect(await screen.findByText(/저장된 프로젝트가 없습니다/)).toBeInTheDocument();
+    // With nothing to list, the way into the example is the empty state's one button.
+    expect(first.container.querySelector(".home-count")).toBeNull();
+    const examples = screen.getAllByRole("button", { name: "예제 열기" });
+    expect(examples).toHaveLength(1);
+    expect(examples[0].closest(".home-empty-state")).not.toBeNull();
+    fireEvent.click(examples[0]);
+    expect(first.props.onExample).toHaveBeenCalledOnce();
     first.unmount();
     vi.mocked(rpc).mockImplementation(async (method: string) => {
       if (method === "project.list") return list;

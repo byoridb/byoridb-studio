@@ -256,6 +256,33 @@ describe("timeline multiple selection", () => {
       ],
     });
   });
+  it("keeps a dropped clip where it was dropped until the service answers, and starts the next drag from there", async () => {
+    let answer!: (value: unknown) => void;
+    const command = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }))
+      .mockResolvedValue(undefined);
+    render(<Harness command={command} initial={["a"]} />);
+    fireEvent.click(screen.getByTitle("스냅 켜기/끄기"));
+    fireEvent.pointerDown(item("a"), { clientX: 100 });
+    fireEvent.pointerMove(item("a"), { clientX: 168 });
+    fireEvent.pointerUp(item("a"));
+    expect(command).toHaveBeenLastCalledWith("edit.batch", {
+      expectedRevision: 7,
+      commands: [{ method: "edit.update", params: { id: "a", patch: { start: 2 } } }],
+    });
+    // Not answered yet: the clip does not jump back to 1s in the meantime.
+    expect(item("a")).toHaveAttribute("aria-label", "a, 2.0초, 2.0초");
+    // A trim begun now starts from the dropped position, not from the stale project.
+    const handle = screen.getByRole("button", { name: "a 끝점 트림" });
+    fireEvent.pointerDown(handle, { clientX: 200 });
+    fireEvent.pointerMove(handle, { clientX: 268 });
+    fireEvent.pointerUp(handle);
+    expect(command).toHaveBeenLastCalledWith("edit.trim", { id: "a", start: 2, end: 5, expectedRevision: 7 });
+    expect(item("a")).toHaveAttribute("aria-label", "a, 2.0초, 3.0초");
+    // Answered (this harness applies nothing): what is drawn is the project again.
+    await act(async () => { answer(undefined); });
+    expect(item("a")).toHaveAttribute("aria-label", "a, 1.0초, 2.0초");
+  });
   it("clamps the earliest clip at zero while retaining the gap", () => {
     const command = vi.fn().mockResolvedValue(undefined);
     render(<Harness command={command} initial={["a", "b"]} />);
@@ -402,7 +429,7 @@ describe("timeline clip editing", () => {
     fireEvent.pointerUp(handle);
     expect(command).not.toHaveBeenCalled();
   });
-  it("clamps a drag to one frame and lets image clips extend past source duration", () => {
+  it("clamps a drag to one frame and lets image clips extend past source duration", async () => {
     const command = vi.fn().mockResolvedValue(undefined);
     render(<Harness initial={["a"]} command={command} />);
     const handle = screen.getByRole("button", { name: "a 끝점 트림" });
@@ -410,6 +437,8 @@ describe("timeline clip editing", () => {
     fireEvent.pointerMove(handle, { clientX: -1000 });
     fireEvent.pointerUp(handle);
     expect(command.mock.calls[0][1].end - command.mock.calls[0][1].start).toBeCloseTo(1 / 30);
+    // The service answers (here without applying it) before the next drag begins.
+    await act(async () => {});
     fireEvent.pointerDown(handle, { clientX: 100 });
     fireEvent.pointerMove(handle, { clientX: 440 });
     fireEvent.pointerUp(handle);
@@ -640,7 +669,7 @@ describe("timeline basics", () => {
     ]);
   });
 
-  it("snaps the dragged clip's end to a marker and its start to the playhead", () => {
+  it("snaps the dragged clip's end to a marker and its start to the playhead", async () => {
     const project = fixture();
     project.clips = [clip("a", 1)];
     project.markers = [{ id: "m1", time: 5.02, label: "마커" }];
@@ -652,6 +681,8 @@ describe("timeline basics", () => {
     const moved = vi.mocked(props.onCommand).mock.calls[0][1] as { commands: { params: { patch: { start: number } } }[] };
     expect(moved.commands[0].params.patch.start).toBeCloseTo(3.02, 10);
     vi.mocked(props.onCommand).mockClear();
+    // The first drop was answered (and not applied here): the clip is at 1s again.
+    await act(async () => {});
     rerender(<Timeline {...props} time={7.03} />);
     fireEvent.pointerDown(item("a"), { clientX: 100 });
     fireEvent.pointerMove(item("a"), { clientX: 100 + 6 * 68 });

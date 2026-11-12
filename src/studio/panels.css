@@ -7,7 +7,7 @@
   height: 100%;
   background: var(--panel);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-panel, 12px);
   overflow: hidden;
 }
 .studio-library button,
@@ -127,7 +127,7 @@
   color: var(--text);
 }
 .asset-count {
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
 }
 .panel-search {
@@ -157,7 +157,7 @@
   border: none !important;
   padding: 0 !important;
   color: var(--text);
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   outline: none;
 }
 .panel-search button {
@@ -280,11 +280,11 @@
 }
 .library-empty strong {
   color: var(--secondary-ink);
-  font-size: 12px;
+  font-size: var(--fs-panel, 12px);
   font-weight: 500;
 }
 .library-empty p {
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.7;
   margin: 0;
 }
@@ -298,19 +298,19 @@
   background: var(--control-border) !important;
 }
 .panel-help {
-  font-size: 10px !important;
+  font-size: var(--fs-supporting, 10px) !important;
   color: var(--muted) !important;
   line-height: 1.7 !important;
   margin: 14px 0 0 !important;
 }
 .panel-hint {
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
   line-height: 1.65;
   margin: 0 0 14px;
 }
 .library-section-title {
-  font-size: 12px;
+  font-size: var(--fs-panel, 12px);
   font-weight: 500;
   margin: 3px 0 14px;
   display: flex;
@@ -319,7 +319,7 @@
 }
 .library-section-title span {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .add-basic-text {
   width: 100%;
@@ -328,7 +328,7 @@
   border: 1px solid var(--control-border) !important;
   margin-bottom: 22px;
   justify-content: space-between !important;
-  font-size: 11px !important;
+  font-size: var(--fs-label, 11px) !important;
 }
 .add-basic-text:hover {
   border-color: var(--accent) !important;
@@ -413,7 +413,8 @@
 .transition-art {
   position: relative;
   display: block;
-  background: var(--bg);
+  /* What the picture enters over: never as dark as an empty tile. */
+  background: var(--control-hover);
   width: 100%;
   height: 70px;
   border: 1px solid var(--control-border);
@@ -422,6 +423,14 @@
 }
 .effect-preset-grid > button.active > .transition-art {
   border-color: var(--accent);
+}
+/*
+ * The applied transition always shows its whole picture. The pointer is still on
+ * the tile right after it is chosen, and the hover loop starts from its empty
+ * first frame, which left the chosen tile dark with only the check mark.
+ */
+.effect-preset-grid > button.active > .transition-art i {
+  animation: none !important;
 }
 .transition-art i {
   position: absolute;
@@ -548,7 +557,7 @@
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 10px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
 }
 .transition-controls label {
@@ -560,7 +569,7 @@
   width: 64px;
   padding: 5px 6px;
   text-align: right;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   font-variant-numeric: tabular-nums;
 }
 .segmented {
@@ -571,7 +580,7 @@
 }
 .segmented > button {
   padding: 5px 11px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
   border-radius: 0;
 }
@@ -637,7 +646,7 @@
   width: 100%;
   background: var(--action-fill) !important;
   color: var(--action-ink) !important;
-  font-size: 11px !important;
+  font-size: var(--fs-label, 11px) !important;
   padding: 8px !important;
   margin: 4px 0 !important;
   font-weight: 500 !important;
@@ -652,14 +661,14 @@
   gap: 7px;
   align-items: center;
   color: var(--accent);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   margin-top: 12px;
 }
 .panel-inline-error {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.6;
   background: var(--danger-bg);
   color: var(--danger-text);
@@ -685,7 +694,7 @@
   background: var(--audio-track);
   border-radius: 4px;
   padding: 10px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
@@ -708,7 +717,7 @@
 }
 .inspector-tabs button {
   padding: 12px 10px;
-  font-size: 12px;
+  font-size: var(--fs-panel, 12px);
   color: var(--muted);
   position: relative;
   white-space: nowrap;
@@ -815,7 +824,7 @@
 }
 .inspector-section-heading button {
   padding: 6px 0;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
 }
 .inspector-section-heading button:last-child:not(:first-child) {
   color: var(--muted);
@@ -887,7 +896,7 @@
   margin: 0;
 }
 .number-input-wrap small {
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
 }
 .keyframe-button {
@@ -907,7 +916,7 @@
   flex-direction: column;
   gap: 7px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
 }
 .inspector-text-field input,
 .inspector-text-field textarea {
@@ -919,7 +928,7 @@
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.6;
   resize: vertical;
 }
@@ -928,7 +937,7 @@
   align-items: center;
   justify-content: space-between;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   gap: 10px;
 }
 .inspector-select-field select {
@@ -944,7 +953,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
 }
 .inspector-color-field > span {
@@ -960,7 +969,7 @@
   cursor: pointer;
 }
 .inspector-color-field code {
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--secondary-ink);
   font-family: inherit;
   font-variant-numeric: tabular-nums;
@@ -969,9 +978,15 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--secondary-ink);
   margin: 3px 0;
+}
+.inspector-hint {
+  font-size: var(--fs-supporting, 10px);
+  color: var(--muted);
+  line-height: 1.6;
+  margin: 2px 0 0;
 }
 .inspector-check input {
   width: 13px;
@@ -1001,7 +1016,7 @@
   justify-content: space-between;
   gap: 9px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   min-height: 22px;
 }
 .project-stat-row strong {
@@ -1021,7 +1036,7 @@
   padding: 7px 4px;
   background: var(--control-bg);
   border: 1px solid var(--control-border);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .aspect-ratios button.active,
 .speed-presets button.active {
@@ -1050,7 +1065,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
 }
 .keyframe-group-heading strong {
@@ -1077,7 +1092,7 @@
   width: 46px;
   min-width: 0;
   padding: 4px 5px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   text-align: right;
   font-variant-numeric: tabular-nums;
   -moz-appearance: textfield;
@@ -1092,7 +1107,7 @@
   flex: 1;
   min-width: 0;
   padding: 4px 3px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   background: var(--control-bg);
   color: var(--text);
   border: 1px solid var(--control-border);
@@ -1115,7 +1130,7 @@
 }
 .animation-presets > button {
   padding: 7px 4px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
   background: var(--panel-raised);
   border: 1px solid transparent;
@@ -1140,13 +1155,13 @@
   gap: 11px;
   padding: 25px 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .inspector-flips {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
   margin-top: 2px;
 }
@@ -1157,7 +1172,7 @@
   padding: 6px 8px;
   border: 1px solid var(--control-border);
   background: var(--control-bg);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .inspector-flips button.active {
   color: var(--accent);
@@ -1175,7 +1190,7 @@
   padding: 6px 3px;
   background: var(--control-bg);
   border: 1px solid var(--control-border);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .mask-shapes {
   display: flex;
@@ -1187,7 +1202,7 @@
   flex-direction: column;
   gap: 6px;
   padding: 10px 4px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
   background: var(--control-bg);
   border: 1px solid var(--control-border);
@@ -1223,7 +1238,7 @@
   padding: 10px;
   background: var(--control-hover);
   border: 1px solid var(--image-track);
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--secondary-ink);
 }
 .mask-preset-art {
@@ -1247,7 +1262,8 @@
   border-radius: 50%;
 }
 .mask-preset-art.soft i {
-  mask-image: radial-gradient(circle, #000 45%, transparent 72%);
+  /* A mask reads only alpha; any opaque token does. */
+  mask-image: radial-gradient(circle, var(--bg) 45%, transparent 72%);
 }
 .mask-preset-art.none i {
   background: transparent;
@@ -1272,7 +1288,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-panel, 12px);
   font-weight: 500;
   margin: 0;
   color: var(--secondary-ink);
@@ -1292,13 +1308,13 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
 }
 .speech-panel select {
   width: 100%;
   min-width: 0;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   padding: 6px 5px;
   color: var(--secondary-ink);
   background: var(--secondary-fill);
@@ -1309,7 +1325,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--secondary-ink);
   margin: 12px 0;
 }
@@ -1321,7 +1337,7 @@
 }
 .speech-panel > textarea {
   width: 100%;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.7;
   resize: vertical;
   padding: 8px;
@@ -1337,7 +1353,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 9px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
   margin: 14px 0;
 }
@@ -1356,7 +1372,7 @@
   margin: 8px 0 0 !important;
 }
 .speech-unavailable {
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   line-height: 1.7;
   color: var(--warning-ink);
   background: var(--border);
@@ -1382,7 +1398,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
 }
 .speech-job-heading > strong {
   font-weight: 500;
@@ -1459,7 +1475,7 @@
 }
 .curve-channels button {
   flex: 1;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   padding: 5px;
   background: var(--panel-raised);
   border: 1px solid var(--border);
@@ -1521,7 +1537,7 @@
   gap: 4px;
   margin: 11px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   font-variant-numeric: tabular-nums;
 }
 .curve-actions > span {
@@ -1550,7 +1566,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
 }
 .lut-import-actions {
   display: flex;
@@ -1568,14 +1584,14 @@
   justify-content: center;
   gap: 4px;
   padding: 3px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--danger-text);
   background: var(--danger-bg);
 }
 .relink-media {
   margin-top: 4px;
   padding: 2px 6px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--accent);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1586,14 +1602,14 @@
   justify-content: space-between;
   gap: 8px;
   margin: 0;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.5;
   color: var(--muted);
 }
 .assistant-provider-note button {
   flex: none;
   padding: 2px 6px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--accent);
 }
 .export-frame-placeholder {
@@ -1601,13 +1617,58 @@
   place-items: center;
   background: var(--bg);
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
 }
 .export-hint {
   margin: 0;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   line-height: 1.5;
   color: var(--muted);
+}
+/* Export result: where the file went, and the reason when it did not get there. */
+.export-progress.completed > div:first-child {
+  color: var(--success-ink);
+}
+.export-progress.failed > div:first-child {
+  color: var(--danger-text);
+}
+.export-progress.cancelled > div:first-child {
+  color: var(--muted);
+}
+.export-result {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.export-result > p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-label, 11px);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.export-copy {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  font-size: var(--fs-label, 11px);
+  color: var(--text);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-control, 4px);
+}
+.export-copy:hover {
+  background: var(--control-hover);
+}
+.export-progress > .inline-error {
+  margin: 8px 0 0;
+  color: var(--danger-text);
+  font-size: var(--fs-label, 11px);
 }
 .settings-modal:focus,
 .export-modal:focus {
@@ -1621,7 +1682,7 @@
   gap: 6px;
   align-self: flex-start;
   padding: 2px 0;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
 }
 .export-advanced-toggle:hover:not(:disabled) {
@@ -1641,7 +1702,7 @@
   display: flex;
   flex-direction: column;
   gap: 7px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--muted);
 }
 .export-advanced > label.export-check {
@@ -1652,7 +1713,7 @@
 .export-advanced input[type="number"] {
   height: 31px;
   padding: 5px 7px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
 }
 
 /* Memory: scope switch and the agent run history. */
@@ -1673,7 +1734,7 @@
 }
 .memory-scope > button {
   padding: 3px 8px;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
   border-radius: 0;
 }
@@ -1698,7 +1759,7 @@
   align-items: center;
   gap: 8px;
   padding: 7px 4px;
-  font-size: 11px;
+  font-size: var(--fs-label, 11px);
   color: var(--text);
   text-align: left;
   border-radius: 4px;
@@ -1708,12 +1769,12 @@
 }
 .agent-history > button > small {
   margin-right: auto;
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 .agent-history > button > em {
-  font-size: 10px;
+  font-size: var(--fs-supporting, 10px);
   font-style: normal;
   color: var(--muted);
 }

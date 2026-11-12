@@ -349,6 +349,26 @@ export default function Timeline({
   }, [shortcutsOpen]);
   const [drag, setDrag] = useState<Drag | null>(null);
   const activeDrag = useRef<Drag | null>(null);
+  // A released drag stays where it was dropped until the service has answered, so
+  // the clip neither jumps back for a moment nor is picked up from its old place
+  // by a drag that starts before the answer arrives.
+  const [held, setHeld] = useState<{ key: number; previews: Drag["previews"] }[]>([]);
+  const heldKey = useRef(0);
+  const hold = (previews: Drag["previews"], task: Promise<unknown>) => {
+    const key = ++heldKey.current;
+    setHeld((list) => [...list, { key, previews }]);
+    const release = () => setHeld((list) => list.filter((entry) => entry.key !== key));
+    task.then(release, release);
+  };
+  /** What is drawn over the project: drops still on their way, then the drag in hand. */
+  const shown = useMemo(() => {
+    const merged: Drag["previews"] = {};
+    for (const previews of [...held.map((entry) => entry.previews), drag?.previews ?? {}])
+      for (const [id, patch] of Object.entries(previews)) merged[id] = { ...merged[id], ...patch };
+    return merged;
+  }, [held, drag]);
+  const settled = useRef(shown);
+  settled.current = shown;
   const trackRows = useRef(new Map<string, HTMLDivElement>());
   const editGuideId = useId();
   const editable = canEditSelection(project, selectedIds);
@@ -605,12 +625,14 @@ export default function Timeline({
     onSelection(ids, clip.id);
     if (!canEditSelection(project, mode === "move" ? ids : [clip.id])) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
+    // A drop still on its way to the service is where the clip is, as far as this drag goes.
+    const dropped = (item: Clip): Clip => ({ ...item, ...settled.current[item.id] });
     setActiveDrag({
       id: clip.id,
       mode,
       x: event.clientX,
-      origin: clip,
-      clips: mode === "move" ? selectedClips(project, ids) : [clip],
+      origin: dropped(clip),
+      clips: (mode === "move" ? selectedClips(project, ids) : [clip]).map(dropped),
       revision: project.revision,
       scroll: workspace.current?.scrollLeft ?? 0,
       previews: {},
@@ -676,22 +698,28 @@ export default function Timeline({
       })
       .map(([id, patch]) => ({ method: "edit.update", params: { id, patch } }));
     if (!commands.length) return;
-    if (current.mode === "move")
-      void onCommand("edit.batch", {
+    // The revision is the one the drag began on; the app sends it on top of this
+    // window's own edits that were still on their way then.
+    if (current.mode === "move") {
+      const task = onCommand("edit.batch", {
         commands,
         expectedRevision: current.revision,
-      }).then((result) => {
+      });
+      hold(current.previews, task);
+      void task.then((result) => {
         if (result && current.targetTrack) onTrackSelect?.(current.targetTrack);
       }).catch(() => undefined);
-    else {
+    } else {
       const clip = { ...current.origin, ...current.previews[current.id] };
       setTrimNote(`${clip.name} · ${trimText(clip)}`);
-      void onCommand("edit.trim", {
+      const task = onCommand("edit.trim", {
         id: clip.id,
         start: clip.start,
         end: clip.start + clip.duration,
         expectedRevision: current.revision,
-      }).catch(() => undefined);
+      });
+      hold(current.previews, task);
+      void task.catch(() => undefined);
     }
   };
   const trimWithKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, clip: Clip, edge: "start" | "end") => {
@@ -1110,7 +1138,7 @@ export default function Timeline({
                 })()}
                 {(clipsByTrack.get(track.id) ?? [])
                   .filter((clip) => {
-                    const preview = drag?.previews[clip.id];
+                    const preview = shown[clip.id];
                     const start = preview?.start ?? clip.start;
                     return inView(Math.min(start, clip.start), Math.max(start + (preview?.duration ?? clip.duration), clip.start + clip.duration)) ||
                       selectedSet.has(clip.id) || clip.id === drag?.id;
@@ -1118,7 +1146,7 @@ export default function Timeline({
                   .map((original) => {
                     const clip = {
                       ...original,
-                      ...drag?.previews[original.id],
+                      ...shown[original.id],
                     };
                     const media = project.media.find((item) => item.id === clip.mediaId);
                     const peaks = clip.kind === "audio" ? media?.waveform : undefined;
@@ -1131,8 +1159,8 @@ export default function Timeline({
                         style={{
                           left: clip.start * zoom,
                           width: Math.max(8, clip.duration * zoom),
-                          ...(drag?.previews[original.id]?.trackId && drag.previews[original.id].trackId !== original.trackId ? {
-                            transform: `translateY(${(trackRows.current.get(drag.previews[original.id].trackId!)?.offsetTop || 0) - (trackRows.current.get(original.trackId)?.offsetTop || 0)}px)`,
+                          ...(shown[original.id]?.trackId && shown[original.id].trackId !== original.trackId ? {
+                            transform: `translateY(${(trackRows.current.get(shown[original.id].trackId!)?.offsetTop || 0) - (trackRows.current.get(original.trackId)?.offsetTop || 0)}px)`,
                             zIndex: 15,
                           } : {}),
                         }}

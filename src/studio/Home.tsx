@@ -44,12 +44,13 @@ const stamp = (value: string | number) => {
 
 /** The project's first frame; the film icon stands in when there is none or it cannot be read. */
 function Cover({ item }: { item: ProjectSummary }) {
-  const [failed, setFailed] = useState(false);
+  // The cover that could not be read. Kept by its media id rather than reset in an
+  // effect: an effect that runs after the image has already failed would undo it.
+  const [failed, setFailed] = useState<string | null>(null);
   const mediaId = item.thumbnail?.mediaId;
-  useEffect(() => setFailed(false), [mediaId]);
-  const url = mediaId && !failed ? projectThumbnailUrl(item.id, mediaId) : "";
+  const url = mediaId && failed !== mediaId ? projectThumbnailUrl(item.id, mediaId) : "";
   return url
-    ? <img src={url} alt="" draggable={false} onError={() => setFailed(true)} />
+    ? <img src={url} alt="" draggable={false} onError={() => setFailed(mediaId ?? null)} />
     : <Film size={22} aria-hidden="true" />;
 }
 
@@ -108,6 +109,7 @@ export default function Home({
     // Untouched projects the app made by itself are not the user's work to list.
     .filter((item) => item.id !== hiddenId && !(item.empty && UNNAMED.includes(item.name)))
     .sort((a, b) => stamp(b.updatedAt) - stamp(a.updatedAt));
+  const empty = projects !== null && !sorted.length;
   return (
     <main className="home-screen">
       <header className="home-header">
@@ -121,7 +123,10 @@ export default function Home({
       </header>
       <div className="home-body">
         <section aria-labelledby="home-new">
-          <h2 id="home-new">새 프로젝트</h2>
+          <div className="home-section-heading">
+            <h2 id="home-new">새 프로젝트</h2>
+            <small>화면 비율을 고르면 바로 편집을 시작합니다</small>
+          </div>
           <div className="home-presets">
             {FRAME_PRESETS.map((preset) => (
               <button
@@ -145,16 +150,21 @@ export default function Home({
         </section>
         <section aria-labelledby="home-recent">
           <div className="home-section-heading">
-            <h2 id="home-recent">최근 프로젝트</h2>
-            <button
-              className="home-example"
-              aria-label="예제 열기"
-              title="제공된 사진과 합성 오디오로 만든 예제 프로젝트"
-              disabled={busy}
-              onClick={onExample}
-            >
-              예제 열기
-            </button>
+            <h2 id="home-recent">
+              최근 프로젝트
+              {sorted.length > 0 && <span className="home-count">{sorted.length}</span>}
+            </h2>
+            {/* With nothing saved the example is offered in the empty state below instead. */}
+            {!empty && (
+              <button
+                className="home-example"
+                title="제공된 사진과 합성 오디오로 만든 예제 프로젝트"
+                disabled={busy}
+                onClick={onExample}
+              >
+                예제 열기
+              </button>
+            )}
           </div>
           {error && (
             <div className="inline-error" role="alert">
@@ -165,8 +175,20 @@ export default function Home({
             <p className="home-empty">
               <LoaderCircle className="spin" size={16} /> 프로젝트를 불러오고 있습니다.
             </p>
-          ) : !sorted.length ? (
-            <p className="home-empty">저장된 프로젝트가 없습니다. 위에서 새 프로젝트를 시작해 보세요.</p>
+          ) : empty ? (
+            <div className="home-empty-state">
+              <Film size={22} aria-hidden="true" />
+              <strong>아직 저장된 프로젝트가 없습니다</strong>
+              <p>위에서 화면 비율을 골라 시작하거나, 예제로 먼저 둘러보세요.</p>
+              <button
+                className="secondary-button"
+                title="제공된 사진과 합성 오디오로 만든 예제 프로젝트"
+                disabled={busy}
+                onClick={onExample}
+              >
+                예제 열기
+              </button>
+            </div>
           ) : (
             <ul className="home-grid">
               {sorted.map((item) => {

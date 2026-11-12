@@ -1,4 +1,7 @@
+// @ts-expect-error The app has no Node typings; the test runner provides the module.
+import { readFileSync } from "node:fs";
 import {
+  cleanup,
   render,
   screen,
   fireEvent,
@@ -296,9 +299,8 @@ describe("Inspector", () => {
       expect(command).toHaveBeenCalledWith("edit.update", {
         id: "clip1",
         expectedRevision: 7,
-        patch: {
-          transform: { x: 0, y: 0, scale: 1.25, rotation: 0, opacity: 1 },
-        },
+        // The changed field alone: the service merges it into the clip.
+        patch: { transform: { scale: 1.25 } },
       }),
     );
   });
@@ -430,6 +432,23 @@ describe("Inspector", () => {
     });
   });
 
+  it("sends only the field that changed, so an edit still on its way is not put back", async () => {
+    const user = userEvent.setup();
+    const command = vi.fn().mockResolvedValue(project);
+    const text = {
+      ...clip, kind: "text" as const,
+      text: { content: "제목", fontSize: 64, fontFamily: "Arial", bold: false, color: "#ffffff", align: "center", background: "transparent" },
+    };
+    render(<Inspector project={project} selected={text} onCommand={command} playhead={1} />);
+    // A size typed and, before its answer has been drawn, a toggle made from the same render.
+    const size = screen.getByRole("spinbutton", { name: "글자 크기" });
+    fireEvent.change(size, { target: { value: "80" } });
+    fireEvent.blur(size);
+    await user.click(screen.getByRole("button", { name: "굵게" }));
+    const patches = command.mock.calls.map(([, params]) => (params as { patch: unknown }).patch);
+    expect(patches).toEqual([{ text: { fontSize: 80 } }, { text: { bold: true } }]);
+  });
+
   it("flips a clip while preserving its existing transform", async () => {
     const user = userEvent.setup();
     const command = vi.fn().mockResolvedValue(project);
@@ -449,16 +468,7 @@ describe("Inspector", () => {
     expect(command).toHaveBeenCalledWith("edit.update", {
       id: "clip1",
       expectedRevision: 7,
-      patch: {
-        transform: {
-          x: 120,
-          y: 0,
-          scale: 0.8,
-          rotation: 0,
-          opacity: 1,
-          flipX: true,
-        },
-      },
+      patch: { transform: { flipX: true } },
     });
   });
 
@@ -505,7 +515,7 @@ describe("Inspector", () => {
     expect(command).toHaveBeenCalledWith("edit.update", {
       id: "clip1",
       expectedRevision: 7,
-      patch: { crop: { x: 0.5, y: 0, width: 0.5, height: 1 } },
+      patch: { crop: { x: 0.5 } },
     });
   });
 
@@ -946,7 +956,7 @@ describe("Inspector color inputs", () => {
     expect(command).toHaveBeenCalledWith("edit.update", {
       id: "clip1",
       expectedRevision: 7,
-      patch: { text: { ...text.text, color: "#0000ff" } },
+      patch: { text: { color: "#0000ff" } },
     });
     command.mockClear();
     const background = screen.getByLabelText("텍스트 배경 색상");
@@ -954,7 +964,7 @@ describe("Inspector color inputs", () => {
     expect(command).toHaveBeenCalledWith(
       "edit.update",
       expect.objectContaining({
-        patch: { text: { ...text.text, background: "#102030e6" } },
+        patch: { text: { background: "#102030e6" } },
       }),
     );
   });
@@ -988,7 +998,7 @@ describe("Inspector color inputs", () => {
     expect(command).toHaveBeenCalledWith(
       "edit.update",
       expect.objectContaining({
-        patch: { text: { ...text.text, color: "#0000ff80" } },
+        patch: { text: { color: "#0000ff80" } },
       }),
     );
     unmount();
@@ -1147,6 +1157,74 @@ describe("Library transitions and stickers", () => {
     expect(screen.getByRole("button", { name: "디졸브" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "전환 제거" })).toBeNull();
     expect(command).not.toHaveBeenCalled();
+  });
+
+  it("keeps the applied transition's preview picture beside its check mark", () => {
+    const joined: Clip = {
+      ...next,
+      start: 4.5,
+      transitionIn: { type: "slideLeft", duration: 0.5 },
+      fadeIn: 0.5,
+    };
+    open({ ...project, clips: [clip, joined] }, joined);
+    fireEvent.click(screen.getByRole("tab", { name: "전환" }));
+    const applied = screen.getByRole("button", { name: "왼쪽 슬라이드" });
+    expect(applied).toHaveAttribute("aria-pressed", "true");
+    expect(applied).toHaveClass("active");
+    const art = applied.querySelector(".transition-art")!;
+    expect(art.querySelector("i")!.style.backgroundImage).toContain("media1");
+    expect(art.querySelector(".preset-check")).not.toBeNull();
+    // The hover loop starts from an empty frame (slid out, clipped or transparent)
+    // and the pointer is still on a tile that was just chosen: the applied tile
+    // must not animate, and an empty frame must not be as dark as the panel.
+    const css = readFileSync("src/studio/panels.css", "utf8");
+    expect(css).toMatch(
+      /\.effect-preset-grid > button\.active > \.transition-art i \{\s*animation: none !important;/,
+    );
+    const tile = css.match(/\n\.transition-art \{[^}]*\}/)![0];
+    expect(tile).toContain("background: var(--control-hover);");
+    expect(tile).not.toContain("var(--bg)");
+  });
+
+  it("puts new text above text that is already on screen at that time", async () => {
+    const caption: Clip = {
+      ...clip,
+      id: "caption",
+      kind: "text",
+      mediaId: undefined,
+      trackId: "text1",
+      start: 1,
+      duration: 4,
+      transform: { ...clip.transform, y: 1080 * 0.32 },
+    };
+    const captioned: Project = { ...project, clips: [clip, caption] };
+    const { command } = open(captioned, null);
+    fireEvent.click(screen.getByRole("tab", { name: "텍스트" }));
+    fireEvent.click(screen.getByRole("button", { name: "기본 텍스트 추가" }));
+    // The playhead (2 s) is inside the caption: the new text goes to the centre.
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith(
+        "edit.add",
+        expect.objectContaining({ start: 2, duration: 3, transform: { y: 0 } }),
+      ),
+    );
+  });
+
+  it("leaves new text at the default place when no text is on screen then", async () => {
+    const caption: Clip = {
+      ...clip,
+      id: "caption",
+      kind: "text",
+      mediaId: undefined,
+      start: 6,
+      duration: 2,
+      transform: { ...clip.transform, y: 1080 * 0.32 },
+    };
+    const { command } = open({ ...project, clips: [clip, caption] }, null);
+    fireEvent.click(screen.getByRole("tab", { name: "텍스트" }));
+    fireEvent.click(screen.getByRole("button", { name: "기본 텍스트 추가" }));
+    await waitFor(() => expect(command).toHaveBeenCalled());
+    expect(command.mock.calls[0][1]).not.toHaveProperty("transform");
   });
 
   it("offers audio clips only a fade and joins them with it", async () => {
@@ -1395,10 +1473,9 @@ describe("Inspector animation, transitions and styles", () => {
       <Inspector project={project} selected={clip} onCommand={vi.fn()} playhead={1} />,
     );
     expect(expanded("변형")).toBe("true");
-    for (const name of ["자르기", "마스크", "크로마키", "흔들림 보정", "오디오", "이퀄라이저"])
+    // A video clip always has its own entrance and exit to set, folded until asked for.
+    for (const name of ["자르기", "마스크", "크로마키", "흔들림 보정", "오디오", "이퀄라이저", "전환"])
       expect(expanded(name)).toBe("false");
-    // Nothing precedes this clip and it has no transition: the section is not shown.
-    expect(screen.queryByRole("button", { name: "전환" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "오디오" }));
     fireEvent.click(screen.getByRole("button", { name: "변형" }));
     first.unmount();
@@ -1487,9 +1564,9 @@ describe("Inspector animation, transitions and styles", () => {
     const touching: Clip = { ...clip, start: 3 };
     const { command } = inspect(touching, { ...project, clips: [previous, touching] });
     fireEvent.click(screen.getByRole("button", { name: "전환" }));
-    // A clip's own entrance and exit live in the animation tab.
-    expect(screen.queryByLabelText("등장 전환")).toBeNull();
-    expect(screen.queryByLabelText("퇴장 전환")).toBeNull();
+    // Its own entrance and exit are separate choices, both still unset.
+    expect(screen.getByLabelText("등장 전환")).toHaveValue("");
+    expect(screen.getByLabelText("퇴장 전환")).toHaveValue("");
     fireEvent.change(screen.getByLabelText("앞 클립과 전환"), { target: { value: "wipeUp" } });
     await waitFor(() =>
       expect(command).toHaveBeenCalledWith("edit.batch", {
@@ -1502,12 +1579,96 @@ describe("Inspector animation, transitions and styles", () => {
     );
   });
 
-  it("shows a clip's own older transition only so it can be removed", async () => {
+  it("sets a lone video clip's entrance and exit: one of nine kinds and a length", async () => {
+    const { command, preview } = inspect(clip);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    // Nothing precedes the clip, so there is no join to offer.
+    expect(screen.queryByLabelText("앞 클립과 전환")).toBeNull();
+    const enter = screen.getByLabelText("등장 전환");
+    expect(Array.from(enter.querySelectorAll("option")).map((o) => o.textContent)).toEqual([
+      "없음", "페이드", "디졸브", "왼쪽 와이프", "오른쪽 와이프", "위로 와이프",
+      "아래로 와이프", "왼쪽 슬라이드", "오른쪽 슬라이드", "줌",
+    ]);
+    // A length appears only once a kind is chosen.
+    expect(screen.queryByRole("spinbutton", { name: "등장 길이" })).toBeNull();
+    fireEvent.change(enter, { target: { value: "slideLeft" } });
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { transitionIn: { type: "slideLeft", duration: 0.5 }, fadeIn: 0.5 },
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("퇴장 전환"), { target: { value: "zoom" } });
+    await waitFor(() =>
+      expect(patched(command)).toEqual({
+        transitionOut: { type: "zoom", duration: 0.5 },
+        fadeOut: 0.5,
+      }),
+    );
+    expect(preview).not.toHaveBeenCalled();
+  });
+
+  it("changes the length of a clip's own exit and removes it with 없음", async () => {
+    // Older projects fade with only fadeOut set: that reads as a fade.
     const legacy: Clip = { ...clip, fadeOut: 0.8 };
+    const { command, preview } = inspect(legacy);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    expect(screen.getByLabelText("퇴장 전환")).toHaveValue("fade");
+    expect(screen.getByLabelText("등장 전환")).toHaveValue("");
+    const length = screen.getByRole("spinbutton", { name: "퇴장 길이" });
+    expect(length).toHaveValue(0.8);
+    fireEvent.change(length, { target: { value: "1.5" } });
+    expect(preview).toHaveBeenLastCalledWith("clip1", {
+      transitionOut: { type: "fade", duration: 1.5 },
+      fadeOut: 1.5,
+    });
+    fireEvent.blur(length);
+    await waitFor(() =>
+      expect(patched(command)).toEqual({
+        transitionOut: { type: "fade", duration: 1.5 },
+        fadeOut: 1.5,
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("퇴장 전환"), { target: { value: "" } });
+    await waitFor(() =>
+      expect(command).toHaveBeenCalledWith("edit.update", {
+        id: "clip1",
+        expectedRevision: 7,
+        patch: { transitionOut: null, fadeOut: 0 },
+      }),
+    );
+  });
+
+  it("offers an image clip the same entrance and exit, and a joined clip only its exit", () => {
+    const image: Clip = { ...clip, kind: "image" };
+    const first = inspect(image);
+    fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    expect(screen.getByLabelText("등장 전환")).toBeInTheDocument();
+    expect(screen.getByLabelText("퇴장 전환")).toBeInTheDocument();
+    expect(first.command).not.toHaveBeenCalled();
+    // The section stays open: what was opened is remembered.
+    cleanup();
+    const previous: Clip = { ...clip, id: "clip0", start: 0, duration: 3 };
+    const overlapped: Clip = {
+      ...clip,
+      start: 2.5,
+      transitionIn: { type: "dissolve", duration: 0.5 },
+      fadeIn: 0.5,
+    };
+    inspect(overlapped, { ...project, clips: [previous, overlapped] });
+    // The entrance of a joined clip is the join itself.
+    expect(screen.getByLabelText("앞 클립과 전환")).toHaveValue("dissolve");
+    expect(screen.queryByLabelText("등장 전환")).toBeNull();
+    expect(screen.getByLabelText("퇴장 전환")).toHaveValue("");
+  });
+
+  it("keeps text to its animations: an older transition can only be removed", async () => {
+    const legacy: Clip = { ...text, fadeOut: 0.8 };
     const { command } = inspect(legacy);
     fireEvent.click(screen.getByRole("button", { name: "전환" }));
+    expect(screen.queryByLabelText("퇴장 전환")).toBeNull();
     expect(screen.getByText(/퇴장 전환 · 페이드 0.8초/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "등장 전환 제거" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "퇴장 전환 제거" }));
     await waitFor(() =>
       expect(command).toHaveBeenCalledWith("edit.update", {
@@ -1516,6 +1677,38 @@ describe("Inspector animation, transitions and styles", () => {
         patch: { transitionOut: null, fadeOut: 0 },
       }),
     );
+  });
+
+  it("fades a video clip's sound in and out, keeping the picture's transition kind", async () => {
+    const wiped: Clip = {
+      ...clip,
+      transitionOut: { type: "wipeLeft", duration: 0.5 },
+      fadeOut: 0.5,
+    };
+    const { command } = inspect(wiped);
+    fireEvent.click(screen.getByRole("button", { name: "오디오" }));
+    const fadeIn = screen.getByRole("spinbutton", { name: "페이드 인" });
+    fireEvent.change(fadeIn, { target: { value: "1" } });
+    fireEvent.blur(fadeIn);
+    await waitFor(() =>
+      expect(patched(command)).toEqual({
+        transitionIn: { type: "fade", duration: 1 },
+        fadeIn: 1,
+      }),
+    );
+    const fadeOut = screen.getByRole("spinbutton", { name: "페이드 아웃" });
+    expect(fadeOut).toHaveValue(0.5);
+    fireEvent.change(fadeOut, { target: { value: "2" } });
+    fireEvent.blur(fadeOut);
+    await waitFor(() =>
+      expect(patched(command)).toEqual({
+        transitionOut: { type: "wipeLeft", duration: 2 },
+        fadeOut: 2,
+      }),
+    );
+    expect(
+      screen.getByText("소리 페이드는 화면의 등장·퇴장 전환과 같은 길이로 움직입니다."),
+    ).toBeInTheDocument();
   });
 
   it("fades an audio clip in and out by length", async () => {

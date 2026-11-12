@@ -6,6 +6,7 @@ import {
   animationPresetKeyframes,
   animationPresets,
   activeMotionPreset,
+  freeTextY,
   incomingTransitionCommands,
   joinTransitionCommands,
   motionPresetKeyframes,
@@ -304,6 +305,68 @@ describe("animation presets beside other keyframes", () => {
     const removedOut = apply(both, "out", null);
     expect(valueAt(removedOut, "transform.opacity", 0)).toBe(0);
     expect(valueAt(removedOut, "transform.opacity", 1)).toBe(1);
+  });
+});
+
+describe("new text position", () => {
+  const caption = (y: number, start = 0, duration = 5): Clip => ({
+    ...clip,
+    id: `text${y}`,
+    kind: "text",
+    start,
+    duration,
+    transform: { ...clip.transform, y },
+  });
+  const lower = 1080 * 0.32;
+
+  it("keeps the editor's default while no text is on screen at that time", () => {
+    expect(freeTextY(project([clip]), 4, 3)).toBeUndefined();
+    // A caption that ends exactly where the new text starts does not overlap it.
+    expect(freeTextY(project([caption(lower, 0, 4)]), 4, 3)).toBeUndefined();
+    // Text elsewhere on screen leaves the default row free.
+    expect(freeTextY(project([caption(-300)]), 1, 3)).toBeUndefined();
+  });
+
+  it("moves to the centre, then the upper third, past text already there", () => {
+    expect(freeTextY(project([caption(lower)]), 1, 3)).toBe(0);
+    expect(freeTextY(project([caption(lower), caption(0)]), 1, 3)).toBeCloseTo(-lower, 6);
+    // Text slightly off a row still occupies it.
+    expect(freeTextY(project([caption(lower - 60)]), 1, 3)).toBe(0);
+  });
+
+  it("takes the emptiest row when all three are occupied", () => {
+    const crowded = [caption(lower), caption(40), caption(-lower)];
+    // The centre is 40px from the nearest text; the other rows hold text exactly.
+    expect(freeTextY(project(crowded), 1, 3)).toBe(0);
+  });
+});
+
+describe("panel styles", () => {
+  const css = readFileSync("src/studio/panels.css", "utf8") as string;
+
+  it("uses the type steps for every text size, none under 10px", () => {
+    const sizes = css.match(/font-size:[^;]+;/g) ?? [];
+    expect(sizes.length).toBeGreaterThan(50);
+    const other = sizes.filter(
+      (size) =>
+        !/^font-size: var\(--fs-(supporting|label|panel|body|title), \d+px\)( !important)?;$/.test(size),
+    );
+    // Text preset samples show the media's own type; the search field inherits.
+    expect(other).toEqual(["font-size: 28px;", "font-size: inherit;"]);
+    for (const [, px] of css.matchAll(/var\(--fs-[a-z]+, (\d+)px\)/g))
+      expect(Number(px)).toBeGreaterThanOrEqual(10);
+  });
+
+  it("takes every colour from the design tokens", () => {
+    expect(css.match(/#[0-9a-fA-F]{3,8}\b|\b(rgba?|hsla?|color-mix)\(/g)).toBeNull();
+    const tokens = new Set(
+      Array.from(
+        (readFileSync("src/styles/index.css", "utf8") as string).matchAll(/^\s*(--[a-z-]+):/gm),
+        (match) => match[1],
+      ),
+    );
+    const used = new Set(Array.from(css.matchAll(/var\((--[a-z-]+)/g), (match) => match[1]));
+    expect([...used].filter((name) => !tokens.has(name))).toEqual([]);
   });
 });
 

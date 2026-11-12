@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   act,
+  configure,
   fireEvent,
   render,
   screen,
@@ -11,6 +12,13 @@ import App from "./App";
 import { connectStudio, pickFiles, rpc, uploadFile } from "./studio/api";
 import * as mediaPlayback from "./studio/mediaPlayback";
 import type { Project } from "./studio/types";
+
+// Every test here renders the whole app in jsdom: about 0.2s on an idle machine,
+// but measured at over 5s when the CPU is saturated (eleven test processes at once).
+// The default limits (5s a test, 1s for findBy*) then fail whichever test is running,
+// so they are raised for this file; a real hang still fails, only later.
+vi.setConfig({ testTimeout: 30_000 });
+configure({ asyncUtilTimeout: 10_000 });
 
 vi.mock("./studio/api", () => ({
   connectStudio: vi.fn(),
@@ -119,9 +127,7 @@ describe("Studio application", () => {
     const { container, unmount } = render(<App />);
     try {
       await screen.findByLabelText("프로젝트 이름");
-      // Loading a project stops playback in an effect. Let it run before pressing
-      // play: a click landing between that commit and its effects is undone by it
-      // (the rare failure recorded below: playing=false, no frame requested).
+      // Let the effects of the first project render run before pressing play.
       await act(async () => {});
       fireEvent.click(screen.getByTitle("재생 (Space)"));
       const start = performance.now();

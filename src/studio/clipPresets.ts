@@ -485,6 +485,36 @@ export const textDefaults = {
   align: "center",
   background: "transparent",
 };
+/**
+ * Where new text sits, as a vertical offset from the centre in frame heights:
+ * the editor's own default (lower third), then the centre, then the upper third.
+ */
+const textRows = [0.32, 0, -0.32];
+/**
+ * The vertical position for text added at `start`: `undefined` keeps the editor's
+ * default, otherwise the first row no other text occupies during that time (the
+ * emptiest one when all three are taken), so new text never covers a caption.
+ */
+export function freeTextY(
+  project: Project,
+  start: number,
+  duration: number,
+): number | undefined {
+  const taken = project.clips
+    .filter(
+      (c) =>
+        c.kind === "text" &&
+        c.start < start + duration - epsilon &&
+        c.start + c.duration > start + epsilon,
+    )
+    .map((c) => c.transform.y / Math.max(1, project.height));
+  if (!taken.length) return undefined;
+  const distance = (row: number) => Math.min(...taken.map((y) => Math.abs(y - row)));
+  const row =
+    textRows.find((candidate) => distance(candidate) > 0.16) ??
+    [...textRows].sort((a, b) => distance(b) - distance(a))[0];
+  return row === textRows[0] ? undefined : row * project.height;
+}
 export const outlineOff = { color: "#000000", width: 0 };
 export const shadowOff = { color: "#000000", x: 0, y: 0, blur: 0 };
 export const shadowOn = (shadow?: { x: number; y: number; blur: number }) =>

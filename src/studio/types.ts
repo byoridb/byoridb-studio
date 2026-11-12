@@ -10,6 +10,12 @@ export interface Media {
   hasAudio: boolean;
   thumbnail?: string;
   waveform?: number[];
+  /**
+   * Sent instead of `waveform` to a caller that asked for `omitWaveforms`: the number
+   * of peaks (0: the audio could not be read; absent: not computed yet). The peaks
+   * themselves then come from `media.waveform {id}`.
+   */
+  waveformPeaks?: number;
   missing?: boolean;
   proxy?: boolean;
   codec?: string;

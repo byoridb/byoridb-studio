@@ -113,7 +113,8 @@ describe("Reusable assets", () => {
     expect(command).not.toHaveBeenCalled();
     fireEvent.pointerUp(slider);
     await waitFor(() => expect(command).toHaveBeenCalledTimes(1));
-    expect(command).toHaveBeenCalledWith("edit.update", { id: "c1", patch: { color: { ...visual.color, brightness: .35 } }, expectedRevision: 3 });
+    // The changed field alone: the service merges it into the clip as it is then.
+    expect(command).toHaveBeenCalledWith("edit.update", { id: "c1", patch: { color: { brightness: .35 } }, expectedRevision: 3 });
   });
 
   it("selects a system font without resending a managed font path", async () => {

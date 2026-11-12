@@ -48,7 +48,9 @@ never replace a user's global Claude/Codex/Gemini settings. See README.md.
 - `scripts/test_integration.py`: end-to-end tests against the real `studio-service`.
 
 UI, CLI and MCP must share the same editor state and validated command path.
-Pass expectedRevision for edits; reject stale asynchronous results. Keep user
+Pass expectedRevision for edits; reject stale asynchronous results. A patch carries
+only the fields it changes (the service merges; this window's queued edits follow its
+own revisions). Saves are deferred up to a second: flush before a slow command. Keep user
 media untouched, cancellation explicit, and preview/export output consistent.
 The app stores projects in `~/.byori-studio`; automated integration tests must use
 isolated BYORI_STUDIO_HOME/port, never a user's current project. The packaged app

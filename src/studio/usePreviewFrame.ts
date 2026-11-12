@@ -20,6 +20,8 @@ export function usePreviewFrame(
   const key = `${content}:${Math.floor(at * project.fps)}:${pixels}`;
   const cache = useRef(new Map<string, Frame>());
   const alive = useRef(true);
+  /** Frame requests the service has not answered yet. */
+  const waiting = useRef(0);
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -28,7 +30,13 @@ export function usePreviewFrame(
   }, []);
   useEffect(() => {
     let valid = true;
-    if (!enabled) return;
+    if (!enabled) {
+      // Playback has started (or the frame is no longer shown): a render still
+      // running would only take the processor from the decoders. Stop it.
+      if (waiting.current)
+        void rpc("preview.cancel", { client }, project.id).catch(() => {});
+      return;
+    }
     const hit = cache.current.get(key);
     if (hit) {
       setFrame(hit);
@@ -38,11 +46,17 @@ export function usePreviewFrame(
     // (PREVIEW_CANCELLED), so only the newest frame is ever waited for.
     const timer = setTimeout(() => {
       const request = { key, projectId: project.id, revision: project.revision };
-      rpc<{ assetId: string; revision: number; projectId?: string }>(
+      waiting.current++;
+      const settle = () => {
+        waiting.current--;
+      };
+      const reply = rpc<{ assetId: string; revision: number; projectId?: string }>(
         "preview.frame",
         { time: at, width: pixels, expectedRevision: request.revision, client },
         request.projectId,
-      ).then(
+      );
+      void reply.then(settle, settle);
+      reply.then(
         (result) => {
           if (
             result.revision !== request.revision ||

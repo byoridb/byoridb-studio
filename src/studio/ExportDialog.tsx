@@ -1,17 +1,23 @@
 import { useEffect, useState } from "react";
 import {
   ChevronDown,
+  Copy,
   Download,
   FolderOpen,
   LoaderCircle,
   X,
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { assetUrl, rpc, savePath } from "./api";
+import { assetUrl, revealFile, rpc, savePath } from "./api";
 import { durationOf, type Job, type Project } from "./types";
 import { useModal } from "./useModal";
 import { usePoll } from "./usePoll";
 import "./panels.css";
+
+/** The quality choices (CRF) by the names the dialog shows for them everywhere. */
+const qualityNames: [number, string][] = [[18, "높음"], [23, "보통"], [28, "작은 파일"]];
+/** How long 「경로 복사」 says that it copied. */
+const COPIED_MS = 2000;
 
 const audioFormats = ["mp3", "wav"];
 const codecFormats = ["mp4", "mov"];
@@ -49,11 +55,18 @@ export default function ExportDialog({
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState<"" | "copied" | "failed">("");
+  const [revealError, setRevealError] = useState("");
   const [range, setRange] = useState(false);
   const [startTime, setStartTime] = useState(0);
   const [endTime, setEndTime] = useState(durationOf(project));
   const [preview, setPreview] = useState("");
   const [previewError, setPreviewError] = useState(false);
+  useEffect(() => {
+    if (copied !== "copied") return;
+    const timer = setTimeout(() => setCopied(""), COPIED_MS);
+    return () => clearTimeout(timer);
+  }, [copied]);
   useEffect(() => {
     let stale = false;
     setPreview("");
@@ -92,6 +105,14 @@ export default function ExportDialog({
   const audioOnly = audioFormats.includes(format);
   const codecChoice = codecFormats.includes(format);
   const kbps = Number(bitrate);
+  /** One line saying what the current choices encode to; the defaults read as-is. */
+  const encoding = [
+    !codecChoice ? "VP9" : codec === "hevc" ? "HEVC" : "H.264",
+    bitrate.trim()
+      ? `${bitrate.trim()} kbps`
+      : `품질 ${qualityNames.find(([value]) => value === quality)?.[1] ?? quality}`,
+    codecChoice && hardware ? "하드웨어 가속" : "소프트웨어 인코딩",
+  ].join(" · ");
   const start = async () => {
     setBusy(true);
     setError("");
@@ -127,6 +148,8 @@ export default function ExportDialog({
         },
         project.id,
       );
+      setCopied("");
+      setRevealError("");
       setJob({ id: j.id, state: "running", progress: 0 });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -285,9 +308,9 @@ export default function ExportDialog({
                 value={quality}
                 onChange={(e) => setQuality(+e.target.value)}
               >
-                <option value={18}>높음</option>
-                <option value={23}>보통</option>
-                <option value={28}>작은 파일</option>
+                {qualityNames.map(([value, name]) => (
+                  <option key={value} value={value}>{name}</option>
+                ))}
               </select>
             </label>
             </div>
@@ -384,10 +407,13 @@ export default function ExportDialog({
                 </label>
                 <p className="export-hint">
                   {codecChoice
-                    ? "하드웨어 가속을 쓸 수 없거나 실패하면 소프트웨어 인코더로 자동 전환합니다. 비트레이트를 입력하면 품질 설정 대신 사용합니다."
+                    ? "하드웨어 가속이 안 되면 소프트웨어 인코더로 자동 전환하고, 비트레이트를 넣으면 품질 대신 씁니다."
                     : "WebM은 VP9 소프트웨어 인코더로 내보냅니다."}
                 </p>
               </div>
+            )}
+            {!audioOnly && (
+              <p className="export-hint export-summary">{encoding}</p>
             )}
             {audioOnly && (
               <p className="export-hint">
@@ -409,7 +435,7 @@ export default function ExportDialog({
           </div>
         )}
         {job && (
-          <div className="export-progress">
+          <div className={`export-progress ${job.state}`} role="status">
             <div>
               <strong>
                 {job.state === "completed"
@@ -417,21 +443,77 @@ export default function ExportDialog({
                   : job.state === "failed"
                     ? "내보내기 실패"
                     : job.state === "cancelled"
-                      ? "내보내기 취소"
+                      ? "내보내기를 취소했습니다"
                       : job.state === "cancelling"
                         ? "내보내기를 취소하고 있습니다"
-                        : "영상을 내보내고 있습니다"}
+                        : audioOnly
+                          ? "소리를 내보내고 있습니다"
+                          : "영상을 내보내고 있습니다"}
               </strong>
-              <span>{Math.round((job.progress || 0) * 100)}%</span>
+              {(active || job.state === "completed") && (
+                <span>{Math.round((job.progress || 0) * 100)}%</span>
+              )}
             </div>
-            <progress value={job.progress || 0} max={1} />
-            {job.path && <p>{job.path}</p>}
-            {job.encoder && (
+            {active && (
+              <progress
+                aria-label="내보내기 진행률"
+                value={job.progress || 0}
+                max={1}
+              />
+            )}
+            {job.state === "completed" && job.path && (
+              <div className="export-result">
+                <p title={job.path}>{job.path}</p>
+                {isTauri() && (
+                  <button
+                    className="export-copy"
+                    onClick={() => {
+                      setRevealError("");
+                      void revealFile(job.path!).catch((e) =>
+                        setRevealError(e instanceof Error ? e.message : String(e)),
+                      );
+                    }}
+                  >
+                    <FolderOpen size={13} />
+                    파일 위치 열기
+                  </button>
+                )}
+                <button
+                  className="export-copy"
+                  onClick={() => {
+                    const saved = job.path!;
+                    void (async () => {
+                      try {
+                        await navigator.clipboard.writeText(saved);
+                        setCopied("copied");
+                      } catch {
+                        setCopied("failed");
+                      }
+                    })();
+                  }}
+                >
+                  <Copy size={13} />
+                  {copied === "copied" ? "복사했습니다" : "경로 복사"}
+                </button>
+              </div>
+            )}
+            {copied === "failed" && job.state === "completed" && (
+              <p>경로를 복사하지 못했습니다. 위 경로를 직접 선택해 복사하세요.</p>
+            )}
+            {revealError && job.state === "completed" && (
+              <p className="inline-error" role="alert">{revealError}</p>
+            )}
+            {active && job.encoder && (
               <p>
                 인코더: {job.encoder.includes("videotoolbox") ? "하드웨어" : "소프트웨어"} ({job.encoder})
               </p>
             )}
-            {job.error && <p className="inline-error">{job.error}</p>}
+            {job.state === "failed" && (
+              <p className="inline-error" role="alert">
+                {job.error ||
+                  "원인을 확인하지 못했습니다. 저장 위치와 남은 저장 공간을 확인한 뒤 다시 시도하세요."}
+              </p>
+            )}
           </div>
         )}
         <footer>
@@ -459,7 +541,11 @@ export default function ExportDialog({
               ) : (
                 <Download size={15} />
               )}{" "}
-              {job?.state === "completed" ? "다시 내보내기" : "내보내기"}
+              {job?.state === "completed"
+                ? "다시 내보내기"
+                : job?.state === "failed"
+                  ? "다시 시도"
+                  : "내보내기"}
             </button>
           )}
         </footer>

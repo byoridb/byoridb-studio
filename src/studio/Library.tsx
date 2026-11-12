@@ -22,6 +22,7 @@ import {
 import { isTauri } from "@tauri-apps/api/core";
 import { assetUrl, pickFiles, savePath, uploadFile } from "./api";
 import {
+  freeTextY,
   incomingTransitionCommands,
   overlapWithPrevious,
   previousClip,
@@ -280,13 +281,18 @@ export function Library({
       setError(e);
     }
   };
-  const addText = (label: string, style: Record<string, unknown> = {}) =>
-    run(label, "edit.add", {
-      start: now?.() ?? playhead,
+  const addText = (label: string, style: Record<string, unknown> = {}) => {
+    const start = now?.() ?? playhead;
+    // Text already on screen at that time keeps its place; the new one goes above it.
+    const y = freeTextY(project, start, 3);
+    return run(label, "edit.add", {
+      start,
       duration: 3,
       ...(targetTrack?.kind === "text" ? { trackId: targetTrack.id } : {}),
       text: { ...textDefaults, content: label, ...style },
+      ...(y === undefined ? {} : { transform: { y } }),
     });
+  };
   const patchSelected = (key: string, patch: Record<string, unknown>) =>
     selected
       ? run(key, "edit.update", {
@@ -620,9 +626,9 @@ export function Library({
                         disabled={pending !== null}
                         onClick={() =>
                           void patchSelected("voice", {
+                            // Only what changes when the clip has its audio settings: the service merges.
                             audio: {
-                              ...audioDefaults,
-                              ...selected.audio,
+                              ...(selected.audio ? {} : audioDefaults),
                               denoise: true,
                               voiceEnhance: true,
                             },
@@ -637,8 +643,7 @@ export function Library({
                         onClick={() =>
                           void patchSelected("normalize", {
                             audio: {
-                              ...audioDefaults,
-                              ...selected.audio,
+                              ...(selected.audio ? {} : audioDefaults),
                               normalize: true,
                             },
                           })

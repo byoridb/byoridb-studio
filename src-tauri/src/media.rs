@@ -16,7 +16,7 @@ const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKGROUND_WAVEFORM_TIMEOUT: Duration = Duration::from_secs(600);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Proxies are at most this long on their longer side.
-const PROXY_SIZE: u32 = 1280;
+pub const PROXY_SIZE: u32 = 1280;
 /// Codecs a browser plays smoothly from the original file.
 const LIGHT_CODECS: [&str; 4] = ["h264", "vp8", "vp9", "av1"];
 const WAVEFORM_RATE: usize = 8000;
@@ -234,15 +234,40 @@ fn frame_rate(value: Option<&Value>) -> Option<f64> {
 /// know how far apart its frames are. `None` for variable or unreadable material.
 /// Remembered per file until the file changes.
 pub async fn constant_frame_rate(path: &Path) -> Option<f64> {
-    // Per file: its size and modification time when probed, and the rate found.
-    type Known = std::collections::HashMap<PathBuf, ((u64, Option<SystemTime>), Option<f64>)>;
+    video_traits(path).await?.0
+}
+
+/// Whether the file's video has transparency. A proxy has none, so it cannot stand
+/// in for such a file where the picture below shows through. Unreadable files count
+/// as transparent: the original is the safe choice.
+pub async fn has_alpha(path: &Path) -> bool {
+    video_traits(path).await.is_none_or(|traits| traits.1)
+}
+
+/// Pixel formats that carry an alpha channel (or a palette that may).
+fn alpha_format(name: &str) -> bool {
+    name.starts_with("yuva")
+        || name.starts_with("ya")
+        || name.starts_with("gbrap")
+        || name == "pal8"
+        || ["rgba", "bgra", "argb", "abgr"]
+            .iter()
+            .any(|packed| name.starts_with(packed))
+}
+
+/// The constant frame rate (if any) and the transparency of a file's first video
+/// stream, probed once per file and remembered until the file changes.
+async fn video_traits(path: &Path) -> Option<(Option<f64>, bool)> {
+    // Per file: its size and modification time when probed, and what was found.
+    type Known =
+        std::collections::HashMap<PathBuf, ((u64, Option<SystemTime>), (Option<f64>, bool))>;
     static KNOWN: std::sync::OnceLock<std::sync::Mutex<Known>> = std::sync::OnceLock::new();
     let info = std::fs::metadata(path).ok()?;
     let stamp = (info.len(), info.modified().ok());
     let known = KNOWN.get_or_init(Default::default);
-    if let Some((seen, rate)) = known.lock().unwrap().get(path) {
+    if let Some((seen, traits)) = known.lock().unwrap().get(path) {
         if *seen == stamp {
-            return *rate;
+            return Some(*traits);
         }
     }
     let output = output_within(
@@ -250,7 +275,7 @@ pub async fn constant_frame_rate(path: &Path) -> Option<f64> {
             .args(["-v", "error", "-select_streams", "v:0"])
             .args([
                 "-show_entries",
-                "stream=r_frame_rate,avg_frame_rate",
+                "stream=r_frame_rate,avg_frame_rate,pix_fmt",
                 "-of",
                 "json",
             ])
@@ -269,12 +294,13 @@ pub async fn constant_frame_rate(path: &Path) -> Option<f64> {
         (Some(base), Some(average)) if (base - average).abs() <= base * 0.01 => Some(average),
         _ => None,
     };
+    let traits = (rate, alpha_format(stream["pix_fmt"].as_str().unwrap_or("")));
     let mut known = known.lock().unwrap();
     if known.len() >= 512 {
         known.clear();
     }
-    known.insert(path.to_path_buf(), (stamp, rate));
-    rate
+    known.insert(path.to_path_buf(), (stamp, traits));
+    Some(traits)
 }
 
 /// Probes a file and makes its thumbnail. The result has no `waveform` field.
@@ -489,18 +515,51 @@ pub fn proxy_path(root: &Path, media_id: &str) -> PathBuf {
 }
 
 /// Next to each proxy, a note of the source file it was made from, written before
-/// the proxy is built: `<root>/proxies/<mediaId>.source`.
+/// the proxy is built: `<root>/proxies/<mediaId>.source`. Its text is `proxy_note`.
 pub fn proxy_source_note(proxy: &Path) -> PathBuf {
     proxy.with_extension("source")
 }
 
-/// Whether `proxy` exists and shows `source`. A proxy without its note, or noted as
-/// made from another file (the media was relinked since), does not stand in for it.
-/// The one place that decides this, for the service that builds proxies and for the
-/// `proxy` flag of a media item.
+/// The size and modification time of `source` as one line, or None when the file
+/// cannot be read now. Another content at the same path has another stamp.
+pub fn source_stamp(source: &str) -> Option<String> {
+    let info = std::fs::metadata(source).ok()?;
+    let modified = info
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!("{} {}", info.len(), modified.as_nanos()))
+}
+
+/// What the note beside a proxy of `source` says when it is made now: the path,
+/// then the file's size and modification time on a second line.
+pub fn proxy_note(source: &str) -> String {
+    match source_stamp(source) {
+        Some(stamp) => format!("{source}\n{stamp}"),
+        None => source.to_owned(),
+    }
+}
+
+/// Whether `proxy` exists and shows `source` as that file is now. A proxy without
+/// its note, noted as made from another file (the media was relinked since), or made
+/// from an earlier content of the same path (the file was replaced in place; a note
+/// without the size and time counts as that) does not stand in for it. While the
+/// source cannot be read the path alone decides, so a proxy survives its drive being
+/// unplugged. The one place that decides this, for the service that builds proxies,
+/// for rendering and for the `proxy` flag of a media item.
 pub fn proxy_is_of(proxy: &Path, source: &str) -> bool {
-    proxy.is_file()
-        && std::fs::read_to_string(proxy_source_note(proxy)).is_ok_and(|noted| noted == source)
+    if !proxy.is_file() {
+        return false;
+    }
+    let Ok(noted) = std::fs::read_to_string(proxy_source_note(proxy)) else {
+        return false;
+    };
+    let (path, made_from) = match noted.split_once('\n') {
+        Some((path, stamp)) => (path, Some(stamp)),
+        None => (noted.as_str(), None),
+    };
+    path == source && source_stamp(source).is_none_or(|now| made_from == Some(now.as_str()))
 }
 
 /// Transcodes the media's source into its proxy (H.264, at most 1280 on the longer
@@ -1003,6 +1062,33 @@ mod tests {
         assert_eq!(asset["codec"], "h264");
         assert_eq!(constant_frame_rate(&mp4).await, Some(25.0));
         assert_eq!(constant_frame_rate(&root.join("missing.mp4")).await, None);
+        // Opaque video may be shown from a proxy; transparent or unreadable video not.
+        assert!(!has_alpha(&mp4).await);
+        assert!(has_alpha(&root.join("missing.mp4")).await);
+        for name in [
+            "yuva420p",
+            "yuva444p10le",
+            "rgba",
+            "bgra64le",
+            "argb",
+            "gbrap",
+            "ya8",
+            "pal8",
+        ] {
+            assert!(alpha_format(name), "{name}");
+        }
+        for name in [
+            "yuv420p",
+            "yuvj420p",
+            "yuv422p10le",
+            "rgb24",
+            "gbrp",
+            "gray",
+            "nv12",
+            "",
+        ] {
+            assert!(!alpha_format(name), "{name}");
+        }
         assert!(Path::new(asset["thumbnail"].as_str().unwrap()).is_file());
         let path = Path::new(asset["path"].as_str().unwrap());
         let peaks = waveform(path, asset["duration"].as_f64().unwrap())
@@ -1222,6 +1308,22 @@ mod tests {
         std::fs::write(proxy_source_note(&proxy), "/films/a.mp4").unwrap();
         assert!(proxy_is_of(&proxy, "/films/a.mp4"));
         assert!(!proxy_is_of(&proxy, "/films/b.mp4"), "relinked since");
+        // A source that can be read must also be the content the proxy was made from.
+        let source = folder.join("a.mp4");
+        let path = source.to_str().unwrap();
+        std::fs::write(&source, b"first").unwrap();
+        std::fs::write(proxy_source_note(&proxy), path).unwrap();
+        assert!(!proxy_is_of(&proxy, path), "a note without size and time");
+        std::fs::write(proxy_source_note(&proxy), proxy_note(path)).unwrap();
+        assert!(proxy_is_of(&proxy, path));
+        std::fs::write(&source, b"replaced in place").unwrap();
+        assert!(
+            !proxy_is_of(&proxy, path),
+            "another content at the same path"
+        );
+        std::fs::write(proxy_source_note(&proxy), proxy_note(path)).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert!(proxy_is_of(&proxy, path), "kept while the source is away");
         std::fs::remove_dir_all(folder).unwrap();
         assert_eq!(
             proxy_path(Path::new("/data"), "media-1"),

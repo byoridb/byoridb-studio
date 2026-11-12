@@ -68,7 +68,10 @@ struct ServiceState {
     origins: Arc<Vec<String>>,
     /// Wakes the background media worker after something may have been imported.
     media_work: Arc<Notify>,
+    /// The media whose proxy is being built right now.
+    proxy_in_progress: ProxyInProgress,
 }
+type ProxyInProgress = Arc<std::sync::Mutex<Option<String>>>;
 
 pub struct StudioService {
     pub connection: Connection,
@@ -77,10 +80,13 @@ pub struct StudioService {
     task: Option<JoinHandle<()>>,
     media_worker: Option<JoinHandle<()>>,
     media_cancel: Arc<AtomicBool>,
+    editor: Option<Arc<Mutex<Editor>>>,
+    autosave: Option<JoinHandle<()>>,
 }
 impl StudioService {
-    /// Stops child processes and revokes access. Safe to call more than once;
-    /// does nothing when this instance only attached to an existing service.
+    /// Writes the last edits, stops child processes and revokes access. Safe to
+    /// call more than once; does nothing when this instance only attached to an
+    /// existing service.
     pub fn shutdown(&self) {
         let Some(runtime) = self.runtime.as_ref() else {
             return;
@@ -91,6 +97,9 @@ impl StudioService {
             worker.abort();
         }
         runtime.shutdown();
+        if let Some(editor) = self.editor.as_ref() {
+            save_on_shutdown(editor);
+        }
         let file = self.root.join("connection.json");
         let ours = std::fs::read(&file)
             .ok()
@@ -104,7 +113,10 @@ impl StudioService {
 impl Drop for StudioService {
     fn drop(&mut self) {
         self.shutdown();
-        if let Some(task) = self.task.take() {
+        for task in [self.task.take(), self.autosave.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -245,6 +257,8 @@ impl StudioService {
                         task: None,
                         media_worker: None,
                         media_cancel: Arc::default(),
+                        editor: None,
+                        autosave: None,
                     })
                 }
             };
@@ -253,7 +267,11 @@ impl StudioService {
             url: format!("http://127.0.0.1:{port}"),
             token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
         };
-        let editor = Arc::new(Mutex::new(Editor::new(root.clone())?));
+        let mut editor = Editor::new(root.clone())?;
+        // Edits answer without waiting for the disk; `autosave` writes them.
+        editor.defer_saves();
+        let editor = Arc::new(Mutex::new(editor));
+        let autosave = tokio::spawn(autosave(editor.clone()));
         let runtime = Arc::new(Runtime::new(
             root.clone(),
             connection.clone(),
@@ -266,20 +284,23 @@ impl StudioService {
             .await;
         let media_work = Arc::new(Notify::new());
         let media_cancel = Arc::new(AtomicBool::new(false));
+        let proxy_in_progress = ProxyInProgress::default();
         let media_worker = tokio::spawn(media_worker(
             editor.clone(),
             root.clone(),
             media_work.clone(),
             media_cancel.clone(),
+            proxy_in_progress.clone(),
         ));
         let state = ServiceState {
             previews: Arc::new(PreviewFrames::default()),
-            editor,
+            editor: editor.clone(),
             runtime: runtime.clone(),
             connection: connection.clone(),
             root: root.clone(),
             origins: Arc::new(origins.clone()),
             media_work,
+            proxy_in_progress,
         };
         let cors = CorsLayer::new()
             .allow_origin(AllowOrigin::list(
@@ -332,7 +353,59 @@ impl StudioService {
             task: Some(task),
             media_worker: Some(media_worker),
             media_cancel,
+            editor: Some(editor),
+            autosave: Some(autosave),
         })
+    }
+}
+
+/// How often `autosave` looks whether the editor has edits due to be written.
+const SAVE_POLL: Duration = Duration::from_millis(100);
+/// Writes the open project once editing pauses (`editor::SAVE_IDLE`) and at the
+/// latest `editor::SAVE_LATEST` after an edit. The write happens under the editor
+/// lock, so no edit can slip between what is written and what is marked saved.
+/// A write that fails is tried again every pass; meanwhile the editor writes each
+/// edit at once, so the failure reaches the user with their next edit.
+async fn autosave(editor: Arc<Mutex<Editor>>) {
+    let mut failing = false;
+    loop {
+        tokio::time::sleep(SAVE_POLL).await;
+        let mut editor = editor.lock().await;
+        if !editor.save_due() {
+            continue;
+        }
+        match editor.flush() {
+            Ok(()) => failing = false,
+            Err(error) => {
+                if !failing {
+                    tracing::error!("프로젝트를 저장하지 못했습니다: {error}");
+                }
+                failing = true;
+            }
+        }
+    }
+}
+/// The edits `autosave` has not written yet. A command that is still running holds
+/// the editor; it gets a few seconds to finish before the wait is given up. Giving
+/// up loses no answered edit when that command is one of the editor's slow ones
+/// (imports, probes): those write what was waiting before they start, and nothing
+/// else can edit until they return.
+fn save_on_shutdown(editor: &Arc<Mutex<Editor>>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut editor) = editor.try_lock() {
+            if let Err(error) = editor.flush() {
+                tracing::error!("종료하면서 프로젝트를 저장하지 못했습니다: {error}");
+            }
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::error!(
+                "종료하면서 프로젝트를 저장하지 못했습니다: 편집기가 응답하지 않습니다."
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -344,8 +417,12 @@ async fn media_worker(
     root: PathBuf,
     wake: Arc<Notify>,
     cancel: Arc<AtomicBool>,
+    proxy_in_progress: ProxyInProgress,
 ) {
-    let mut work = MediaWork::default();
+    let mut work = MediaWork {
+        proxy_in_progress,
+        ..MediaWork::default()
+    };
     loop {
         if !media_work_step(&editor, &root, &cancel, &mut work).await {
             // Imports made by speech jobs and agents arrive without a wake-up.
@@ -360,10 +437,13 @@ async fn media_worker(
     }
 }
 const MEDIA_POLL: Duration = Duration::from_secs(5);
-/// How often a waveform that could not be saved is saved again within one run of
-/// the service, after 2, 4 and 8 seconds.
+/// How often a waveform that could not be saved is saved again soon, after 2, 4
+/// and 8 seconds. A save that still fails then is tried once a minute: it must not
+/// spin, and a disk that works again later must not cost the waveform until the
+/// next start.
 const WAVEFORM_RETRIES: u32 = 3;
 const WAVEFORM_RETRY_DELAY: Duration = Duration::from_secs(2);
+const WAVEFORM_SLOW_RETRY: Duration = Duration::from_secs(60);
 /// A decoded waveform waiting to be saved again.
 struct WaveformRetry {
     failures: u32,
@@ -376,6 +456,8 @@ struct MediaWork {
     attempted: HashSet<String>,
     retries: HashMap<String, WaveformRetry>,
     retry_delay: Duration,
+    slow_retry: Duration,
+    proxy_in_progress: ProxyInProgress,
 }
 impl Default for MediaWork {
     fn default() -> Self {
@@ -383,6 +465,8 @@ impl Default for MediaWork {
             attempted: HashSet::new(),
             retries: HashMap::new(),
             retry_delay: WAVEFORM_RETRY_DELAY,
+            slow_retry: WAVEFORM_SLOW_RETRY,
+            proxy_in_progress: ProxyInProgress::default(),
         }
     }
 }
@@ -426,10 +510,12 @@ async fn media_work_step(
                 if media::proxy_is_of(&output, source) {
                     continue;
                 }
-                // Relinked (or undone) since: the proxy shows another file.
+                // Relinked (or undone) or replaced in place since: the proxy shows
+                // another file.
                 let _ = std::fs::remove_file(&output);
             }
-            let key = format!("proxy:{id}:{source}");
+            // A file replaced at the same path is another attempt.
+            let key = format!("proxy:{id}:{}", media::proxy_note(source));
             if next.is_none()
                 && item["missing"] != true
                 && media::needs_proxy(item)
@@ -449,15 +535,32 @@ async fn media_work_step(
     let noted = std::fs::create_dir_all(root.join("proxies")).and_then(|_| {
         std::fs::write(
             media::proxy_source_note(&output),
-            item["path"].as_str().unwrap_or(""),
+            media::proxy_note(item["path"].as_str().unwrap_or("")),
         )
     });
+    // Named while it is written, so that cleaning storage leaves its unfinished
+    // file alone. Cleared on every way out, also when this task is dropped.
+    struct InProgress(ProxyInProgress);
+    impl Drop for InProgress {
+        fn drop(&mut self) {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+    let in_progress = InProgress(work.proxy_in_progress.clone());
+    *in_progress
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = item["id"].as_str().map(str::to_owned);
     let built = match noted {
         Ok(()) => media::build_proxy(root, &item, cancel.clone())
             .await
             .map(|_| ()),
         Err(error) => Err(error.to_string()),
     };
+    drop(in_progress);
     match built {
         Ok(()) => {
             attempted.remove(&key);
@@ -510,23 +613,25 @@ where
             // nothing was recorded. Either way, compute it when it is pending again.
             Ok(_) => {}
             // The save failed (a full or briefly unwritable disk). Tried again a few
-            // times, each wait twice the last, then left until the next start: a save
-            // that keeps failing must not spin.
-            Err(error) if failures < WAVEFORM_RETRIES => {
-                let wait = work.retry_delay * 2u32.pow(failures);
-                tracing::warn!("waveform for {id}: {error}; retrying in {wait:?}");
+            // times, each wait twice the last, then once a minute: a save that keeps
+            // failing must not spin, and the decoded peaks are kept meanwhile.
+            Err(error) => {
+                let wait = if failures < WAVEFORM_RETRIES {
+                    work.retry_delay * 2u32.pow(failures)
+                } else {
+                    work.slow_retry
+                };
+                if failures <= WAVEFORM_RETRIES {
+                    tracing::warn!("waveform for {id}: {error}; retrying in {wait:?}");
+                }
                 work.retries.insert(
                     key,
                     WaveformRetry {
-                        failures: failures + 1,
+                        failures: failures.saturating_add(1),
                         at: std::time::Instant::now() + wait,
                         peaks,
                     },
                 );
-            }
-            Err(error) => {
-                tracing::warn!("waveform for {id}: {error}; not retried until the next start");
-                work.attempted.insert(key);
             }
         }
     }
@@ -541,11 +646,38 @@ where
 /// in `speech/` are the only copy of that media, and a project file saved outside
 /// this folder may still point at them, so they are never deleted automatically.
 fn remove_orphaned_media_files(root: &FsPath) {
+    // Nothing is being built yet: every unfinished proxy is left over from a run
+    // that was killed, whatever the project files say or fail to say.
+    for path in unfinished_proxies(root, None, Duration::ZERO) {
+        let _ = std::fs::remove_file(&path);
+    }
     if let Some(references) = project_references(root) {
-        for path in orphaned_proxies(root, &references, true) {
+        for path in orphaned_proxies(root, &references) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+/// How long an unfinished proxy must have been untouched before a running service
+/// takes it for abandoned. FFmpeg writes to the one it is building all the time.
+const UNFINISHED_PROXY_AGE: Duration = Duration::from_secs(60);
+/// The ".partial.mp4" files in `proxies/` that nothing is writing: not the one of
+/// the media being built (`building`), and not touched for `idle`.
+fn unfinished_proxies(root: &FsPath, building: Option<&str>, idle: Duration) -> Vec<PathBuf> {
+    listed(&root.join("proxies"))
+        .into_iter()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let ours = building.is_some_and(|id| name.starts_with(&format!(".{id}.")));
+            let quiet = std::fs::metadata(path)
+                .and_then(|info| info.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age >= idle));
+            name.ends_with(".partial.mp4") && !ours && quiet
+        })
+        .collect()
 }
 fn listed(folder: &FsPath) -> Vec<PathBuf> {
     std::fs::read_dir(folder)
@@ -572,9 +704,8 @@ fn project_references(root: &FsPath) -> Option<String> {
     Some(references)
 }
 /// The files in `proxies/` whose media id no project mentions: "<media id>.mp4" and
-/// its ".source" note. Unfinished ".partial.mp4" files count only with `partial`,
-/// which is for startup: while the service runs one of them is being written.
-fn orphaned_proxies(root: &FsPath, references: &str, partial: bool) -> Vec<PathBuf> {
+/// its ".source" note. Unfinished ".partial.mp4" files are `unfinished_proxies`'.
+fn orphaned_proxies(root: &FsPath, references: &str) -> Vec<PathBuf> {
     listed(&root.join("proxies"))
         .into_iter()
         .filter(|path| {
@@ -584,7 +715,7 @@ fn orphaned_proxies(root: &FsPath, references: &str, partial: bool) -> Vec<PathB
                 .to_string_lossy()
                 .into_owned();
             if name.ends_with(".partial.mp4") {
-                return partial;
+                return false;
             }
             match name.rsplit_once('.') {
                 Some((id, "mp4" | "source")) => !references.contains(&format!("\"{id}\"")),
@@ -620,18 +751,22 @@ fn remove_entry(path: &FsPath) -> bool {
 const STORAGE_FOLDERS: [&str; 5] = ["proxies", "imports", "speech", "renders", "previews"];
 const CLEANABLE: [&str; 3] = ["proxies", "previews", "renders"];
 /// What may be deleted right now, per cleanable folder: proxies no project mentions
-/// (the open one included) and the scratch files in `previews/` and `renders/` that
-/// neither a running render nor a shown preview uses. `in_use` are the preview files
-/// still shown. Without readable project files no proxy is offered.
+/// (the open one included), unfinished proxies that nothing is writing (`building`
+/// is the media whose proxy is being made), and the scratch files in `previews/` and
+/// `renders/` that neither a running render nor a shown preview uses. `in_use` are
+/// the preview files still shown. Without readable project files no finished proxy
+/// is offered.
 fn reclaimable(
     root: &FsPath,
     open_project: &str,
     in_use: &HashSet<PathBuf>,
+    building: Option<&str>,
 ) -> Vec<(&'static str, Vec<PathBuf>)> {
-    let proxies = project_references(root).map_or_else(Vec::new, |mut references| {
+    let mut proxies = project_references(root).map_or_else(Vec::new, |mut references| {
         references.push_str(open_project);
-        orphaned_proxies(root, &references, false)
+        orphaned_proxies(root, &references)
     });
+    proxies.extend(unfinished_proxies(root, building, UNFINISHED_PROXY_AGE));
     let scratch = |folder: &str| -> Vec<PathBuf> {
         listed(&root.join(folder))
             .into_iter()
@@ -671,12 +806,22 @@ async fn storage(state: &ServiceState, clean: bool) -> Result<Value, String> {
                         in_use.insert(path);
                     }
                 }
-                editor.dispatch("project.get", json!({})).await?.to_string()
+                editor
+                    .dispatch("project.get", json!({"omitWaveforms":true}))
+                    .await?
+                    .to_string()
             };
+            let building = state
+                .proxy_in_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             tokio::task::spawn_blocking(move || {
                 let mut folders = serde_json::Map::new();
                 let (mut total, mut freeable) = (0, 0);
-                for (folder, entries) in reclaimable(&root, &open_project, &in_use) {
+                for (folder, entries) in
+                    reclaimable(&root, &open_project, &in_use, building.as_deref())
+                {
                     let mut sum = (0, 0);
                     for entry in entries {
                         let size = disk_use(&entry);
@@ -928,6 +1073,7 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
             || "player".to_owned(),
             |client| client.chars().take(64).collect(),
         );
+    let agent = matches!(caller, Caller::Agent(_));
     if let Caller::Agent(project) = caller {
         if let Err(error) = agent_request(&request.method, &mut request.params, &state.root) {
             return (StatusCode::FORBIDDEN, Json(json!({"error":error}))).into_response();
@@ -951,6 +1097,9 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
                 &preview_client,
             )
             .await
+    } else if request.method == "preview.cancel" {
+        // Not in the agent allowlist: only the UI stops its own frames.
+        Ok(json!({"cancelled": state.previews.cancel(&preview_client)}))
     } else if request.method.starts_with("runtime.")
         || request.method.starts_with("agent.")
         || request.method.starts_with("memory.")
@@ -968,14 +1117,22 @@ async fn rpc(State(state): State<ServiceState>, headers: HeaderMap, body: Body) 
             .await
     } else {
         let mut editor = state.editor.lock().await;
-        if let Some(id) = request.project_id.as_ref() {
-            match editor.dispatch("project.get", json!({})).await {
-                Ok(project) if project["id"].as_str() == Some(id.as_str()) => {},
-                _ => return (StatusCode::CONFLICT, Json(json!({"error":"에이전트 작업 중 프로젝트가 변경되었습니다. 새 작업을 시작해주세요."}))).into_response(),
-            }
+        if request
+            .project_id
+            .as_ref()
+            .is_some_and(|id| editor.project_id() != id)
+        {
+            return (StatusCode::CONFLICT, Json(json!({"error":"에이전트 작업 중 프로젝트가 변경되었습니다. 새 작업을 시작해주세요."}))).into_response();
         }
         editor.dispatch(&request.method, request.params).await
     };
+    // Waveforms are for drawing the timeline: an agent gets their length only.
+    let result = result.map(|mut reply| {
+        if agent {
+            crate::editor::omit_waveforms(&mut reply);
+        }
+        reply
+    });
     if result.is_ok() && brings_media(&request.method) {
         state.media_work.notify_one();
     }
@@ -1309,6 +1466,116 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         std::fs::remove_dir_all(&state.root).unwrap();
     }
+    /// Waveforms are for drawing: an agent's replies name their length only, the UI
+    /// gets them unless it asks not to, and then fetches one with `media.waveform`.
+    #[tokio::test]
+    async fn agents_and_slim_replies_carry_no_waveforms() {
+        let state = upload_fixture();
+        let (_, project) = call(&state, "test", json!({"method":"project.get"})).await;
+        let mut project = project["result"].clone();
+        project["media"] = json!([{"id":"media-tone","name":"tone.wav","path":"/nonexistent/tone.wav","kind":"audio","duration":1.0,"width":0,"height":0,"hasAudio":true,"waveform":[0.5,0.25]}]);
+        let file = state.root.join("exports/with-waveform.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, project.to_string()).unwrap();
+        let (status, opened) = call(
+            &state,
+            "test",
+            json!({"method":"project.open","params":{"path":file}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["result"]["media"][0]["waveform"], json!([0.5, 0.25]));
+        let project_id = opened["result"]["id"].as_str().unwrap().to_owned();
+        let token = state.runtime.issue_agent_token(&project_id);
+
+        let (_, seen) = call(&state, &token, json!({"method":"project.get"})).await;
+        let media = &seen["result"]["media"][0];
+        assert_eq!(media["id"], "media-tone");
+        assert!(media.get("waveform").is_none(), "{media}");
+        assert_eq!(media["waveformPeaks"], 2);
+        let (status, edited) = call(
+            &state,
+            &token,
+            json!({"method":"edit.add","params":{"text":"자막","duration":1.0}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert!(edited["result"]["media"][0].get("waveform").is_none());
+        let (status, _) = call(
+            &state,
+            &token,
+            json!({"method":"media.waveform","params":{"id":"media-tone"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (_, full) = call(&state, "test", json!({"method":"project.get"})).await;
+        assert_eq!(full["result"]["media"][0]["waveform"], json!([0.5, 0.25]));
+        let (_, slim) = call(
+            &state,
+            "test",
+            json!({"method":"project.get","params":{"omitWaveforms":true}}),
+        )
+        .await;
+        assert!(slim["result"]["media"][0].get("waveform").is_none());
+        assert_eq!(slim["result"]["media"][0]["waveformPeaks"], 2);
+        let (_, peaks) = call(
+            &state,
+            "test",
+            json!({"method":"media.waveform","params":{"id":"media-tone"}}),
+        )
+        .await;
+        assert_eq!(
+            peaks["result"],
+            json!({"id":"media-tone","waveform":[0.5,0.25]})
+        );
+        std::fs::remove_dir_all(&state.root).unwrap();
+    }
+    /// The service answers an edit before it is on disk: it is written once editing
+    /// pauses, and at once when the service shuts down.
+    #[tokio::test]
+    async fn edits_are_written_after_a_pause_and_on_shutdown() {
+        let root = temp_root("autosave");
+        let service = StudioService::start_on(root.clone(), Host::Service, 0)
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let add = |text: &'static str| {
+            let request = client
+                .post(format!("{}/rpc", service.connection.url))
+                .bearer_auth(&service.connection.token)
+                .json(&json!({"method":"edit.add","params":{"text":text,"duration":1.0}}));
+            async move {
+                let body: Value = request.send().await.unwrap().json().await.unwrap();
+                assert!(body.get("error").is_none(), "{body}");
+                body["result"].clone()
+            }
+        };
+        let saved = || -> Value {
+            serde_json::from_slice(&std::fs::read(root.join("current.json")).unwrap()).unwrap()
+        };
+        let first = add("하나").await;
+        assert_eq!(first["revision"], 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while saved()["revision"] != 1 {
+            assert!(std::time::Instant::now() < deadline, "never written");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(saved(), first);
+        let stored = root
+            .join("projects")
+            .join(format!("{}.json", first["id"].as_str().unwrap()));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(stored).unwrap()).unwrap(),
+            first
+        );
+
+        let second = add("둘").await;
+        service.shutdown();
+        assert_eq!(saved(), second, "nothing is left for a later write");
+        drop(service);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn agent_output_is_new_files_in_known_folders_only() {
         let root = std::env::temp_dir().join(format!("studio-agent-path-{}", Uuid::new_v4()));
@@ -1514,6 +1781,65 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("다른 프로그램"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    /// Unfinished proxies: all of them go at startup, even when a project file
+    /// cannot be read; a running service spares the one being built and any that
+    /// was written to a moment ago.
+    #[test]
+    fn unfinished_proxies_are_removed_unless_one_may_still_be_written() {
+        let root = temp_root("partials");
+        std::fs::create_dir_all(root.join("proxies")).unwrap();
+        let touch = |name: &str, age: u64| {
+            let path = root.join("proxies").join(name);
+            std::fs::write(&path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
+            path
+        };
+        let building = touch(".media-1.a.partial.mp4", 600);
+        let abandoned = touch(".media-10.b.partial.mp4", 600);
+        let fresh = touch(".media-2.c.partial.mp4", 0);
+        let finished = touch("media-3.mp4", 600);
+        let found = |building: Option<&str>, idle: Duration| {
+            let mut found = unfinished_proxies(&root, building, idle);
+            found.sort();
+            found
+        };
+        assert_eq!(
+            found(Some("media-1"), UNFINISHED_PROXY_AGE),
+            vec![abandoned.clone()]
+        );
+        assert_eq!(
+            found(None, UNFINISHED_PROXY_AGE),
+            vec![building.clone(), abandoned.clone()]
+        );
+        assert_eq!(
+            found(None, Duration::ZERO),
+            vec![building.clone(), abandoned.clone(), fresh.clone()]
+        );
+        // A project folder that cannot be listed as files makes the references
+        // unknown: finished proxies stay, unfinished ones still go.
+        std::fs::create_dir_all(root.join("projects/unreadable.json")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(root.join("current.json"), "{}").unwrap();
+            std::fs::set_permissions(
+                root.join("current.json"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            assert!(project_references(&root).is_none());
+        }
+        remove_orphaned_media_files(&root);
+        assert!(!building.exists() && !abandoned.exists() && !fresh.exists());
+        #[cfg(unix)]
+        assert!(finished.is_file());
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
@@ -1751,7 +2077,13 @@ mod tests {
         for _ in 0..300 {
             let note =
                 std::fs::read_to_string(root.join("proxies").join(format!("{wide_id}.source")));
-            if note.is_ok_and(|noted| FsPath::new(&noted) == other) && file.is_file() {
+            let shows_other = note.is_ok_and(|noted| {
+                noted
+                    .lines()
+                    .next()
+                    .is_some_and(|path| FsPath::new(path) == other)
+            });
+            if shows_other && file.is_file() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1867,10 +2199,11 @@ mod tests {
         std::fs::remove_dir_all(&sources).unwrap();
     }
     /// A waveform that was decoded but could not be saved is saved again after a
-    /// growing wait, without decoding again, and given up after three retries.
+    /// growing wait, without decoding again, and after three retries at a slow,
+    /// steady pace until the save works.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_waveform_that_cannot_be_saved_is_retried_with_backoff_then_left() {
+    async fn a_waveform_that_cannot_be_saved_is_retried_with_backoff_then_slowly() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_root("waveform-backoff");
         let sources = temp_root("waveform-backoff-sources");
@@ -1909,8 +2242,10 @@ mod tests {
             Some(vec![0.5])
         };
         let delay = Duration::from_millis(40);
+        let slow = Duration::from_millis(400);
         let mut work = MediaWork {
             retry_delay: delay,
+            slow_retry: slow,
             ..MediaWork::default()
         };
         let waveform = || async {
@@ -1943,7 +2278,7 @@ mod tests {
         );
 
         // A save that keeps failing: the first try and three retries, each wait
-        // twice the last, then nothing more in this run.
+        // twice the last, then one try per slow interval for as long as it takes.
         let id = editor
             .lock()
             .await
@@ -1974,12 +2309,23 @@ mod tests {
             waveform_work(&editor, &mut work, decode).await,
             "the last retry"
         );
-        assert!(work.retries.is_empty() && work.attempted.len() == 1);
-        writable(true);
+        assert!(work.retries.len() == 1 && work.attempted.is_empty());
+        let wait = work.next_retry().expect("still scheduled");
+        assert!(wait > waits[2] && wait <= slow, "{wait:?} after {waits:?}");
         assert!(
             !waveform_work(&editor, &mut work, decode).await,
-            "left until the next start"
+            "not before the slow wait is over"
         );
+        tokio::time::sleep(wait + Duration::from_millis(10)).await;
+        assert!(waveform_work(&editor, &mut work, decode).await);
+        assert_eq!(work.next_retry().map(|wait| wait > slow / 2), Some(true));
+        assert!(waveform().await.is_null());
+        // The disk works again: the next slow try records the kept peaks.
+        writable(true);
+        tokio::time::sleep(slow + Duration::from_millis(10)).await;
+        assert!(waveform_work(&editor, &mut work, decode).await);
+        assert_eq!(waveform().await, json!([0.5]));
+        assert!(work.retries.is_empty() && work.attempted.is_empty());
         assert_eq!(
             decoded.load(Ordering::SeqCst),
             2,
@@ -2041,7 +2387,7 @@ mod tests {
         let kept = [
             touch("proxies/media-stored.mp4", 1000),
             touch("proxies/media-stored.source", 10),
-            // Being written by the worker for all this knows.
+            // Written to a moment ago: the worker may be building it.
             touch("proxies/.media-new.partial.mp4", 30),
             touch("imports/upload-a.mp4", 5000),
             touch("speech/job-1/voice.aiff", 700),
@@ -2052,15 +2398,23 @@ mod tests {
             touch("previews/preview-old.png", 300),
             touch("previews/preview-old/text-0.png", 40),
             touch("renders/export-old/filters.ffgraph", 50),
+            // Left by a build that was killed: nothing has written to it for a while.
+            touch("proxies/.media-gone.1.partial.mp4", 7),
         ];
+        std::fs::File::options()
+            .write(true)
+            .open(&removed[5])
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
         let frame_bytes = std::fs::metadata(&frame).unwrap().len();
 
         let usage = rpc("storage.usage", json!({})).await;
         let folder =
             |report: &Value, name: &str, field: &str| report["folders"][name][field].as_u64();
-        assert_eq!(folder(&usage, "proxies", "bytes"), Some(3060));
-        assert_eq!(folder(&usage, "proxies", "files"), Some(5));
-        assert_eq!(folder(&usage, "proxies", "reclaimableBytes"), Some(2020));
+        assert_eq!(folder(&usage, "proxies", "bytes"), Some(3067));
+        assert_eq!(folder(&usage, "proxies", "files"), Some(6));
+        assert_eq!(folder(&usage, "proxies", "reclaimableBytes"), Some(2027));
         assert_eq!(folder(&usage, "imports", "bytes"), Some(5000));
         assert_eq!(folder(&usage, "speech", "bytes"), Some(700));
         assert_eq!(folder(&usage, "renders", "reclaimableBytes"), Some(50));
@@ -2072,9 +2426,9 @@ mod tests {
         );
         assert_eq!(
             usage["bytes"].as_u64(),
-            Some(3060 + 5000 + 700 + 50 + 340 + frame_bytes)
+            Some(3067 + 5000 + 700 + 50 + 340 + frame_bytes)
         );
-        assert_eq!(usage["reclaimableBytes"].as_u64(), Some(2020 + 50 + 340));
+        assert_eq!(usage["reclaimableBytes"].as_u64(), Some(2027 + 50 + 340));
         for name in ["imports", "speech"] {
             assert_eq!(usage["folders"][name]["cleanable"], false);
             assert!(usage["folders"][name].get("reclaimableBytes").is_none());
@@ -2103,8 +2457,8 @@ mod tests {
         }
 
         let cleaned = rpc("storage.clean", json!({})).await;
-        assert_eq!(cleaned["removedBytes"].as_u64(), Some(2020 + 50 + 340));
-        assert_eq!(folder(&cleaned, "proxies", "removedFiles"), Some(2));
+        assert_eq!(cleaned["removedBytes"].as_u64(), Some(2027 + 50 + 340));
+        assert_eq!(folder(&cleaned, "proxies", "removedFiles"), Some(3));
         assert_eq!(folder(&cleaned, "proxies", "bytes"), Some(1040));
         assert_eq!(folder(&cleaned, "imports", "bytes"), Some(5000));
         assert_eq!(folder(&cleaned, "speech", "bytes"), Some(700));
@@ -2264,6 +2618,7 @@ mod tests {
             root,
             origins: Arc::new(allowed_origins(Host::Service)),
             media_work: Arc::new(Notify::new()),
+            proxy_in_progress: ProxyInProgress::default(),
         }
     }
     fn upload_headers() -> HeaderMap {

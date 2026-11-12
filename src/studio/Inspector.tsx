@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import {
   AlignCenter,
   AlignLeft,
@@ -73,6 +73,8 @@ export interface InspectorProps {
   playhead: number;
   /** The live playhead at the moment of an action; `playhead` holds still during playback. */
   now?: () => number;
+  /** Something lies over the panel: its controls take no focus and no input meanwhile. */
+  covered?: boolean;
 }
 
 interface NumberFieldProps {
@@ -641,6 +643,7 @@ export function Inspector({
   onCommand,
   playhead,
   now,
+  covered = false,
 }: InspectorProps) {
   const preview = usePreviewDraft();
   const { catalog } = useAssetCatalog(selected?.kind === "text");
@@ -678,12 +681,18 @@ export function Inspector({
       patch: changes,
       expectedRevision: project.revision,
     });
+  // A change of one field sends that field alone and the service merges it into
+  // the clip as it is then: built from what is on screen, the whole object would
+  // put back the fields an edit still on its way has just changed.
   const patchTransform = (key: string, value: number | boolean) =>
-    selected && patch({ transform: { ...selected.transform, [key]: value } });
+    selected && patch({ transform: { [key]: value } });
   const patchColor = (key: string, value: number) =>
-    selected && patch({ color: { ...selected.color, [key]: value } });
+    selected && patch({ color: { [key]: value } });
   const patchText = (key: string, value: unknown) =>
-    selected && patch({ text: { ...selected.text, [key]: value } });
+    selected && patch({ text: { [key]: value } });
+  /** The same for an object a clip may not have yet: then all of it, with its defaults. */
+  const within = (existing: object | undefined, whole: object, change: object) =>
+    existing ? change : { ...whole, ...change };
   const draft = (changes: Record<string, unknown>) => selected && preview(selected.id, changes);
   const clearDraft = () => selected && preview(selected.id, null);
   const draftTransform = (key: string, value: number) => selected && draft({ transform: { ...selected.transform, [key]: value } });
@@ -830,19 +839,27 @@ export function Inspector({
         : separateTransitionCommands(project, selected),
     );
   /**
-   * A visual clip's own in/out transition. The panel no longer creates these
-   * (entrances and exits are animations); an existing one can still be removed.
+   * A clip's own entrance and exit, apart from the join with the clip before it
+   * (a joined clip's entrance is that join). Older projects fade with only
+   * fadeIn/fadeOut set; that reads as a fade here.
    */
-  const ownTransitions =
+  const ownEdge = (edge: Edge) => {
+    const stored = selected ? transitionOf(selected, edge) : null;
+    const fade = (edge === "in" ? selected?.fadeIn : selected?.fadeOut) ?? 0;
+    const type = stored?.type ?? (fade > 0 ? ("fade" as const) : null);
+    return { edge, type, length: type ? (stored?.duration ?? fade) : 0 };
+  };
+  const ownEdges =
     selected && !isAudio
-      ? (["in", "out"] as const).flatMap((edge) => {
-          if (edge === "in" && joined) return [];
-          const stored = transitionOf(selected, edge);
-          const fade = edge === "in" ? selected.fadeIn : selected.fadeOut;
-          const type = stored?.type ?? (fade > 0 ? ("fade" as const) : null);
-          return type ? [{ edge, type, length: stored?.duration ?? fade }] : [];
-        })
+      ? (["in", "out"] as const)
+          .filter((edge) => !(edge === "in" && joined))
+          .map(ownEdge)
       : [];
+  /** Video and image clips choose their entrance and exit here; text animates. */
+  const ownsTransitions = selected?.kind === "video" || selected?.kind === "image";
+  const ownTransitions = ownsTransitions
+    ? []
+    : ownEdges.flatMap((own) => (own.type ? [{ ...own, type: own.type }] : []));
   const setTransition = (
     edge: Edge,
     type: TransitionType | null,
@@ -852,6 +869,29 @@ export function Inspector({
     // A joined clip overlaps the previous one by exactly its in transition.
     if (edge === "in" && joined) return setJoin(type, duration);
     return patch(transitionPatch(selected, edge, type, duration));
+  };
+  /**
+   * The sound of a clip fades over its fadeIn/fadeOut, the same length as the
+   * picture's transition on that edge, which keeps its type.
+   */
+  const fadeField = (edge: Edge) => {
+    if (!selected || (edge === "in" && joined)) return null;
+    const type = (length: number) =>
+      length > 0 ? (isAudio ? "fade" : (ownEdge(edge).type ?? "fade")) : null;
+    return (
+      <NumberField
+        key={edge}
+        label={edge === "in" ? "페이드 인" : "페이드 아웃"}
+        value={edge === "in" ? selected.fadeIn : selected.fadeOut}
+        min={0}
+        max={selected.duration}
+        step={0.1}
+        unit="s"
+        onCommit={(v) => void setTransition(edge, type(v), v)}
+        onPreview={(v) => draft(transitionPatch(selected, edge, type(v), v))}
+        onCancelPreview={clearDraft}
+      />
+    );
   };
   const crop = { x: 0, y: 0, width: 1, height: 1, ...selected?.crop };
   const mask = {
@@ -878,7 +918,7 @@ export function Inspector({
   };
   const eq = { bass: 0, mid: 0, treble: 0, ...audio.eq };
   const patchCrop = (key: string, value: number) =>
-    patch({ crop: { ...crop, [key]: value } });
+    patch({ crop: within(selected?.crop, crop, { [key]: value }) });
   const draftCrop = (key: string, value: number) =>
     draft({ crop: { ...crop, [key]: value } });
   const draftMask = (key: string, value: number) =>
@@ -893,11 +933,11 @@ export function Inspector({
       },
     });
   const patchMask = (key: string, value: number | string) =>
-    patch({ mask: { ...mask, [key]: value } });
+    patch({ mask: within(selected?.mask, mask, { [key]: value }) });
   const patchChroma = (key: string, value: number | string | boolean) =>
-    patch({ chromaKey: { ...chromaKey, [key]: value } });
+    patch({ chromaKey: within(selected?.chromaKey, chromaKey, { [key]: value }) });
   const patchAudio = (key: string, value: boolean) =>
-    patch({ audio: { ...audio, [key]: value } });
+    patch({ audio: within(selected?.audio, audio, { [key]: value }) });
   const cropToRatio = (ratio: number) => {
     const sourceRatio =
       selectedMedia?.width && selectedMedia.height
@@ -1038,6 +1078,9 @@ export function Inspector({
       className="studio-inspector"
       aria-label="속성 패널"
       aria-busy={busy}
+      // Focusable from code only: the workspace moves focus here when it brings the panel back.
+      tabIndex={-1}
+      inert={covered}
     >
       <nav className="inspector-tabs" aria-label="클립 속성">
         {tabs.map((t) => (
@@ -1321,7 +1364,6 @@ export function Inspector({
                     onReset={() =>
                       patch({
                         text: {
-                          ...selected.text,
                           italic: false,
                           letterSpacing: 0,
                           lineHeight: 1.2,
@@ -1614,7 +1656,7 @@ export function Inspector({
                     title="고급"
                     onReset={() =>
                       patch({
-                        transform: { ...selected.transform, flipX: false, flipY: false },
+                        transform: { flipX: false, flipY: false },
                         blendMode: "normal",
                         mask: { type: "none", x: 0.5, y: 0.5, width: 1, height: 1, feather: 0 },
                       })
@@ -1820,6 +1862,14 @@ export function Inspector({
                       />
                       <span>음성 선명하게</span>
                     </label>
+                    {!isAudio && (
+                      <>
+                        {(["in", "out"] as const).map(fadeField)}
+                        <p className="inspector-hint">
+                          소리 페이드는 화면의 등장·퇴장 전환과 같은 길이로 움직입니다.
+                        </p>
+                      </>
+                    )}
                   </Section>
                 )}
                 {hasAudio && (
@@ -1877,7 +1927,7 @@ export function Inspector({
                       />
                     </Section>
                   )}
-                {(isAudio || before || ownTransitions.length > 0) && (
+                {(isAudio || ownsTransitions || before || ownTransitions.length > 0) && (
                   <Section
                     title={isAudio ? "페이드" : "전환"}
                     onReset={() =>
@@ -1896,30 +1946,59 @@ export function Inspector({
                           })
                     }
                   >
-                    {isAudio &&
-                      (["in", "out"] as const).map(
-                        (edge) =>
-                          !(edge === "in" && joined) && (
-                            <NumberField
-                              key={edge}
-                              label={edge === "in" ? "페이드 인" : "페이드 아웃"}
-                              value={edge === "in" ? selected.fadeIn : selected.fadeOut}
-                              min={0}
-                              max={selected.duration}
-                              step={0.1}
-                              unit="s"
-                              onCommit={(v) =>
-                                void setTransition(edge, v > 0 ? "fade" : null, v)
-                              }
-                              onPreview={(v) =>
-                                draft(
-                                  transitionPatch(selected, edge, v > 0 ? "fade" : null, v),
-                                )
-                              }
-                              onCancelPreview={clearDraft}
-                            />
-                          ),
-                      )}
+                    {isAudio && (["in", "out"] as const).map(fadeField)}
+                    {ownsTransitions &&
+                      ownEdges.map(({ edge, type, length }) => {
+                        const name = edge === "in" ? "등장" : "퇴장";
+                        return (
+                          <Fragment key={edge}>
+                            <label className="inspector-select-field">
+                              <span>{name} 전환</span>
+                              <select
+                                aria-label={`${name} 전환`}
+                                disabled={busy}
+                                value={type ?? ""}
+                                onChange={(e) =>
+                                  void setTransition(
+                                    edge,
+                                    (e.target.value || null) as TransitionType | null,
+                                    length || 0.5,
+                                  )
+                                }
+                              >
+                                <option value="">없음</option>
+                                {transitionCatalog.map((item) => (
+                                  <option key={item.id} value={item.id}>
+                                    {item.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            {type && (
+                              <NumberField
+                                label={`${name} 길이`}
+                                value={length}
+                                min={0.1}
+                                max={selected.duration}
+                                step={0.1}
+                                unit="s"
+                                onCommit={(v) => void setTransition(edge, type, v)}
+                                onPreview={(v) =>
+                                  draft(transitionPatch(selected, edge, type, v))
+                                }
+                                onCancelPreview={clearDraft}
+                              />
+                            )}
+                          </Fragment>
+                        );
+                      })}
+                    {ownsTransitions && (
+                      <p className="inspector-hint">
+                        등장·퇴장은 이 클립 혼자 나타나고 사라지는 방식입니다. 두 클립이
+                        겹치는 전환은 {before ? "‘앞 클립과 전환’이나 " : ""}라이브러리
+                        전환 탭에서 넣습니다.
+                      </p>
+                    )}
                     {before && (
                       <label className="inspector-select-field">
                         <span>앞 클립과 전환</span>

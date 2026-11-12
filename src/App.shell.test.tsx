@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, configure, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "./App";
 import { connectStudio, rpc } from "./studio/api";
 import * as mediaPlayback from "./studio/mediaPlayback";
 import { playbackClock } from "./studio/playbackClock";
 import type { Clip, Project } from "./studio/types";
+
+// Whole-app renders in jsdom: a saturated CPU stretches them past the default limits
+// (see App.test.tsx), so those are raised for this file.
+vi.setConfig({ testTimeout: 30_000 });
+configure({ asyncUtilTimeout: 10_000 });
 
 vi.mock("./studio/api", () => ({
   connectStudio: vi.fn(),
@@ -29,7 +34,10 @@ vi.mock("./studio/Library", () => ({
   },
 }));
 vi.mock("./studio/Inspector", () => ({
-  default: () => { renders.inspector++; return <section aria-label="속성" />; },
+  default: ({ covered }: { covered?: boolean }) => {
+    renders.inspector++;
+    return <section className="studio-inspector" aria-label="속성" tabIndex={-1} inert={covered} />;
+  },
 }));
 
 const clip = (id: string, start: number, trackId: string): Clip => ({
@@ -342,7 +350,9 @@ describe("workspace layout", () => {
 
     localStorage.setItem("byori.layout", JSON.stringify({ library: 560, inspector: 520, timeline: 300 }));
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-      const size = this.classList.contains("editing-surface") ? { width: 1280, height: 800 } : { width: 0, height: 0 };
+      // The workspace is the surface plus its 6px side padding.
+      const size = this.classList.contains("editing-surface") ? { width: 1280, height: 800 }
+        : this.classList.contains("editor-workspace") ? { width: 1292, height: 806 } : { width: 0, height: 0 };
       return { left: 0, top: 0, right: size.width, bottom: size.height, x: 0, y: 0, ...size, toJSON: () => ({}) };
     });
     render(<App />);
@@ -360,5 +370,226 @@ describe("workspace layout", () => {
     fireEvent.blur(name);
     expect(name).toHaveValue("편집 테스트");
     expect(rpc).not.toHaveBeenCalledWith("project.update", expect.anything(), expect.anything());
+  });
+});
+
+describe("this window's own edits in a row", () => {
+  const CONFLICT = "프로젝트가 다른 작업에 의해 변경되었습니다. 최신 상태를 불러온 뒤 다시 시도해 주세요. (REVISION_CONFLICT)";
+  /** The service's revision guard, answering each edit only when the test lets it. */
+  const guardedService = () => {
+    const gates: (() => void)[] = [];
+    const sent: { method: string; expected: unknown }[] = [];
+    const fallback = vi.mocked(rpc).getMockImplementation()!;
+    vi.mocked(rpc).mockImplementation(async (method, params, projectId) => {
+      if (!method.startsWith("edit.")) return fallback(method, params, projectId);
+      sent.push({ method, expected: params?.expectedRevision });
+      await new Promise<void>((resolve) => gates.push(resolve));
+      if (params?.expectedRevision !== served.revision) throw new Error(CONFLICT);
+      served = { ...served, revision: served.revision + 1 };
+      return structuredClone(served);
+    });
+    return { sent, answer: async () => { await act(async () => { gates.shift()?.(); }); } };
+  };
+
+  it("sends them one at a time, each on the revision the one before left", async () => {
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const service = guardedService();
+    const command = renders.libraryCommand!;
+    // A move, and a trim begun before the move was answered: both were built on revision 1.
+    let move!: Promise<unknown>, trim!: Promise<unknown>;
+    act(() => {
+      move = command("edit.batch", { commands: [{ method: "edit.update", params: { id: "c0", patch: { start: 1 } } }], expectedRevision: 1 });
+      trim = command("edit.trim", { id: "c0", start: 1, end: 2, expectedRevision: 1 });
+    });
+    await act(async () => {});
+    expect(service.sent).toEqual([{ method: "edit.batch", expected: 1 }]);
+    await service.answer();
+    expect(service.sent).toEqual([{ method: "edit.batch", expected: 1 }, { method: "edit.trim", expected: 2 }]);
+    await service.answer();
+    await expect(move).resolves.toMatchObject({ revision: 2 });
+    await expect(trim).resolves.toMatchObject({ revision: 3 });
+    expect(screen.queryByRole("alert")).toBeNull();
+    // An edit without a revision of its own is guarded by the one on screen.
+    let plain!: Promise<unknown>;
+    act(() => { plain = command("edit.update", { id: "c0", patch: { start: 2 } }); });
+    await act(async () => {});
+    expect(service.sent[2]).toEqual({ method: "edit.update", expected: 3 });
+    await service.answer();
+    await expect(plain).resolves.toMatchObject({ revision: 4 });
+  });
+
+  it("still refuses an edit built on a revision somebody else has replaced", async () => {
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const service = guardedService();
+    const command = renders.libraryCommand!;
+    let own!: Promise<unknown>;
+    act(() => { own = command("edit.update", { id: "c0", patch: { start: 1 }, expectedRevision: 1 }); });
+    await service.answer();
+    await expect(own).resolves.toMatchObject({ revision: 2 });
+    // An agent edits the project: revision 3 is not this window's.
+    served = { ...served, revision: 3 };
+    let stale!: Promise<unknown>, older!: Promise<unknown>;
+    act(() => {
+      stale = command("edit.update", { id: "c0", patch: { start: 4 }, expectedRevision: 2 });
+      // Followed through this window's own 1 → 2 only, never past the agent's revision.
+      older = command("edit.update", { id: "c0", patch: { start: 5 }, expectedRevision: 1 });
+    });
+    stale.catch(() => {});
+    older.catch(() => {});
+    await service.answer();
+    await service.answer();
+    await expect(stale).rejects.toThrow("REVISION_CONFLICT");
+    await expect(older).rejects.toThrow("REVISION_CONFLICT");
+    expect(service.sent.map((call) => call.expected)).toEqual([1, 2, 2]);
+    expect(served.revision).toBe(3);
+  });
+
+  it("makes a repeated nudge from where the step before left the clips", async () => {
+    served = { ...structuredClone(base), clips: [clip("c0", 0, "t0")] };
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const gates: (() => void)[] = [];
+    const sent: unknown[] = [];
+    const fallback = vi.mocked(rpc).getMockImplementation()!;
+    vi.mocked(rpc).mockImplementation(async (method, params, projectId) => {
+      if (method !== "edit.batch") return fallback(method, params, projectId);
+      sent.push(params);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      if (params?.expectedRevision !== served.revision) throw new Error(CONFLICT);
+      const [{ params: update }] = params.commands as { params: { id: string; patch: { start: number } } }[];
+      served = {
+        ...served, revision: served.revision + 1,
+        clips: served.clips.map((item) => item.id === update.id ? { ...item, ...update.patch } : item),
+      };
+      return structuredClone(served);
+    });
+    const step = (start: number, expectedRevision: number) =>
+      ({ commands: [{ method: "edit.update", params: { id: "c0", patch: { start } } }], expectedRevision });
+    fireEvent.keyDown(document.body, { key: "a", metaKey: true });
+    // The key repeats before the service has answered the first step.
+    fireEvent.keyDown(document.body, { key: "ArrowRight", altKey: true });
+    fireEvent.keyDown(document.body, { key: "ArrowRight", altKey: true, repeat: true });
+    await act(async () => {});
+    expect(sent).toEqual([step(1 / 30, 1)]);
+    await act(async () => { gates.shift()!(); });
+    expect(sent).toEqual([step(1 / 30, 1), step(2 / 30, 2)]);
+    await act(async () => { gates.shift()!(); });
+    expect(served.clips[0].start).toBeCloseTo(2 / 30);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("leaves a project only after the edits before it, and sends none made for it afterwards", async () => {
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    const service = guardedService();
+    const command = renders.libraryCommand!;
+    const opened = () => vi.mocked(rpc).mock.calls.filter(([method]) => method === "project.open").length;
+    let first!: Promise<unknown>, second!: Promise<unknown>, open!: Promise<unknown>, late!: Promise<unknown>;
+    act(() => {
+      first = command("edit.update", { id: "c0", patch: { start: 1 } });
+      second = command("edit.delete", { ids: ["c1"] });
+      open = command("project.open", { id: "other" });
+      // Still made for the project that is being left.
+      late = command("edit.delete", { ids: ["c2"] });
+    });
+    await act(async () => {});
+    expect(service.sent).toHaveLength(1);
+    expect(opened()).toBe(0);
+    await service.answer();
+    // The second edit reaches the project it was made for before that is left.
+    expect(service.sent).toEqual([{ method: "edit.update", expected: 1 }, { method: "edit.delete", expected: 2 }]);
+    expect(opened()).toBe(0);
+    await service.answer();
+    await expect(first).resolves.toMatchObject({ revision: 2 });
+    await expect(second).resolves.toMatchObject({ revision: 3 });
+    await expect(open).resolves.toMatchObject({ id: "other" });
+    expect(opened()).toBe(1);
+    await expect(late).resolves.toBeUndefined();
+    expect(service.sent).toHaveLength(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("follows only an unbroken chain of this window's revisions", async () => {
+    const { OwnRevisions } = await import("./App");
+    const own = new OwnRevisions();
+    own.record("p", 1, 2);
+    own.record("p", 2, 3);
+    // 3 → 4 was somebody else's; 4 → 5 is ours again.
+    own.record("p", 4, 5);
+    expect(own.latest("p", 1)).toBe(3);
+    expect(own.latest("p", 3)).toBe(3);
+    expect(own.latest("p", 4)).toBe(5);
+    expect(own.latest("other", 1)).toBe(1);
+    // An answer that is not exactly the next revision says nothing about who made it.
+    own.record("p", 5, 7);
+    expect(own.latest("p", 5)).toBe(5);
+    own.record("other", 1, 2);
+    expect(own.latest("p", 1)).toBe(1);
+  });
+});
+
+describe("assistant drawer and the player's room", () => {
+  const open = async (workspace: number) => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const size = this.classList.contains("editor-workspace") ? { width: workspace + 12, height: 700 }
+        : this.classList.contains("editing-surface") ? { width: workspace, height: 694 } : { width: 0, height: 0 };
+      return { left: 0, top: 0, right: size.width, bottom: size.height, x: 0, y: 0, ...size, toJSON: () => ({}) };
+    });
+    const fallback = vi.mocked(rpc).getMockImplementation()!;
+    vi.mocked(rpc).mockImplementation(async (method, params, projectId) =>
+      method === "agent.list" ? [] : method === "memory.search" ? { items: [] } : fallback(method, params, projectId));
+    render(<App />);
+    await screen.findByLabelText("프로젝트 이름");
+    fireEvent.click(screen.getByText("어시스턴트", { selector: "button" }));
+    await act(async () => {});
+    return {
+      upper: document.querySelector<HTMLElement>(".upper-workspace")!,
+      workspace: document.querySelector<HTMLElement>(".editor-workspace")!,
+    };
+  };
+
+  it("decides by the width the player is left with", async () => {
+    const { drawerLayout } = await import("./App");
+    const untouched = { library: null, inspector: 278 };
+    // Unmeasured: nothing is hidden.
+    expect(drawerLayout(untouched, 0)).toEqual({ inspector: true, overlay: false });
+    expect(drawerLayout(untouched, 1600)).toEqual({ inspector: true, overlay: false });
+    // A 1180px window: the player would be 298px beside both; without the inspector it has 556px.
+    expect(drawerLayout(untouched, 1168)).toEqual({ inspector: false, overlay: false });
+    // Too narrow even then: the drawer floats and the surface keeps its layout.
+    expect(drawerLayout(untouched, 908)).toEqual({ inspector: true, overlay: true });
+    // Wide panels the user chose count too.
+    expect(drawerLayout({ library: 560, inspector: 520 }, 1900)).toEqual({ inspector: true, overlay: false });
+    expect(drawerLayout({ library: 560, inspector: 278 }, 1500)).toEqual({ inspector: false, overlay: false });
+  });
+
+  it("folds the inspector away at 1180px and brings it back from the top bar", async () => {
+    const { upper, workspace } = await open(1168);
+    expect(upper).toHaveClass("inspector-hidden");
+    expect(workspace).not.toHaveClass("drawer-overlay");
+    expect(document.querySelector(".assistant-panel")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("속성 패널 열기"));
+    expect(upper).not.toHaveClass("inspector-hidden");
+    expect(document.querySelector(".assistant-panel")).toBeNull();
+    expect(screen.queryByLabelText("속성 패널 열기")).toBeNull();
+    // The button that was pressed is gone: focus is on the panel it opened.
+    expect(screen.getByLabelText("속성")).toHaveFocus();
+  });
+
+  it("floats the drawer over a window too narrow for it, and leaves a wide one alone", async () => {
+    const narrow = await open(908);
+    expect(narrow.workspace).toHaveClass("drawer-overlay");
+    expect(narrow.upper).not.toHaveClass("inspector-hidden");
+    expect(screen.queryByLabelText("속성 패널 열기")).toBeNull();
+    // The inspector lies under the drawer: nothing in it takes focus.
+    expect(screen.getByLabelText("속성")).toHaveAttribute("inert");
+    cleanup();
+    vi.restoreAllMocks();
+    const wide = await open(1600);
+    expect(wide.workspace).not.toHaveClass("drawer-overlay");
+    expect(wide.upper).not.toHaveClass("inspector-hidden");
+    expect(screen.getByLabelText("속성")).not.toHaveAttribute("inert");
   });
 });

@@ -11,6 +11,7 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:integration": "cargo build --manifest-path src-tauri/Cargo.toml --bin studio-service && BYORI_STUDIO_REQUIRE_INTEGRATION=1 python3 scripts/test_integration.py",
+    "bench": "cargo build --release --manifest-path src-tauri/Cargo.toml --bin studio-service && python3 scripts/bench.py",
     "check:version": "node scripts/check-version.mjs",
     "verify": "node scripts/check-version.mjs && vitest run && cargo test --manifest-path src-tauri/Cargo.toml --lib && cargo build --manifest-path src-tauri/Cargo.toml --bin studio-service && BYORI_STUDIO_REQUIRE_INTEGRATION=1 python3 -m unittest discover -s scripts -p \"test_*.py\" && npm run build",
     "coverage": "vitest run --coverage",

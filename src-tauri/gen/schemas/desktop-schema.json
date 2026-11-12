@@ -189,6 +189,12 @@
           "markdownDescription": "Enables the studio_open_files command without any pre-configured scope."
         },
         {
+          "description": "Enables the studio_reveal_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-studio-reveal-file",
+          "markdownDescription": "Enables the studio_reveal_file command without any pre-configured scope."
+        },
+        {
           "description": "Enables the studio_save_file command without any pre-configured scope.",
           "type": "string",
           "const": "allow-studio-save-file",
@@ -205,6 +211,12 @@
           "type": "string",
           "const": "deny-studio-open-files",
           "markdownDescription": "Denies the studio_open_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the studio_reveal_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-studio-reveal-file",
+          "markdownDescription": "Denies the studio_reveal_file command without any pre-configured scope."
         },
         {
           "description": "Denies the studio_save_file command without any pre-configured scope.",

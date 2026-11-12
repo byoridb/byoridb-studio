@@ -9,6 +9,7 @@ import {
   LoaderCircle,
   Plus,
   Settings2,
+  SlidersHorizontal,
   Sparkles,
   TriangleAlert,
   X,
@@ -63,7 +64,7 @@ const flaggedKey = (project: Project | null, flag: "missing" | "proxy") =>
 /** What the service fills in without a new revision: missing files, proxies, waveforms. */
 const derivedKey = (project: Project | null) =>
   project?.media
-    .map((media) => `${media.id}:${media.missing ? 1 : 0}${media.proxy ? 1 : 0}:${media.waveform?.length ?? "-"}`)
+    .map((media) => `${media.id}:${media.missing ? 1 : 0}${media.proxy ? 1 : 0}:${media.waveform?.length ?? media.waveformPeaks ?? "-"}`)
     .join() ?? "";
 interface Selection {
   projectId: string | null;
@@ -101,11 +102,71 @@ const storedLayout = (): Layout => {
     return defaultLayout;
   }
 };
+/**
+ * The revisions this window made itself: `from → to` for every edit the service
+ * accepted from it. A command built on an older revision may be sent on the newest
+ * one only when every step in between is in here; a revision made by anyone else
+ * (an agent, the CLI) breaks the chain, and the service then rejects the command.
+ */
+export class OwnRevisions {
+  private projectId: string | null = null;
+  private next = new Map<number, number>();
+  /** The newest revision reached from `base` through this window's edits alone. */
+  latest(projectId: string | undefined, base: number): number {
+    if (projectId !== this.projectId) return base;
+    let revision = base;
+    while (this.next.has(revision)) revision = this.next.get(revision)!;
+    return revision;
+  }
+  /** The service applied one edit of ours on `from`: every commit is exactly one revision. */
+  record(projectId: string | undefined, from: number, to: number) {
+    if (!projectId || to !== from + 1) return;
+    if (projectId !== this.projectId) {
+      this.projectId = projectId;
+      this.next.clear();
+    }
+    this.next.set(from, to);
+    if (this.next.size > 256) this.next.delete(this.next.keys().next().value!);
+  }
+}
+/** Commands that change the project: sent one at a time, each on the revision the one before left. */
+const isEdit = (method: string) =>
+  method.startsWith("edit.") || method.startsWith("history.") || method === "project.update";
+
+/** How often a precise preview render is asked for its progress (a loopback call). */
+const PREVIEW_POLL_MS = 100;
 const PANEL_LIMITS = { library: [220, 560], inspector: [240, 520] } as const;
-/** Below this editing width an open assistant drawer takes the inspector's place. */
-const INSPECTOR_ROOM = 820;
+/** The assistant drawer: its width and the gap beside it. */
+const DRAWER_WIDTH = 320 + 6;
+/** The player keeps at least this width while the assistant drawer is open. */
+const PLAYER_ROOM = 420;
 /** Two separators and the narrowest player. */
 const PLAYER_RESERVE = 6 + 250 + 6;
+
+/**
+ * What stands beside the player while the assistant drawer is open. `workspace` is
+ * the width the drawer shares with the editing surface. The drawer is a column while
+ * the player keeps PLAYER_ROOM beside it; when it cannot with the inspector shown,
+ * the inspector folds away; when it cannot even then, the drawer floats over the
+ * surface, which keeps the layout it has with the drawer closed.
+ */
+export function drawerLayout(
+  layout: { library: number | null; inspector: number },
+  workspace: number,
+): { inspector: boolean; overlay: boolean } {
+  if (!(workspace > 0)) return { inspector: true, overlay: false };
+  const surface = workspace - DRAWER_WIDTH;
+  const player = (inspectorShown: boolean) => {
+    const fitted = fitPanelWidths(layout, surface, inspectorShown);
+    const narrow = surface <= 1200;
+    const library = fitted.library ?? Math.max(narrow ? 280 : 282, surface * (narrow ? 0.29 : 0.28));
+    const inspector = fitted.inspector ?? (narrow ? 252 : defaultLayout.inspector);
+    return surface - library - 6 - (inspectorShown ? 6 + inspector : 0);
+  };
+  if (player(true) >= PLAYER_ROOM) return { inspector: true, overlay: false };
+  if (player(false) >= PLAYER_ROOM) return { inspector: false, overlay: false };
+  return { inspector: true, overlay: true };
+}
 
 /**
  * The panel widths that fit a workspace `width` wide. The chosen widths stay
@@ -287,9 +348,21 @@ export default function App() {
     }
   }, [layout]);
   const [surfaceHeight, setSurfaceHeight] = useState(640);
-  const [surfaceWidth, setSurfaceWidth] = useState(0);
-  const inspectorShown = !(assistant && surfaceWidth > 0 && surfaceWidth < INSPECTOR_ROOM);
+  /** The width the editing surface and the assistant drawer share; 0 until measured. */
+  const [workspaceWidth, setWorkspaceWidth] = useState(0);
+  const drawer = assistant ? drawerLayout(layout, workspaceWidth) : { inspector: true, overlay: false };
+  const inspectorShown = drawer.inspector;
+  // Derived rather than measured, so the panels fit in the same render the drawer opens in.
+  const surfaceWidth = workspaceWidth > 0
+    ? workspaceWidth - (assistant && !drawer.overlay ? DRAWER_WIDTH : 0)
+    : 0;
   const panels = fitPanelWidths(layout, surfaceWidth, inspectorShown);
+  const focusInspector = useRef(false);
+  useEffect(() => {
+    if (!inspectorShown || !focusInspector.current) return;
+    focusInspector.current = false;
+    editingSurface.current?.querySelector<HTMLElement>(".studio-inspector")?.focus();
+  }, [inspectorShown]);
   const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
   // The stored height is kept as chosen and only clamped to what fits right now.
   const timelineHeight = Math.max(200, Math.min(maxTimelineHeight, layout.timeline));
@@ -298,20 +371,26 @@ export default function App() {
   useEffect(() => {
     const surface = editingSurface.current;
     if (!surface) return;
+    const workspace = surface.parentElement;
     const measure = () => {
-      const { width, height } = surface.getBoundingClientRect();
+      const { height } = surface.getBoundingClientRect();
       if (!height) return;
       setSurfaceHeight(height);
-      setSurfaceWidth(width);
+      // Less the workspace's 6px side padding.
+      setWorkspaceWidth(Math.max(0, (workspace?.getBoundingClientRect().width ?? 0) - 12));
     };
     const observer = new ResizeObserver(measure);
     observer.observe(surface);
+    if (workspace) observer.observe(workspace);
     measure();
     return () => observer.disconnect();
   }, [!!project, home]);
   const current = useRef<Project | null>(null);
   current.current = project;
   const projectGeneration = useRef(0);
+  const ownRevisions = useRef(new OwnRevisions());
+  const editQueue = useRef<Promise<void>>(Promise.resolve());
+  const editsInFlight = useRef(0);
   const selectMany = useCallback((ids: string[], primary?: string | null) => {
     const active = current.current;
     const valid = [...new Set(ids)].filter((id) =>
@@ -444,26 +523,53 @@ export default function App() {
    * Runs one service command. `quiet` is for the library and the inspector, which
    * show a failure in place: the same failure is not also raised as a toast.
    */
-  const execute = useCallback(async (method: string, params: Record<string, unknown> = {}, quiet = false) => {
+  const execute = useCallback(async (
+    method: string,
+    /** The parameters, or for an edit a function that makes them from the project as it is when the edit is sent. */
+    given: Record<string, unknown> | ((project: Project) => Record<string, unknown> | null) = {},
+    quiet = false,
+  ) => {
     setError("");
+    const build = typeof given === "function" ? given : null;
+    const params = build ? {} : (given as Record<string, unknown>);
     const switching = ["project.new", "project.open", "project.demo"].includes(
       method,
     );
-    let generation = switching
-      ? ++projectGeneration.current
-      : projectGeneration.current;
+    let generation = projectGeneration.current;
     const projectId = switching ? undefined : current.current?.id;
-    setPending((count) => count + 1);
-    try {
-      const guarded =
-        (method.startsWith("edit.") || method === "project.update") &&
-        params.expectedRevision === undefined
-          ? { ...params, expectedRevision: current.current?.revision }
-          : params;
-      const result = await rpc<unknown>(method, guarded, projectId);
+    const edit = isEdit(method);
+    // The revision the command was built on: the caller's, or what is on screen now.
+    const base =
+      typeof params.expectedRevision === "number"
+        ? params.expectedRevision
+        : edit && method !== "history.undo" && method !== "history.redo"
+          ? current.current?.revision
+          : undefined;
+    /** Sends the command and takes the project it answers with; false when that answer is stale. */
+    const send = async (): Promise<[unknown, boolean]> => {
+      // From its turn on, answers for the project being left are stale. Not earlier:
+      // the edits before it still follow one another's revisions.
+      if (switching) generation = ++projectGeneration.current;
+      // The project was left while this edit waited its turn: it is not sent to a
+      // service that has another project open by now.
+      if (edit && current.current?.id !== projectId) return [undefined, false];
+      // Made now, from the project the edits before this one left.
+      const built = build && current.current ? build(current.current) : params;
+      if (!built) return [undefined, false];
+      // An edit of ours that was still on its way when this one was made has moved
+      // the project on: follow our own revisions, and only ours.
+      const expected = build
+        ? current.current?.revision
+        : base === undefined ? undefined : ownRevisions.current.latest(projectId, base);
+      const sentOn = expected ?? (current.current?.id === projectId ? current.current?.revision : undefined);
+      const result = await rpc<unknown>(
+        method,
+        expected === undefined ? built : { ...built, expectedRevision: expected },
+        projectId,
+      );
       setOffline(false);
       setSaveFailed(false);
-      if (projectGeneration.current !== generation) return result;
+      if (projectGeneration.current !== generation) return [result, false];
       if (switching) generation = ++projectGeneration.current;
       if (
         result &&
@@ -471,18 +577,39 @@ export default function App() {
         "clips" in result &&
         "tracks" in result
       ) {
+        const updated = result as Project;
+        if ((edit || expected !== undefined) && sentOn !== undefined && updated.id === projectId)
+          ownRevisions.current.record(projectId, sentOn, updated.revision);
         if (
-          (result as Project).id === current.current?.id &&
-          (result as Project).revision < current.current.revision
+          updated.id === current.current?.id &&
+          updated.revision < current.current.revision
         )
-          return result;
-        current.current = result as Project;
-        setProject(result as Project);
-        playbackClock.set(Math.min(playbackClock.get(), durationOf(result as Project)));
+          return [result, false];
+        current.current = updated;
+        setProject(updated);
+        playbackClock.set(Math.min(playbackClock.get(), durationOf(updated)));
       } else if (result && typeof result === "object" && "project" in result) {
         current.current = (result as { project: Project }).project;
         setProject(current.current);
       }
+      return [result, true];
+    };
+    setPending((count) => count + 1);
+    try {
+      // Edits go out one at a time, in the order they were made: each is sent only
+      // once the one before has answered, on the revision that answer left. Leaving
+      // the project takes its turn too, so the edits before it reach that project
+      // and none made after it does.
+      let outcome: Promise<[unknown, boolean]>;
+      if (edit || switching) {
+        outcome = editsInFlight.current ? editQueue.current.then(send) : send();
+        editsInFlight.current++;
+        const settled = outcome.then(() => {}, () => {});
+        editQueue.current = settled;
+        void settled.then(() => { editsInFlight.current--; });
+      } else outcome = send();
+      const [result, fresh] = await outcome;
+      if (!fresh) return result;
       const h = await rpc<{ canUndo: boolean; canRedo: boolean }>(
         "history.status",
         {},
@@ -622,7 +749,8 @@ export default function App() {
           setBusy(
             `정밀 미리보기 준비 · ${Math.round((status.progress || 0) * 100)}%`,
           );
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          // A finished render starts playing within this interval: keep it short.
+          await new Promise((resolve) => setTimeout(resolve, PREVIEW_POLL_MS));
         }
       } catch (e) {
         if (previewRun.current === nonce)
@@ -848,10 +976,19 @@ export default function App() {
               )
             : shiftSelectionTracks(active, selectedIds, direction);
         if (commands.length)
-          void safeCommand("edit.batch", {
-            commands,
-            expectedRevision: active.revision,
-          });
+          // Made again when it is sent: a key that repeats faster than the service
+          // answers moves on from where the step before left the clips.
+          void execute("edit.batch", (latest) => {
+            const ids = selectedIds.filter((id) => latest.clips.some((clip) => clip.id === id));
+            const commands =
+              event.key === "ArrowLeft" || event.key === "ArrowRight"
+                ? moveSelection(
+                    selectedClips(latest, ids),
+                    (direction * (event.shiftKey ? 10 : 1)) / latest.fps,
+                  )
+                : shiftSelectionTracks(latest, ids, direction);
+            return commands.length ? { commands } : null;
+          }).catch(() => undefined);
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
         seekTime((value) =>
@@ -903,7 +1040,7 @@ export default function App() {
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [safeCommand, selectMany, seekTime, copySelection, pasteAt]);
+  }, [safeCommand, execute, selectMany, seekTime, copySelection, pasteAt]);
   const relink = async (media: Media) => {
     try {
       const paths = await pickFiles();
@@ -1176,8 +1313,24 @@ export default function App() {
             </span>
           </div>
           <div className="topbar-actions">
+            {!inspectorShown && (
+              // The drawer has taken the inspector's column: this brings the inspector back.
+              <button
+                className="assistant-toggle"
+                aria-label="속성 패널 열기"
+                title="속성 패널 열기 · 창이 좁아 어시스턴트와 함께 둘 수 없어 어시스턴트를 닫습니다"
+                onClick={() => {
+                  // This button goes away with the click: focus follows to the panel it opened.
+                  focusInspector.current = true;
+                  setAssistant(false);
+                }}
+              >
+                <SlidersHorizontal size={15} /> 속성
+              </button>
+            )}
             <button
               className={`assistant-toggle ${assistant ? "active" : ""}`}
+              aria-pressed={assistant}
               onClick={() => setAssistant(!assistant)}
             >
               <Sparkles size={15} /> 어시스턴트
@@ -1251,7 +1404,7 @@ export default function App() {
             <button onClick={() => void relink(missing[0])}>다시 연결</button>
           </div>
         )}
-        <div className="editor-workspace">
+        <div className={`editor-workspace ${assistant && drawer.overlay ? "drawer-overlay" : ""}`}>
           <div
             className="editing-surface"
             ref={editingSurface}
@@ -1316,6 +1469,7 @@ export default function App() {
                 onCommand={panelCommand}
                 playhead={idleTime}
                 now={playbackClock.get}
+                covered={assistant && drawer.overlay}
               />
             </div>
             <div

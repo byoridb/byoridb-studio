@@ -94,6 +94,17 @@ impl PreviewFrames {
         work(cached).await
     }
 
+    /// Stops what `client` is waiting for: its queued frames are dropped and the one
+    /// being rendered has its FFmpeg stopped. For a player that starts playing, which
+    /// no longer shows the frame and needs the processor for decoding. Returns how
+    /// many requests were stopped; other clients' frames are untouched.
+    pub fn cancel(&self, client: &str) -> usize {
+        let pending = self.pending.lock().unwrap();
+        let own = pending.iter().filter(|(_, other, ..)| other == client);
+        own.map(|(.., flag)| flag.store(true, Ordering::Relaxed))
+            .count()
+    }
+
     /// `client` names who asks ("player", "export", one agent job): see `pending`.
     pub async fn frame(
         &self,
@@ -134,8 +145,18 @@ impl PreviewFrames {
         let width = (number(&params, "width", 640.0).clamp(64.0, 1920.0) as u32 / 2) * 2;
         let frame = (number(&params, "time", 0.0) * number(&project, "fps", 30.0) + 1e-6).floor();
         let shown = picture(&project);
+        // A frame asked for from the originals (`proxy: false`) is not the one drawn
+        // from proxies, which is softer.
+        let originals = params["proxy"] == false;
+        // A source replaced at its path shows another picture for the same project.
+        let files: Vec<Option<String>> = project["media"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| media::source_stamp(item["path"].as_str().unwrap_or_default()))
+            .collect();
         let key = format!(
-            "{}:{width}:{frame}",
+            "{}:{width}:{frame}:{originals}:{files:?}",
             serde_json::to_string(&shown).map_err(|e| e.to_string())?
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -361,6 +382,20 @@ mod tests {
             .remove("missing");
         project["media"][0]["proxy"] = json!(true);
         assert_eq!(picture(&project), before);
+        // The source replaced at its path: the same project shows another picture.
+        std::fs::write(&tone, b"another file at the same path").unwrap();
+        let replaced = frames
+            .frame_with(
+                &editor,
+                json!({"time":0}),
+                None,
+                "player",
+                |_, _, root, _| output(root, count.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced["cacheHit"], false);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -622,6 +657,53 @@ mod tests {
                 .contains("PREVIEW_CANCELLED"));
         }
         assert!(frames.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// A player that starts playing stops its own frame without asking for another.
+    #[tokio::test]
+    async fn cancel_stops_only_that_clients_frames() {
+        let (root, editor) = setup();
+        editor
+            .lock()
+            .await
+            .dispatch("edit.add", json!({"text":"미리보기","duration":3}))
+            .await
+            .unwrap();
+        let frames = Arc::new(PreviewFrames::default());
+        let endless = |client: &'static str| {
+            let (editor, frames) = (editor.clone(), frames.clone());
+            tokio::spawn(async move {
+                frames
+                    .frame_with(
+                        &editor,
+                        json!({"time":0}),
+                        None,
+                        client,
+                        |_, _, _, cancel| async move {
+                            while !cancel.load(Ordering::Relaxed) {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            Err("stopped".to_string())
+                        },
+                    )
+                    .await
+            })
+        };
+        let player = endless("player");
+        while frames.sequence.load(Ordering::Relaxed) < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(frames.cancel("export"), 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!player.is_finished());
+        assert_eq!(frames.cancel("player"), 1);
+        let error = tokio::time::timeout(Duration::from_secs(10), player)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("PREVIEW_CANCELLED"), "{error}");
+        assert_eq!(frames.cancel("player"), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -380,8 +380,16 @@ async fn render_frame(
     let _scratch = Scratch::of(vec![temp.clone(), output.clone()]);
     std::fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
     let args = json!({"width":width,"height":height,"start":time,"end":(time+1.0/number(project,"fps",30.0)).min(duration)});
+    // A frame no wider than a proxy is drawn from the proxies of the clips under it:
+    // a 4K or long-GOP original costs most of a frame's time to seek and decode.
+    // `proxy: false` asks for the originals. Exports never come here.
+    let (shown, proxies) = if params["proxy"] != false && width <= media::PROXY_SIZE {
+        with_proxies(project, root, Some(time)).await
+    } else {
+        (None, 0)
+    };
     let result = run_process(
-        project,
+        shown.as_ref().unwrap_or(project),
         &args,
         &output,
         "png",
@@ -390,6 +398,7 @@ async fn render_frame(
         Arc::new(Mutex::new(HashMap::new())),
         cancel,
         "",
+        &WHOLE,
     )
     .await;
     let _ = std::fs::remove_dir_all(temp);
@@ -398,8 +407,54 @@ async fn render_frame(
     }
     result?;
     Ok(
-        json!({"path":output,"width":width,"height":height,"time":time,"revision":project["revision"]}),
+        json!({"path":output,"width":width,"height":height,"time":time,"revision":project["revision"],"proxies":proxies}),
     )
+}
+
+/// The project with the media under `time` (all media without a time) read from
+/// their proxies where those exist, and how many were replaced. For previews only:
+/// a proxy is smaller and more compressed than its source, shows the same frames at
+/// the same times, and has no transparency, so sources with an alpha channel keep
+/// their original.
+async fn with_proxies(project: &Value, root: &Path, time: Option<f64>) -> (Option<Value>, usize) {
+    let mut swaps = vec![];
+    for (index, item) in project["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let (Some(id), Some(source)) = (item["id"].as_str(), item["path"].as_str()) else {
+            continue;
+        };
+        let plain = id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !plain || id.is_empty() || !media::needs_proxy(item) {
+            continue;
+        }
+        let used = project["clips"].as_array().into_iter().flatten().any(|c| {
+            c["mediaId"] == id
+                && time.is_none_or(|t| {
+                    let from = number(c, "start", 0.0);
+                    t >= from - 1.0 && t < from + number(c, "duration", 0.0) + 1.0
+                })
+        });
+        let proxy = media::proxy_path(root, id);
+        if used && media::proxy_is_of(&proxy, source) && !media::has_alpha(Path::new(source)).await
+        {
+            swaps.push((index, proxy));
+        }
+    }
+    if swaps.is_empty() {
+        return (None, 0);
+    }
+    let mut shown = project.clone();
+    let count = swaps.len();
+    for (index, proxy) in swaps {
+        shown["media"][index]["path"] = json!(proxy);
+    }
+    (Some(shown), count)
 }
 
 fn property_alias(property: &str) -> &str {
@@ -701,6 +756,16 @@ async fn run(
         .unwrap()
         .insert(temp_output.clone());
     let encoders = video_encoders(&params, format).await;
+    // The small video for precise playback reads proxies, like a preview frame.
+    // Whatever is written anywhere else is an export and reads the originals.
+    let project = if params["preview"] == true && output.starts_with(root.join("previews")) {
+        with_proxies(&project, root, None)
+            .await
+            .0
+            .unwrap_or(project)
+    } else {
+        project
+    };
     let result = run_encoders(
         &project,
         &params,
@@ -794,7 +859,7 @@ async fn run_encoders(
                 job["encoder"] = json!(encoder);
             }
         }
-        result = run_process(
+        result = render(
             p,
             params,
             output,
@@ -804,6 +869,7 @@ async fn run_encoders(
             states.clone(),
             cancel.clone(),
             encoder,
+            inputs_per_run(p),
         )
         .await;
         if result.is_ok() || cancel.load(Ordering::Relaxed) {
@@ -862,6 +928,71 @@ fn video_encoder_args(encoder: &str, params: &Value, fps: f64) -> Vec<String> {
     args
 }
 
+/// How one FFmpeg run fits into the render it belongs to.
+struct Pass<'a> {
+    /// Set when the run renders one part of a longer export: its sound goes to this
+    /// file as unlimited float PCM (the limiter runs once over the joined parts) and
+    /// `output` receives the picture alone.
+    sound: Option<&'a Path>,
+    /// Where the run's own progress (0..1) lies in the job's: offset and share.
+    progress: (f64, f64),
+}
+const WHOLE: Pass<'static> = Pass {
+    sound: None,
+    progress: (0.0, 1.0),
+};
+
+/// Whether a clip contributes picture and sound to a render.
+fn clip_roles(
+    track: &Value,
+    clip: &Value,
+    asset: Option<&Value>,
+    audio_only: bool,
+    still: bool,
+) -> (bool, bool) {
+    let kind = string(clip, "kind", "video");
+    let visible = track["hidden"] != true && kind != "audio" && !audio_only;
+    let audible = !still
+        && track["muted"] != true
+        && kind != "text"
+        && kind != "image"
+        && asset.is_some_and(|a| a["hasAudio"] == true)
+        && (number(clip, "volume", 1.0) > 0.0 || has_keyframe(clip, "volume"));
+    (visible, audible)
+}
+
+/// The encoder arguments for the sound of each output format.
+fn audio_encoder_args(format: &str) -> &'static [&'static str] {
+    match format {
+        "mp4" | "mov" => &["-c:a", "aac", "-b:a", "192k"],
+        "webm" => &["-c:a", "libopus", "-b:a", "160k"],
+        "mp3" => &["-c:a", "libmp3lame", "-b:a", "192k"],
+        "wav" => &["-c:a", "pcm_s16le"],
+        _ => &[],
+    }
+}
+
+/// The encoder arguments for the picture of mp4, mov and webm.
+fn picture_encoder_args(format: &str, encoder: &str, params: &Value, fps: f64) -> Vec<String> {
+    if format != "webm" {
+        return video_encoder_args(encoder, params, fps);
+    }
+    let mut args: Vec<String> = vec!["-c:v".into(), "libvpx-vp9".into()];
+    match params["bitrate"].as_f64() {
+        Some(kbps) => args.extend(["-b:v".into(), format!("{}k", kbps.round() as u64)]),
+        None => args.extend([
+            "-crf".into(),
+            number(params, "crf", 28.0).to_string(),
+            "-b:v".into(),
+            "0".into(),
+        ]),
+    }
+    args
+}
+
+/// The limiter every mix ends with.
+const LIMITER: &str = "alimiter=limit=0.98:latency=1";
+
 #[allow(clippy::too_many_arguments)]
 async fn run_process(
     p: &Value,
@@ -873,6 +1004,7 @@ async fn run_process(
     states: Arc<Mutex<HashMap<String, Value>>>,
     cancel: Arc<AtomicBool>,
     encoder: &str,
+    pass: &Pass<'_>,
 ) -> Result<(), String> {
     let duration = project_duration(p);
     let start = number(params, "start", 0.0);
@@ -903,8 +1035,15 @@ async fn run_process(
     // is decoded from where the window first needs it instead of from the timeline start.
     let mut graph = vec![];
     if !audio_only {
+        // A part of a longer export holds an exact number of frames (see `-frames:v`
+        // below); half a frame more of background keeps rounding from ending it early.
+        let length = if pass.sound.is_some() {
+            span + 0.5 / fps
+        } else {
+            span
+        };
         graph.push(format!(
-            "color=c={}:s={}x{}:r={fps}:d={span}[base]",
+            "color=c={}:s={}x{}:r={fps}:d={length}[base]",
             string(p, "background", "#111111").replace('#', "0x"),
             pw as u32,
             ph as u32
@@ -937,14 +1076,8 @@ async fn run_process(
             let length = number(clip, "duration", 1.0);
             let source = number(clip, "sourceIn", 0.0);
             let speed = number(clip, "speed", 1.0);
-            let visible = track["hidden"] != true && kind != "audio" && !audio_only;
             let asset = assets.iter().find(|m| m["id"] == clip["mediaId"]);
-            let audible = !still
-                && track["muted"] != true
-                && kind != "text"
-                && kind != "image"
-                && asset.is_some_and(|a| a["hasAudio"] == true)
-                && (number(clip, "volume", 1.0) > 0.0 || has_keyframe(clip, "volume"));
+            let (visible, audible) = clip_roles(track, clip, asset, audio_only, still);
             if !visible && !audible {
                 continue;
             }
@@ -1199,8 +1332,15 @@ async fn run_process(
                     }
                     filters.push_str(&format!(",scale=w='max(2,trunc(iw*({scale})/2)*2)':h='max(2,trunc(ih*({scale})/2)*2)':eval=frame"));
                 }
+                // The clip's frames are placed on the output's frames: its first one on
+                // the first output frame at or after it. setpts would cut a fraction
+                // off instead (2.0 s at 29.97 fps is frame 59.94, which became 59), and a
+                // clip that starts between two output frames, as clips do when the
+                // export's frame rate is not the project's, then lost its first frame
+                // and showed the picture below for its last. The thousandth of a frame
+                // absorbs float error for clips that start on a frame.
                 filters.push_str(&format!(
-                    ",trim=start={cut}:end={until},setpts=PTS-STARTPTS+({})/TB[v{idx}]",
+                    ",trim=start={cut}:end={until},setpts=PTS-STARTPTS+ceil(({})/TB-0.001)[v{idx}]",
                     position + from - start
                 ));
                 graph.push(filters);
@@ -1338,51 +1478,67 @@ async fn run_process(
         ));
     }
     if !still {
-        graph.push(format!("{}amix=inputs={}:normalize=0:dropout_transition=0,alimiter=limit=0.98:latency=1,atrim=duration={span}[aout]",audio_labels.iter().map(|s|format!("[{s}]")).collect::<String>(),audio_labels.len()));
+        // The parts of a longer export are limited once, after they are joined.
+        let limiter = if pass.sound.is_some() {
+            String::new()
+        } else {
+            format!("{LIMITER},")
+        };
+        graph.push(format!("{}amix=inputs={}:normalize=0:dropout_transition=0,{limiter}atrim=duration={span}[aout]",audio_labels.iter().map(|s|format!("[{s}]")).collect::<String>(),audio_labels.len()));
     }
     // Retain the graph for diagnostics, and pass it as one argv (never through a shell).
     let script = temp.join("filters.ffgraph");
     std::fs::write(&script, graph.join(";\n")).map_err(|e| e.to_string())?;
     command.arg("-filter_complex").arg(graph.join(";"));
-    if !audio_only {
-        command.args(["-map", "[vout]"]);
-    }
-    if !still {
-        command.args(["-map", "[aout]"]);
-    }
-    match format {
-        "mp4" | "mov" => {
+    command.args(["-progress", "pipe:1", "-nostats"]);
+    let span_text = span.to_string();
+    if let Some(sound) = pass.sound {
+        // One part: the picture in the export's own encoding, the sound as PCM.
+        if !audio_only {
+            // Parts begin and end on the frame grid. Counting frames instead of
+            // seconds keeps a time that rounds up or down from adding or dropping
+            // a frame where two parts meet.
+            let frames = ((span * fps - 1e-6).ceil() as u64).max(1);
             command
-                .args(video_encoder_args(encoder, params, fps))
-                .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
+                .args(["-map", "[vout]"])
+                .args(picture_encoder_args(format, encoder, params, fps))
+                .args(["-frames:v", &frames.to_string()])
+                .arg(output);
         }
-        "webm" => {
-            command.args(["-c:v", "libvpx-vp9"]);
-            match params["bitrate"].as_f64() {
-                Some(kbps) => command.args(["-b:v", &format!("{}k", kbps.round() as u64)]),
-                None => command.args([
-                    "-crf",
-                    &number(params, "crf", 28.0).to_string(),
-                    "-b:v",
-                    "0",
-                ]),
-            };
-            command.args(["-c:a", "libopus", "-b:a", "160k"]);
+        command
+            .args(["-map", "[aout]", "-c:a", "pcm_f32le", "-t", &span_text])
+            .arg(sound);
+    } else {
+        if !audio_only {
+            command.args(["-map", "[vout]"]);
         }
-        "mp3" => {
-            command.args(["-c:a", "libmp3lame", "-b:a", "192k"]);
+        if !still {
+            command.args(["-map", "[aout]"]);
         }
-        "wav" => {
-            command.args(["-c:a", "pcm_s16le"]);
+        match format {
+            "mp4" | "mov" | "webm" => {
+                command
+                    .args(picture_encoder_args(format, encoder, params, fps))
+                    .args(audio_encoder_args(format));
+                if format != "webm" {
+                    command.args(["-movflags", "+faststart"]);
+                }
+            }
+            "mp3" | "wav" => {
+                command.args(audio_encoder_args(format));
+            }
+            "png" => {
+                command.args(["-c:v", "png", "-frames:v", "1", "-update", "1"]);
+            }
+            _ => unreachable!(),
         }
-        "png" => {
-            command.args(["-c:v", "png", "-frames:v", "1", "-update", "1"]);
-        }
-        _ => unreachable!(),
+        command.args(["-t", &span_text]).arg(output);
     }
+    let written = match pass.sound {
+        Some(sound) if audio_only => sound,
+        _ => output,
+    };
     command
-        .args(["-t", &span.to_string(), "-progress", "pipe:1", "-nostats"])
-        .arg(output)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1405,7 +1561,7 @@ async fn run_process(
     let status = loop {
         tokio::select! {
             status=child.wait()=>break status.map_err(|e|e.to_string())?,
-            line=lines.next_line(),if reading=>match line {Ok(Some(line))=>{if let Some(n)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()){update(&states,id,"running",(n/1_000_000.0/span).clamp(0.0,0.99),None);}},_=>reading=false},
+            line=lines.next_line(),if reading=>match line {Ok(Some(line))=>{if let Some(n)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()){update(&states,id,"running",(pass.progress.0+(n/1_000_000.0/span).clamp(0.0,1.0)*pass.progress.1).clamp(0.0,0.99),None);}},_=>reading=false},
             _=interval.tick()=>{if cancel.load(Ordering::Relaxed){let _=child.kill().await;let _=child.wait().await;let _=stderr_task.await;return Err("내보내기를 취소했습니다.".into());}}
         }
     };
@@ -1413,6 +1569,231 @@ async fn run_process(
     if !status.success() {
         return Err(format!("영상 내보내기에 실패했습니다: {}", error.trim()));
     }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("내보내기를 취소했습니다.".into());
+    }
+    if !written.is_file() || std::fs::metadata(written).map_err(|e| e.to_string())?.len() == 0 {
+        return Err("출력 파일이 생성되지 않았습니다.".into());
+    }
+    Ok(())
+}
+
+/// The shortest part a long export is divided into, in seconds.
+const MIN_PART: f64 = 2.0;
+
+/// How many clips one FFmpeg run reads at once. Every input keeps a few dozen
+/// decoded frames waiting until the timeline reaches its clip, about 75 MB each for
+/// 1080p material and four times that for 4K (measured), and a decoder's threads on
+/// top: hundreds of inputs in one run exhaust memory or the process's thread limit.
+fn inputs_per_run(p: &Value) -> usize {
+    let megapixels = p["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| number(m, "width", 0.0) * number(m, "height", 0.0) / 1e6)
+        .fold(0.0, f64::max);
+    if megapixels <= 0.0 {
+        return 16;
+    }
+    (25.0 / megapixels).round().clamp(4.0, 16.0) as usize
+}
+
+/// The timeline spans of the clips a render reads as inputs.
+fn input_spans(p: &Value, audio_only: bool) -> Vec<(f64, f64)> {
+    let assets = p["media"].as_array().unwrap();
+    let tracks = p["tracks"].as_array().unwrap();
+    p["clips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|clip| {
+            let asset = assets.iter().find(|m| m["id"] == clip["mediaId"]);
+            tracks
+                .iter()
+                .find(|track| track["id"] == clip["trackId"])
+                .is_some_and(|track| {
+                    let (visible, audible) = clip_roles(track, clip, asset, audio_only, false);
+                    visible || audible
+                })
+        })
+        .map(|clip| {
+            let from = number(clip, "start", 0.0);
+            (from, from + number(clip, "duration", 1.0))
+        })
+        .collect()
+}
+
+/// Divides `[start, end)` into consecutive parts that each touch at most `limit` of
+/// the `spans`, as far as parts of at least `MIN_PART` allow. Parts begin on the
+/// output's frame grid, so each holds a whole number of frames. One part means the
+/// range needs no dividing.
+fn part_plan(
+    spans: &[(f64, f64)],
+    start: f64,
+    end: f64,
+    fps: f64,
+    limit: usize,
+) -> Vec<(f64, f64)> {
+    let mut inside: Vec<(f64, f64)> = spans
+        .iter()
+        .copied()
+        .filter(|(from, to)| *from < end && *to > start)
+        .collect();
+    if inside.len() <= limit.max(1) {
+        return vec![(start, end)];
+    }
+    inside.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Counted in output frames from `start`, as the frames of the parts are.
+    let least = (MIN_PART * fps).ceil().max(1.0);
+    let at = |frames: f64| start + frames / fps;
+    let mut parts = vec![];
+    let mut from = 0.0;
+    while at(from) < end {
+        // The part ends where one clip more than the limit would begin.
+        let next = inside
+            .iter()
+            .filter(|(_, to)| *to > at(from) + 1e-9)
+            .nth(limit.max(1))
+            .map_or(end, |(begins, _)| *begins);
+        let to = ((next - start) * fps + 1e-6).floor().max(from + least);
+        if end - at(to) < MIN_PART {
+            parts.push((at(from), end));
+            break;
+        }
+        parts.push((at(from), at(to)));
+        from = to;
+    }
+    parts
+}
+
+/// Stops the FFmpeg run of `command` when `cancel` is set; an error is its last words.
+async fn run_to_end(mut command: Command, cancel: &AtomicBool) -> Result<(), String> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("FFmpeg를 실행할 수 없습니다: {e}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("FFmpeg 오류를 읽을 수 없습니다.")?;
+    let stderr_task = tokio::spawn(read_tail(stderr, STDERR_TAIL));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.map_err(|e| e.to_string())?,
+            _ = interval.tick() => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stderr_task.await;
+                    return Err("내보내기를 취소했습니다.".into());
+                }
+            }
+        }
+    };
+    let error = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        return Err(format!("영상 내보내기에 실패했습니다: {}", error.trim()));
+    }
+    Ok(())
+}
+
+/// Renders the export in one FFmpeg run, or, when its range holds more clips than
+/// `limit`, part by part: each part is a window of the timeline with its picture in
+/// the export's own encoding and its sound as PCM, and the parts are then joined
+/// without encoding the picture again. A window shows exactly the frames the whole
+/// timeline has there, so the result is the same; memory and threads stay bounded by
+/// the clips of one part instead of growing with the timeline.
+#[allow(clippy::too_many_arguments)]
+async fn render(
+    p: &Value,
+    params: &Value,
+    output: &Path,
+    format: &str,
+    temp: &Path,
+    id: &str,
+    states: Arc<Mutex<HashMap<String, Value>>>,
+    cancel: Arc<AtomicBool>,
+    encoder: &str,
+    limit: usize,
+) -> Result<(), String> {
+    let start = number(params, "start", 0.0);
+    let end = number(params, "end", project_duration(p));
+    let span = end - start;
+    let fps = number(params, "fps", number(p, "fps", 30.0));
+    let audio_only = matches!(format, "mp3" | "wav");
+    let parts = if format == "png" {
+        vec![]
+    } else {
+        part_plan(&input_spans(p, audio_only), start, end, fps, limit)
+    };
+    if parts.len() < 2 {
+        return run_process(
+            p, params, output, format, temp, id, states, cancel, encoder, &WHOLE,
+        )
+        .await;
+    }
+    // The joining at the end is quick; it gets the last hundredths of the progress.
+    let share = 0.97 / span;
+    let (mut pictures, mut sounds) = (String::new(), String::new());
+    for (index, (from, to)) in parts.iter().enumerate() {
+        let mut part = params.clone();
+        part["start"] = json!(from);
+        part["end"] = json!(to);
+        let picture = format!("part-{index:05}.mp4");
+        let sound = format!("part-{index:05}.wav");
+        // Generated names, read relative to the working directory.
+        pictures.push_str(&format!("file '{picture}'\n"));
+        sounds.push_str(&format!("file '{sound}'\n"));
+        let sound = temp.join(sound);
+        run_process(
+            p,
+            &part,
+            &temp.join(picture),
+            format,
+            temp,
+            id,
+            states.clone(),
+            cancel.clone(),
+            encoder,
+            &Pass {
+                sound: Some(&sound),
+                progress: ((from - start) * share, (to - from) * share),
+            },
+        )
+        .await?;
+    }
+    let mut command = Command::new(media::executable("ffmpeg"));
+    command
+        .current_dir(temp)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin"]);
+    let list = |name: &str, lines: &str| -> Result<(), String> {
+        std::fs::write(temp.join(name), lines).map_err(|e| e.to_string())
+    };
+    if !audio_only {
+        list("pictures.txt", &pictures)?;
+        command.args(["-f", "concat", "-safe", "0", "-i", "pictures.txt"]);
+    }
+    list("sounds.txt", &sounds)?;
+    command.args(["-f", "concat", "-safe", "0", "-i", "sounds.txt"]);
+    if !audio_only {
+        command.args(["-map", "0:v", "-c:v", "copy"]);
+        if encoder.contains("hevc") || encoder == "libx265" {
+            command.args(["-tag:v", "hvc1"]);
+        }
+    }
+    command
+        .args(["-map", if audio_only { "0:a" } else { "1:a" }])
+        .args(["-af", &format!("{LIMITER},atrim=duration={span}")])
+        .args(audio_encoder_args(format));
+    if matches!(format, "mp4" | "mov") {
+        command.args(["-movflags", "+faststart"]);
+    }
+    command.arg(output);
+    run_to_end(command, &cancel).await?;
     if cancel.load(Ordering::Relaxed) {
         return Err("내보내기를 취소했습니다.".into());
     }
@@ -4973,6 +5354,368 @@ mod tests {
             started.elapsed().as_secs_f64(),
             std::fs::metadata(proxy).unwrap().len()
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_ranges_are_divided_where_too_many_clips_would_be_read_at_once() {
+        let cuts: Vec<(f64, f64)> = (0..10).map(|i| (i as f64, i as f64 + 1.0)).collect();
+        // Few enough clips, or a range that touches few enough: one run.
+        assert_eq!(part_plan(&cuts, 0.0, 10.0, 30.0, 10), vec![(0.0, 10.0)]);
+        assert_eq!(part_plan(&cuts, 3.0, 6.0, 30.0, 3), vec![(3.0, 6.0)]);
+        // Three clips to a part; the last part takes the remainder.
+        assert_eq!(
+            part_plan(&cuts, 0.0, 10.0, 30.0, 3),
+            vec![(0.0, 3.0), (3.0, 6.0), (6.0, 10.0)]
+        );
+        // No part is shorter than MIN_PART, even where clips are denser than the limit.
+        assert_eq!(
+            part_plan(&cuts, 0.0, 10.0, 30.0, 1),
+            vec![(0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 8.0), (8.0, 10.0)]
+        );
+        // Layers that all lie over the whole range cannot be divided usefully, and
+        // the parts still cover the range without gaps.
+        let stacked = vec![(0.0, 9.0); 6];
+        let parts = part_plan(&stacked, 0.0, 9.0, 30.0, 4);
+        assert_eq!(parts.first().unwrap().0, 0.0);
+        assert_eq!(parts.last().unwrap().1, 9.0);
+        assert!(parts.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        // Parts begin on the output's frame grid, counted from the start of the range.
+        let fps = 30000.0 / 1001.0;
+        let offset: Vec<(f64, f64)> = (0..12)
+            .map(|i| (i as f64 * 0.7, i as f64 * 0.7 + 0.7))
+            .collect();
+        let parts = part_plan(&offset, 0.35, 8.4, fps, 4);
+        assert!(parts.len() > 1);
+        for (from, to) in &parts[..parts.len() - 1] {
+            let frames = (to - from) * fps;
+            assert!((frames - frames.round()).abs() < 1e-6, "{from}..{to}");
+            assert!(to - from >= MIN_PART);
+        }
+        assert_eq!(parts.last().unwrap().1, 8.4);
+        // Material sets how many clips one run reads.
+        let sized = |width: u32, height: u32| json!({"media":[{"width":width,"height":height}]});
+        assert_eq!(inputs_per_run(&sized(1920, 1080)), 12);
+        assert_eq!(inputs_per_run(&sized(3840, 2160)), 4);
+        assert_eq!(inputs_per_run(&sized(640, 360)), 16);
+        assert_eq!(inputs_per_run(&json!({"media":[]})), 16);
+    }
+
+    /// Eight one second cuts of a source whose colour changes every frame and whose
+    /// tone never stops, with a transition, a speed change and a moving layer.
+    async fn cut_project(dir: &Path) -> Value {
+        let input = dir.join("ramp.mp4");
+        let generated = Command::new(media::executable("ffmpeg"))
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg(
+                "nullsrc=s=320x180:r=24:d=10,format=gbrp,geq=r='255*N/240':g='mod(N*20,256)':b=128",
+            )
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:sample_rate=48000:duration=10")
+            .args(["-c:v", "libx264", "-crf", "8", "-pix_fmt", "yuv420p"])
+            .args(["-c:a", "aac", "-b:a", "192k"])
+            .arg(&input)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let mut e = crate::editor::Editor::new(dir.join("state")).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":24,"background":"#000000"}}),
+        )
+        .await
+        .unwrap();
+        let mut p = e
+            .dispatch("media.import", json!({"paths":[input]}))
+            .await
+            .unwrap();
+        let media_id = p["media"][0]["id"].clone();
+        for index in 0..8 {
+            p = e
+                .dispatch(
+                    "edit.add",
+                    json!({"mediaId":media_id,"start":index as f64,"duration":1.0,"sourceIn":index as f64}),
+                )
+                .await
+                .unwrap();
+        }
+        let mut clips = p["clips"].as_array().unwrap().clone();
+        clips.sort_by(|a, b| number(a, "start", 0.0).total_cmp(&number(b, "start", 0.0)));
+        clips[3]["transitionIn"] = json!({"type":"fade","duration":0.5});
+        clips[5]["speed"] = json!(2.0);
+        clips[6]["keyframes"] = json!([
+            {"property":"x","time":0,"value":0},{"property":"x","time":1,"value":120}
+        ]);
+        p["clips"] = json!(clips);
+        validate_project(&p).unwrap();
+        p
+    }
+
+    async fn samples(path: &Path) -> Vec<i16> {
+        let decoded = Command::new(media::executable("ffmpeg"))
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-ac", "1", "-f", "s16le", "pipe:1"])
+            .output()
+            .await
+            .unwrap();
+        assert!(decoded.status.success());
+        decoded
+            .stdout
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_export_rendered_in_parts_is_the_export_rendered_in_one_run() {
+        let dir = std::env::temp_dir().join(media::id("studio-parts-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = cut_project(&dir).await;
+        let make = |name: &'static str, format: &'static str, limit: usize, fps: f64| {
+            let (project, dir) = (project.clone(), dir.clone());
+            async move {
+                let temp = dir.join(format!("temp-{name}"));
+                std::fs::create_dir_all(&temp).unwrap();
+                let output = dir.join(format!("{name}.{format}"));
+                let states = Arc::new(Mutex::new(HashMap::new()));
+                states
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), json!({"id":name,"progress":0.0}));
+                render(
+                    &project,
+                    &json!({"crf":8,"fps":fps}),
+                    &output,
+                    format,
+                    &temp,
+                    name,
+                    states.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    if format == "mp4" { "libx264" } else { "" },
+                    limit,
+                )
+                .await
+                .unwrap();
+                let parts = std::fs::read_dir(&temp)
+                    .unwrap()
+                    .flatten()
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".wav"))
+                    .count();
+                let progress = states.lock().unwrap()[name]["progress"].as_f64().unwrap();
+                (output, parts, progress)
+            }
+        };
+        let (whole, no_parts, _) = make("whole", "mp4", usize::MAX, 24.0).await;
+        let (joined, parts, progress) = make("joined", "mp4", 2, 24.0).await;
+        assert_eq!((no_parts, parts), (0, 4));
+        assert!(progress > 0.9 && progress <= 0.99, "{progress}");
+        assert_eq!(frame_count(&whole).await, 8 * 24);
+        assert_eq!(frame_count(&joined).await, 8 * 24);
+        // Every frame, the ones either side of each joint included, is the same picture.
+        for frame in [
+            0, 1, 23, 47, 48, 49, 60, 80, 95, 96, 97, 130, 143, 144, 145, 170, 191,
+        ] {
+            let time = frame as f64 / 24.0;
+            let error = mean_difference(
+                &frame_at(&whole, time).await,
+                &frame_at(&joined, time).await,
+            );
+            assert!(
+                error < 1.5,
+                "frame {frame} differs between the two renders: {error}"
+            );
+        }
+        // The joined file's frames are evenly spaced.
+        let probed = Command::new(media::executable("ffprobe"))
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+            .arg(&joined)
+            .output()
+            .await
+            .unwrap();
+        let mut times: Vec<f64> = String::from_utf8_lossy(&probed.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .collect();
+        times.sort_by(f64::total_cmp);
+        assert_eq!(times.len(), 8 * 24);
+        assert!(times[0].abs() < 1e-6, "{}", times[0]);
+        assert!(times
+            .windows(2)
+            .all(|pair| (pair[1] - pair[0] - 1.0 / 24.0).abs() < 1e-4));
+        assert!(samples(&joined).await.len() >= 8 * 48000 - 2048);
+        // The sound: the same samples, with no step where two parts meet.
+        let (whole, _, _) = make("whole-sound", "wav", usize::MAX, 24.0).await;
+        let (joined, parts, _) = make("joined-sound", "wav", 2, 24.0).await;
+        assert_eq!(parts, 4);
+        let (a, b) = (samples(&whole).await, samples(&joined).await);
+        assert_eq!(a.len(), 8 * 48000);
+        assert_eq!(a.len(), b.len());
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        assert!(worst <= 64, "the joined sound differs by up to {worst}");
+        assert!(a.iter().any(|sample| sample.abs() > 2000));
+        // At a rate whose frame times are not round numbers, no frame is added or
+        // dropped where two parts meet.
+        let (whole, _, _) = make("whole-ntsc", "mp4", usize::MAX, 29.97).await;
+        let (joined, parts, _) = make("joined-ntsc", "mp4", 2, 29.97).await;
+        assert_eq!(parts, 3);
+        assert_eq!(frame_count(&whole).await, 240);
+        assert_eq!(frame_count(&joined).await, 240);
+        for frame in [0, 59, 60, 61, 119, 120, 121, 200, 239] {
+            let time = frame as f64 / 29.97;
+            let error = mean_difference(
+                &frame_at(&whole, time).await,
+                &frame_at(&joined, time).await,
+            );
+            assert!(error < 1.5, "frame {frame} differs at 29.97 fps: {error}");
+        }
+        // The cuts lie between two output frames here. Each clip still fills its
+        // last frame (the source's blue is 128, the background black) and opens
+        // with its own first picture: source frame 48 has red 51.
+        for frame in [29, 59, 89, 149, 239] {
+            let shown = frame_at(&whole, frame as f64 / 29.97).await;
+            assert!(
+                shown[2] > 96,
+                "frame {frame} shows the background: {:?}",
+                &shown[..3]
+            );
+        }
+        let opening = frame_at(&whole, 60.0 / 29.97).await;
+        assert!((opening[0] as i32 - 51).abs() <= 3, "{:?}", &opening[..3]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Stands in for a proxy with a picture nothing else shows: wherever white turns
+    /// up, the proxy was read.
+    #[tokio::test]
+    async fn previews_read_proxies_and_exports_read_the_originals() {
+        let dir = std::env::temp_dir().join(media::id("studio-proxy-preview-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("heavy.mp4");
+        let make = |source: &'static str, codec: &'static str, output: PathBuf| async move {
+            let made = Command::new(media::executable("ffmpeg"))
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i", source])
+                .args(["-c:v", codec, "-pix_fmt", "yuv420p"])
+                .arg(&output)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        };
+        // MPEG-4 Part 2 is a codec that gets a proxy whatever its size.
+        make(
+            "color=c=0x2040c0:s=320x180:r=24:d=3",
+            "mpeg4",
+            input.clone(),
+        )
+        .await;
+        let root = dir.join("state");
+        let mut e = crate::editor::Editor::new(root.clone()).unwrap();
+        e.dispatch(
+            "project.update",
+            json!({"patch":{"width":320,"height":180,"fps":24,"background":"#000000"}}),
+        )
+        .await
+        .unwrap();
+        let project = e
+            .dispatch("media.importAndAdd", json!({"paths":[input]}))
+            .await
+            .unwrap();
+        let item = &project["media"][0];
+        assert!(media::needs_proxy(item), "{item}");
+        let frame = |params: Value| {
+            let (project, root) = (project.clone(), root.clone());
+            async move {
+                let frame =
+                    render_frame(&project, &params, &root, Arc::new(AtomicBool::new(false)))
+                        .await
+                        .unwrap();
+                let pixel = *image::open(frame["path"].as_str().unwrap())
+                    .unwrap()
+                    .to_rgb8()
+                    .get_pixel(100, 60);
+                (frame["proxies"].as_u64().unwrap(), pixel)
+            }
+        };
+        let blue = |pixel: &image::Rgb<u8>| near(pixel, [0x20, 0x40, 0xc0], 24);
+        let white = |pixel: &image::Rgb<u8>| near(pixel, [255, 255, 255], 24);
+        // Without a proxy the original is read.
+        let (count, pixel) = frame(json!({"time":1.0,"width":320})).await;
+        assert!(count == 0 && blue(&pixel), "{count} {pixel:?}");
+        let proxy = media::proxy_path(&root, item["id"].as_str().unwrap());
+        std::fs::create_dir_all(proxy.parent().unwrap()).unwrap();
+        make("color=c=white:s=320x180:r=24:d=3", "libx264", proxy.clone()).await;
+        // A proxy file that does not say which source it shows stands in for nothing.
+        let (count, pixel) = frame(json!({"time":1.0,"width":320})).await;
+        assert!(count == 0 && blue(&pixel), "{count} {pixel:?}");
+        std::fs::write(
+            media::proxy_source_note(&proxy),
+            media::proxy_note(item["path"].as_str().unwrap()),
+        )
+        .unwrap();
+        let (count, pixel) = frame(json!({"time":1.0,"width":320})).await;
+        assert!(count == 1 && white(&pixel), "{count} {pixel:?}");
+        // The originals on request, and for frames larger than a proxy.
+        let (count, pixel) = frame(json!({"time":1.0,"width":320,"proxy":false})).await;
+        assert!(count == 0 && blue(&pixel), "{count} {pixel:?}");
+        let (count, pixel) = frame(json!({"time":1.0,"width":1600})).await;
+        assert!(count == 0 && blue(&pixel), "{count} {pixel:?}");
+        // An export reads the original, also when it claims to be a preview but is
+        // written outside the previews folder.
+        for (name, params) in [
+            ("export", json!({"crf":8,"hardware":false})),
+            ("claimed", json!({"crf":8,"hardware":false,"preview":true})),
+        ] {
+            let output = export(&project, params, &dir, name).await;
+            let exported = frame_at(&output, 1.0).await;
+            assert!(
+                blue(&image::Rgb([exported[0], exported[1], exported[2]])),
+                "{name}: {:?}",
+                &exported[..3]
+            );
+        }
+        // The precise-playback video in the previews folder reads the proxy.
+        let previews = root.join("previews");
+        std::fs::create_dir_all(&previews).unwrap();
+        let output = previews.join("playback.mp4");
+        run(
+            project.clone(),
+            json!({"crf":23,"preview":true}),
+            &output,
+            "mp4",
+            &root,
+            "playback",
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let played = frame_at(&output, 1.0).await;
+        assert!(
+            white(&image::Rgb([played[0], played[1], played[2]])),
+            "{:?}",
+            &played[..3]
+        );
+        // The source replaced at the same path: the proxy shows what the file was,
+        // so the preview reads the original again, as the export does.
+        make("color=c=0x2040c0:s=320x180:r=24:d=4", "mpeg4", input).await;
+        let (count, pixel) = frame(json!({"time":1.0,"width":320})).await;
+        assert!(count == 0 && blue(&pixel), "{count} {pixel:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

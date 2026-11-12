@@ -5,6 +5,7 @@ fn main() {
             "studio_connection",
             "studio_open_files",
             "studio_save_file",
+            "studio_reveal_file",
         ]),
     ))
     .expect("tauri build");

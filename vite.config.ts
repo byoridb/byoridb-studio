@@ -13,6 +13,10 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: "./src/test/setup.ts",
+    // A test that renders the whole app takes well under a second, and many seconds
+    // when every core is busy (a build or another test run beside it): the limits
+    // leave room for that instead of failing on a starved processor.
+    testTimeout: 30_000,
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],

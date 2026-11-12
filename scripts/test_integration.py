@@ -84,6 +84,9 @@ class Service:
             self.env['PATH'] = f'{path_prefix}{os.pathsep}{self.env.get("PATH", "")}'
         self.process = None
         self.connection = None
+        # Where the service runs. A test that sends it relative paths sets this to
+        # a temporary folder so that nothing lands in the repository.
+        self.cwd = None
 
     @property
     def origin(self):
@@ -91,7 +94,8 @@ class Service:
 
     def start(self):
         self.log = open(self.home / 'service.log', 'ab')
-        self.process = subprocess.Popen([str(BINARY)], env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
+        self.process = subprocess.Popen([str(BINARY)], env=self.env, stdout=self.log, stderr=subprocess.STDOUT,
+                                        cwd=self.cwd)
         file = self.home / 'connection.json'
         for _ in range(200):
             if file.exists():
@@ -109,8 +113,12 @@ class Service:
         return self
 
     def output(self):
+        return self.output_all()[-4000:]
+
+    def output_all(self):
+        """Everything the service has written to stdout and stderr since the first start."""
         self.log.flush()
-        return (self.home / 'service.log').read_text(errors='replace')[-4000:]
+        return (self.home / 'service.log').read_text(errors='replace')
 
     def stop(self):
         if self.process and self.process.poll() is None:
@@ -494,6 +502,114 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse({'storage.usage', 'storage.clean', 'storage.configure'} & allowed)
         self.assertEqual(s.call('storage.clean', token='wrong')[0], 401)
 
+    def test_open_project_gets_its_proxies_over_the_limit_and_the_usage_says_so(self):
+        s = self.service
+        sources = [self.media / 'large-a.mp4', self.media / 'large-b.mp4']
+        for source in sources:
+            make_video(source, seconds=1, size='2560x1440')
+        project = s.rpc('project.new', {'name': '프록시 한도'})
+        project = s.rpc('media.import', {'paths': [str(sources[0])], 'expectedRevision': project['revision']})
+        first = project['media'][0]['id']
+
+        def ready(count):
+            media = s.rpc('project.get', {'omitWaveforms': True})['media']
+            return len([item for item in media if item.get('proxy') is True]) == count
+
+        wait_for(lambda: ready(1), 120)
+        proxy = s.home / 'proxies' / f'{first}.mp4'
+        self.assertTrue(proxy.is_file())
+        usage = s.rpc('storage.usage')
+        self.assertFalse(usage['proxyOverLimit'])
+        self.assertGreaterEqual(usage['proxyBytes'], proxy.stat().st_size)
+        self.assertEqual(usage['proxyOpenProjectBytes'], usage['proxyBytes'])
+        self.assertEqual(usage['proxyBytes'], usage['folders']['proxies']['bytes'])
+
+        # A limit the open project alone exceeds: nothing of it is removed, and it is reported.
+        self.assertEqual(s.rpc('storage.configure', {'proxyLimitBytes': 1})['proxyLimitBytes'], 1)
+        usage = s.rpc('storage.usage')
+        self.assertTrue(usage['proxyOverLimit'])
+        self.assertEqual(usage['proxyLimitBytes'], 1)
+        self.assertTrue(proxy.is_file())
+        # A new source of the open project still gets its proxy.
+        project = s.rpc('media.import', {'paths': [str(sources[1])],
+                                         'expectedRevision': s.rpc('project.get')['revision']})
+        wait_for(lambda: ready(2), 120)
+        second = next(item['id'] for item in project['media'] if item['id'] != first)
+        self.assertTrue(proxy.is_file() and (s.home / 'proxies' / f'{second}.mp4').is_file())
+        more = s.rpc('storage.usage')
+        self.assertTrue(more['proxyOverLimit'])
+        self.assertGreater(more['proxyBytes'], usage['proxyBytes'])
+        self.assertEqual(more['proxyOpenProjectBytes'], more['proxyBytes'])
+        self.assertEqual(s.rpc('storage.clean')['removedBytes'], 0, 'cleaning leaves the open project its proxies')
+        # No limit: never over it.
+        s.rpc('storage.configure', {'proxyLimitBytes': 0})
+        self.assertFalse(s.rpc('storage.usage')['proxyOverLimit'])
+
+    def test_upload_reply_names_the_waveforms_when_asked(self):
+        s = self.service
+        tone = self.media / 'tone.wav'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', str(tone)],
+                       check=True)
+        project = s.rpc('project.new', {'name': '업로드'})
+        s.rpc('media.import', {'paths': [str(tone)], 'expectedRevision': project['revision']})
+        wait_for(lambda: s.rpc('project.get', {'omitWaveforms': True})['media'][0].get('waveformId'), 60)
+        srt = '1\n00:00:00,000 --> 00:00:01,000\n자막\n'.encode()
+        base = f"/upload?name=lines.srt&projectId={project['id']}"
+        status, _, body = s.request(base + '&omitWaveforms=true', srt)
+        self.assertEqual(status, 200, body)
+        slim = json.loads(body)['result']['media'][0]
+        self.assertNotIn('waveform', slim)
+        self.assertGreater(slim['waveformPeaks'], 0)
+        self.assertTrue(slim['waveformId'])
+        status, _, full_body = s.request(base, srt)
+        self.assertEqual(status, 200, full_body)
+        full = json.loads(full_body)['result']['media'][0]
+        self.assertEqual(len(full['waveform']), slim['waveformPeaks'])
+        self.assertNotIn('waveformId', full)
+        self.assertLess(len(body), len(full_body))
+        self.assertEqual(s.rpc('media.waveform', {'id': full['id']})['waveformId'], slim['waveformId'])
+        # A media upload answers the same way.
+        clip = self.media / 'small.mp4'
+        make_video(clip, seconds=1)
+        status, _, body = s.request(f"/upload?name=small.mp4&projectId={project['id']}&omitWaveforms=true",
+                                    clip.read_bytes())
+        self.assertEqual(status, 200, body)
+        media = json.loads(body)['result']['media']
+        self.assertEqual(len(media), 2)
+        self.assertTrue(all('waveform' not in item for item in media))
+
+    def test_effect_preset_carries_the_sound_fade_of_a_video_clip(self):
+        s = self.service
+        source = self.media / 'preset.mp4'
+        make_video(source, seconds=4)
+        project = s.rpc('project.new', {'name': '프리셋'})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        clip = next(c for c in project['clips'] if c['kind'] == 'video')
+        project = s.rpc('edit.update', {'id': clip['id'], 'expectedRevision': project['revision'],
+                                        'patch': {'audioFadeIn': 1.0, 'audioFadeOut': 0.5}})
+        preset = s.rpc('presets.save', {'clipId': clip['id'], 'name': '소리 페이드', 'kind': 'effect'})
+        self.assertEqual((preset['patch']['audioFadeIn'], preset['patch']['audioFadeOut']), (1.0, 0.5))
+        project = s.rpc('edit.update', {'id': clip['id'], 'expectedRevision': project['revision'],
+                                        'patch': {'audioFadeIn': None, 'audioFadeOut': None}})
+        self.assertNotIn('audioFadeIn', project['clips'][0])
+        project = s.rpc('presets.apply', {'id': preset['id'], 'clipId': clip['id'], 'expectedRevision': project['revision']})
+        applied = next(c for c in project['clips'] if c['id'] == clip['id'])
+        self.assertEqual((applied['audioFadeIn'], applied['audioFadeOut']), (1.0, 0.5))
+        # A text takes the rest of the effect and no sound fade; one undo takes it back.
+        project = s.rpc('edit.add', {'text': '글', 'start': 0, 'duration': 2, 'expectedRevision': project['revision']})
+        text = next(c for c in project['clips'] if c['kind'] == 'text')
+        project = s.rpc('presets.apply', {'id': preset['id'], 'clipId': text['id'], 'expectedRevision': project['revision']})
+        self.assertNotIn('audioFadeIn', next(c for c in project['clips'] if c['id'] == text['id']))
+        # An audio clip has one fade under either name; nothing is stored as audioFade*.
+        project = s.rpc('edit.add', {'mediaId': project['media'][0]['id'], 'trackId': 'audio-1', 'start': 0, 'duration': 2,
+                                     'expectedRevision': project['revision']})
+        sound = next(c for c in project['clips'] if c['kind'] == 'audio')
+        project = s.rpc('edit.update', {'id': sound['id'], 'expectedRevision': project['revision'],
+                                        'patch': {'audioFadeIn': 0.5}})
+        sound = next(c for c in project['clips'] if c['id'] == sound['id'])
+        self.assertEqual(sound['fadeIn'], 0.5)
+        self.assertNotIn('audioFadeIn', sound)
+
     def test_empty_unnamed_projects_are_reported_and_removed_only_on_request(self):
         s = self.service
         # What the home screen used to leave behind: projects nobody named or touched.
@@ -683,6 +799,236 @@ print('TOKEN ' + c['token'], flush=True)
         seen = json.loads(cli.stdout)
         self.assertEqual((seen['id'], [m['label'] for m in seen['markers']]), (project['id'], ['mcp']))
 
+
+    def test_replaced_file_of_the_same_length_gets_a_new_waveform_name_and_peaks(self):
+        s = self.service
+        source = self.media / 'voice.wav'
+
+        def write(volume):
+            """Two seconds at the same path: the tone is audible only where `volume` says."""
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+                            '-af', f"volume='{volume}':eval=frame", '-ar', '44100', '-ac', '1', str(source)], check=True)
+
+        def named():
+            item = s.rpc('project.get', {'omitWaveforms': True})['media'][0]
+            return item if item.get('waveformId') else None
+
+        write('if(lt(t,1),1,0)')
+        project = s.rpc('project.new', {'name': '파형'})
+        project = s.rpc('media.import', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        media = project['media'][0]['id']
+        first = wait_for(named, 60)
+        self.assertNotIn('waveform', first)
+        before = s.rpc('media.waveform', {'id': media})
+        self.assertEqual(before['waveformId'], first['waveformId'])
+        self.assertEqual(len(before['waveform']), first['waveformPeaks'])
+        half = len(before['waveform']) // 2
+        self.assertGreater(min(before['waveform'][2:half - 2]), 0.1, 'the first half is loud')
+        self.assertLess(max(before['waveform'][half + 2:-2]), 0.01, 'the second half is silent')
+
+        # Another recording of the same length takes the file's place.
+        length = duration_of(source)
+        write('if(lt(t,1),0,1)')
+        self.assertEqual(duration_of(source), length)
+        # Nothing looked at the file again: the stored waveform is still the old one.
+        self.assertEqual(s.rpc('media.waveform', {'id': media}), before)
+        project = s.rpc('media.reprobe', {'ids': [media], 'expectedRevision': s.rpc('project.get')['revision']})
+        self.assertEqual(project['media'][0]['duration'], first['duration'])
+        second = wait_for(lambda: (lambda item: item if item and item['waveformId'] != first['waveformId'] else None)(named()), 60)
+        self.assertEqual(second['waveformPeaks'], first['waveformPeaks'], 'the same length gives as many peaks')
+        after = s.rpc('media.waveform', {'id': media})
+        self.assertEqual(after['waveformId'], second['waveformId'])
+        self.assertNotEqual(after['waveform'], before['waveform'])
+        self.assertLess(max(after['waveform'][2:half - 2]), 0.01, 'now the first half is silent')
+        self.assertGreater(min(after['waveform'][half + 2:-2]), 0.1, 'and the second half is loud')
+        # The name is the content's: the first recording back at the path gets its first name back.
+        write('if(lt(t,1),1,0)')
+        s.rpc('media.reprobe', {'ids': [media]})
+        third = wait_for(lambda: (lambda item: item if item and item['waveformId'] != second['waveformId'] else None)(named()), 60)
+        self.assertEqual(third['waveformId'], first['waveformId'])
+        self.assertEqual(s.rpc('media.waveform', {'id': media}), before)
+
+    def mean_volume(self, path, start, length):
+        """The mean level in dB of one stretch of a sound file (FFmpeg volumedetect)."""
+        report = subprocess.run(['ffmpeg', '-v', 'info', '-nostats', '-ss', str(start), '-t', str(length), '-i', str(path),
+                                 '-af', 'volumedetect', '-f', 'null', '-'], capture_output=True, text=True, check=True).stderr
+        line = next(line for line in report.splitlines() if 'mean_volume:' in line)
+        return float(line.split('mean_volume:')[1].split('dB')[0])
+
+    def test_sound_fade_of_a_video_clip_is_heard_in_the_output_and_leaves_the_picture(self):
+        s = self.service
+        source = self.media / 'tone.mp4'
+        make_video(source, seconds=4)
+        project = s.rpc('project.new', {'name': '소리 페이드', 'width': 320, 'height': 180})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        clip = next(c for c in project['clips'] if c['kind'] == 'video')
+        length = clip['duration']
+
+        def levels(name):
+            output = s.home / 'exports' / name
+            self.export(s, {'path': str(output), 'format': 'wav'})
+            self.assertAlmostEqual(duration_of(output), length, delta=0.1)
+            quarters = [self.mean_volume(output, index * 0.25, 0.25) for index in range(4)]
+            middle = self.mean_volume(output, 1.5, length - 3)
+            end = [self.mean_volume(output, length - 1 + index * 0.25, 0.25) for index in range(4)]
+            return quarters, middle, end
+
+        plain_in, plain_middle, plain_out = levels('plain.wav')
+        for level in plain_in + plain_out:
+            self.assertAlmostEqual(level, plain_middle, delta=1.0, msg='without a fade the tone is level')
+
+        project = s.rpc('edit.update', {'id': clip['id'], 'patch': {'audioFadeIn': 1.0, 'audioFadeOut': 1.0},
+                                        'expectedRevision': project['revision']})
+        faded = next(c for c in project['clips'] if c['id'] == clip['id'])
+        self.assertEqual((faded['audioFadeIn'], faded['audioFadeOut'], faded['fadeIn'], faded['fadeOut']), (1.0, 1.0, 0, 0))
+        fade_in, middle, fade_out = levels('faded.wav')
+        self.assertAlmostEqual(middle, plain_middle, delta=0.5, msg='between the fades the level is unchanged')
+        self.assertEqual(fade_in, sorted(fade_in), 'the sound rises through the fade in')
+        self.assertEqual(fade_out, sorted(fade_out, reverse=True), 'and falls through the fade out')
+        self.assertLess(fade_in[0], middle - 12, 'the first quarter second is far quieter')
+        self.assertLess(fade_out[-1], middle - 12, 'and so is the last')
+        self.assertLess(fade_in[3], middle - 0.5)
+        self.assertGreater(fade_in[3], middle - 6, 'near its end the fade is almost at full level')
+        # The picture does not fade with the sound: its first frame is the source's.
+        frame = s.rpc('preview.frame', {'time': 0.0, 'width': 320})
+        shown = self.frame_pixel(frame['path'], 300, 20)
+        self.assertGreater(sum(shown), 150, shown)
+
+        # The picture's own fade still fades the sound of a clip that has none of its own.
+        project = s.rpc('edit.update', {'id': clip['id'], 'patch': {'audioFadeIn': None, 'audioFadeOut': None, 'fadeIn': 1.0},
+                                        'expectedRevision': project['revision']})
+        following, _, tail = levels('following.wav')
+        self.assertLess(following[0], middle - 12)
+        self.assertAlmostEqual(tail[-1], middle, delta=1.0)
+        frame = s.rpc('preview.frame', {'time': 0.0, 'width': 320})
+        self.assertLess(sum(self.frame_pixel(frame['path'], 300, 20)), 60, 'the picture fades in from black')
+
+    def stream_hashes(self, path):
+        """The decoded content of a file's video and audio, frame by frame."""
+        return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-f', 'framemd5', '-'], text=True)
+
+    def test_schema_2_project_file_opens_as_schema_3_and_renders_the_same(self):
+        s = self.service
+        source = self.media / 'older.mp4'
+        make_video(source, seconds=3)
+        project = s.rpc('project.new', {'name': '이전 버전', 'width': 320, 'height': 180})
+        project = s.rpc('media.importAndAdd', {'paths': [str(source)], 'expectedRevision': project['revision']})
+        clip = next(c for c in project['clips'] if c['kind'] == 'video')
+        # What a version 2 build could store: a transition whose length also fades the sound.
+        project = s.rpc('edit.update', {'id': clip['id'], 'expectedRevision': project['revision'], 'patch': {
+            'transitionIn': {'type': 'slideLeft', 'duration': 1.0}, 'fadeOut': 0.5, 'volume': 0.8}})
+        project = s.rpc('edit.add', {'text': '자막', 'start': 0.5, 'duration': 2, 'expectedRevision': project['revision']})
+        self.assertEqual(project['schemaVersion'], 3)
+        wait_for(lambda: isinstance(s.rpc('project.get')['media'][0].get('waveform'), list), 60)
+        project = s.rpc('project.get')
+
+        def render(name):
+            output = s.home / 'exports' / name
+            self.export(s, {'path': str(output), 'format': 'mp4', 'width': 320, 'height': 180, 'hardware': False})
+            return self.stream_hashes(output)
+
+        expected = render('v3.mp4')
+        self.assertEqual(render('v3-again.mp4'), expected, 'the software export is repeatable')
+
+        older = json.loads(json.dumps(project))
+        older['schemaVersion'] = 2
+        for item in older['clips']:
+            self.assertNotIn('audioFadeIn', item)
+        file = self.media / 'version-2.json'
+        file.write_text(json.dumps(older))
+        opened = s.rpc('project.open', {'path': str(file)})
+        self.assertEqual(opened['schemaVersion'], 3)
+        self.assertEqual(opened['name'], '이전 버전')
+        for key in ('clips', 'tracks', 'media', 'width', 'height', 'fps'):
+            self.assertEqual(opened[key], project[key], key)
+        self.assertEqual(json.loads(file.read_text())['schemaVersion'], 2, 'the opened file itself is left as it was')
+        self.assertEqual(render('v2.mp4'), expected, 'a version 2 project renders as it did')
+        # The sound still follows the transition, as version 2 had it.
+        audio = s.home / 'exports' / 'v2.wav'
+        self.export(s, {'path': str(audio), 'format': 'wav'})
+        self.assertLess(self.mean_volume(audio, 0, 0.25), self.mean_volume(audio, 1.25, 0.5) - 12)
+
+        # The autosave of a version 2 build is migrated the same way when the service starts.
+        s.stop()
+        current = s.home / 'current.json'
+        saved = json.loads(current.read_text())
+        self.assertEqual(saved['schemaVersion'], 3)
+        saved['schemaVersion'] = 2
+        current.write_text(json.dumps(saved))
+        stored = s.home / 'projects' / f"{saved['id']}.json"
+        stored.write_text(json.dumps(saved))
+        s.start()
+        started = s.rpc('project.get')
+        self.assertEqual((started['schemaVersion'], started['id'], started['clips']), (3, opened['id'], opened['clips']))
+        self.assertIsNone(s.rpc('project.notice')['notice'])
+        self.assertEqual(render('v2-restarted.mp4'), expected)
+        # A project from a newer build is refused in words, and nothing is opened.
+        newer = dict(older, schemaVersion=4)
+        file.write_text(json.dumps(newer))
+        self.assertIn('업데이트', s.error('project.open', {'path': str(file)}))
+        self.assertEqual(s.rpc('project.get')['id'], started['id'])
+
+    def test_shutdown_during_a_slow_import_keeps_the_edits_answered_before_it(self):
+        s = self.service
+        source = self.media / 'slow.mp4'
+        make_video(source, seconds=2, size='1280x720')
+        copies = []
+        for index in range(40):
+            copy = self.media / f'slow-{index:02}.mp4'
+            shutil.copyfile(source, copy)
+            copies.append(str(copy))
+        project = s.rpc('project.new', {'name': '느린 명령 중 종료'})
+        for index in range(3):
+            project = s.rpc('edit.add', {'text': f'자막 {index + 1}', 'start': index, 'duration': 1,
+                                         'expectedRevision': project['revision']})
+        reply = {}
+
+        def slow_import():
+            try:
+                reply['status'], reply['value'] = s.call('media.import', {'paths': copies, 'expectedRevision': project['revision']})
+            except Exception as error:  # the connection may end with the service
+                reply['error'] = error
+
+        importing = threading.Thread(target=slow_import)
+        importing.start()
+        time.sleep(0.4)
+        self.assertTrue(importing.is_alive() and not reply, 'the import is still running when the service is told to stop')
+        began = time.time()
+        s.process.send_signal(signal.SIGTERM)
+        s.process.wait(timeout=60)
+        took = time.time() - began
+        s.log.close()
+        importing.join(timeout=30)
+        self.assertFalse(importing.is_alive())
+        self.assertEqual(s.process.returncode, 0, 'the service stopped by itself')
+        self.assertLess(took, 30)
+        self.assertFalse((s.home / 'connection.json').exists())
+
+        # Both files hold a whole project with every answered edit.
+        saved = json.loads((s.home / 'current.json').read_text())
+        stored = json.loads((s.home / 'projects' / f"{project['id']}.json").read_text())
+        self.assertEqual(saved, stored)
+        self.assertEqual(self.texts(saved), ['자막 1', '자막 2', '자막 3'])
+        answered = reply.get('status') == 200
+        if answered:
+            # The import was answered before the service went: it is an answered edit too.
+            self.assertEqual(saved['revision'], reply['value']['revision'])
+            self.assertEqual(len(saved['media']), len(copies))
+        else:
+            # Never half an import: all of it or none.
+            self.assertIn(len(saved['media']), (0, len(copies)))
+            if not saved['media']:
+                self.assertEqual((saved['revision'], saved['clips']), (project['revision'], project['clips']))
+        s.start()
+        reopened = s.rpc('project.get')
+        self.assertEqual((reopened['id'], reopened['revision']), (saved['id'], saved['revision']))
+        self.assertEqual(self.texts(reopened), ['자막 1', '자막 2', '자막 3'])
+        self.assertIsNone(s.rpc('project.notice')['notice'])
+        self.assertEqual([f.name for f in s.home.iterdir() if '.tmp' in f.name or 'corrupt' in f.name], [])
+        # The user's files are as they were, and the editor works on.
+        self.assertEqual(Path(copies[0]).read_bytes(), source.read_bytes())
+        project = s.rpc('edit.add', {'text': '다시 시작한 뒤', 'start': 5, 'duration': 1, 'expectedRevision': reopened['revision']})
+        self.assertEqual(self.texts(project)[-1], '다시 시작한 뒤')
 
     def texts(self, project):
         return [clip['text']['content'] for clip in sorted(project['clips'], key=lambda c: c['start'])]

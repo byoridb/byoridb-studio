@@ -85,7 +85,7 @@ export async function uploadFile(
 ): Promise<Project> {
   const c = await connectStudio();
   const response = await fetch(
-    `${c.url}/upload?name=${encodeURIComponent(file.name)}&projectId=${encodeURIComponent(projectId)}`,
+    `${c.url}/upload?name=${encodeURIComponent(file.name)}&projectId=${encodeURIComponent(projectId)}&omitWaveforms=true`,
     {
       method: "POST",
       headers: {

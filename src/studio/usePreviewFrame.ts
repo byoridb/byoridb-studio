@@ -84,8 +84,10 @@ export function usePreviewFrame(
       void reply.then(settle, settle);
       reply.then(
         (result) => {
-          // Replaced by a newer request, or stopped because playback started.
-          if (!result || result.cancelled || !result.assetId) return;
+          // Replaced by a newer request, stopped because playback started, or overtaken
+          // by an edit: the service says so itself, whatever else the reply carries.
+          if (result?.cancelled === true) return;
+          if (!result?.assetId) return;
           if (
             result.revision !== request.revision ||
             (result.projectId && result.projectId !== request.projectId)

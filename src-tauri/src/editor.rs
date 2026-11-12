@@ -1620,9 +1620,18 @@ impl Editor {
                         frame["time"] = json!(number(frame, "time", 0.0) * ratio);
                     }
                 }
-                for field in ["fadeIn", "fadeOut"] {
+                for field in ["fadeIn", "fadeOut", "audioFadeIn", "audioFadeOut"] {
                     if let Some(value) = patch[field].as_f64() {
                         patch[field] = json!(value * ratio);
+                    }
+                }
+                // Only a video clip has a sound fade apart from the picture's: on an
+                // image or a text the rest of the effect applies without it.
+                if clip["kind"] != "video" {
+                    if let Some(patch) = patch.as_object_mut() {
+                        for (audio, _) in AUDIO_FADES {
+                            patch.remove(audio);
+                        }
                     }
                 }
                 for field in ["transitionIn", "transitionOut"] {
@@ -2160,6 +2169,13 @@ pub(crate) fn capture_preset(clip: &Value, kind: &str) -> Result<Value, String> 
             "chromaKey":{"enabled":false,"color":"#00ff00","similarity":0.1,"blend":0.1},"stabilize":{"enabled":false,"strength":1},
             "fadeIn":0.0,"fadeOut":0.0,"transitionIn":null,"transitionOut":null,"blendMode":"normal","keyframes":[]})
     };
+    // A video clip's sound fade is part of its effect: its own lengths, or null
+    // where the sound follows the picture. Other clips have none to capture.
+    if kind == "effect" && clip["kind"] == "video" {
+        for (audio, _) in AUDIO_FADES {
+            patch[audio] = Value::Null;
+        }
+    }
     for (field, value) in patch.as_object_mut().unwrap() {
         if let Some(selected) = clip.get(field) {
             merge(value, selected);
@@ -2206,6 +2222,8 @@ pub(crate) fn validate_preset(preset: &Value) -> Result<(), String> {
             "stabilize",
             "fadeIn",
             "fadeOut",
+            "audioFadeIn",
+            "audioFadeOut",
             "transitionIn",
             "transitionOut",
             "blendMode",
@@ -2950,7 +2968,16 @@ fn apply(p: &mut Value, method: &str, args: &Value) -> Result<(), String> {
                     "video" => clip[audio] = on_grid(&clip[audio]),
                     "audio" => {
                         let value = clip.as_object_mut().unwrap().remove(audio);
-                        if let Some(value) = value.filter(|value| !value.is_null()) {
+                        // As with fadeIn/fadeOut, a transition given in the same
+                        // patch sets the length.
+                        let transition = if fade == "fadeIn" {
+                            "transitionIn"
+                        } else {
+                            "transitionOut"
+                        };
+                        if let Some(value) = value
+                            .filter(|value| !value.is_null() && !patch.contains_key(transition))
+                        {
                             clip[fade] = on_grid(&value);
                         }
                     }
@@ -4697,6 +4724,128 @@ mod tests {
             .dispatch("presets.apply", json!({"clipId":id,"id":preset["id"]}))
             .await
             .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// An effect preset of a video clip carries its sound fade: the clip's own
+    /// lengths, scaled like the picture's, or that the sound follows the picture.
+    #[tokio::test]
+    async fn effect_presets_carry_the_sound_fade_of_a_video_clip() {
+        let dir = temp();
+        let mut e = Editor::new(dir.clone()).unwrap();
+        e.project = trim_project("video", false, 1.0);
+        let text = e.project["clips"][1]["id"].clone();
+        let own = json!({"fadeIn":1.0,"audioFadeIn":0.5,"audioFadeOut":0.2});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":own}))
+            .await
+            .unwrap();
+        let preset = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Own sound","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preset["patch"]["audioFadeIn"], 0.5);
+        assert_eq!(preset["patch"]["audioFadeOut"], 0.2);
+        // Twice as long, and following the picture again: the preset brings the
+        // sound's own fades back at twice their length.
+        let reset = json!({"duration":8.0,"audioFadeIn":null,"audioFadeOut":null});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":reset}))
+            .await
+            .unwrap();
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":preset["id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 2.0);
+        assert_eq!(p["clips"][0]["audioFadeIn"], 1.0);
+        assert_eq!(p["clips"][0]["audioFadeOut"], 0.4);
+        // A text has no sound: the rest of the effect applies.
+        let p = e
+            .dispatch("presets.apply", json!({"clipId":text,"id":preset["id"]}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][1]["fadeIn"], 0.5);
+        assert!(p["clips"][1].get("audioFadeIn").is_none());
+        assert!(p["clips"][1].get("audioFadeOut").is_none());
+
+        // A clip whose sound follows the picture says so, and a text says nothing.
+        let follow = json!({"audioFadeIn":null,"audioFadeOut":null});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":follow}))
+            .await
+            .unwrap();
+        let following = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Follows","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert!(following["patch"]["audioFadeIn"].is_null());
+        assert!(following["patch"]
+            .as_object()
+            .unwrap()
+            .contains_key("audioFadeOut"));
+        let from_text = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":text,"name":"Text","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert!(from_text["patch"].get("audioFadeIn").is_none());
+        let own = json!({"audioFadeIn":0.5,"audioFadeOut":0.5});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":own}))
+            .await
+            .unwrap();
+        // From a text the sound fade stays; from the following clip it follows again.
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":from_text["id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["audioFadeIn"], 0.5);
+        let p = e
+            .dispatch(
+                "presets.apply",
+                json!({"clipId":"trim-clip","id":following["id"]}),
+            )
+            .await
+            .unwrap();
+        assert!(p["clips"][0].get("audioFadeIn").is_none());
+        assert!(p["clips"][0].get("audioFadeOut").is_none());
+
+        // An audio clip has one fade, under either name, and its preset holds it.
+        e.project = trim_project("audio", false, 1.0);
+        let alias = json!({"audioFadeIn":0.5,"fadeOut":1.0});
+        e.dispatch("edit.update", json!({"id":"trim-clip","patch":alias}))
+            .await
+            .unwrap();
+        let sound = e
+            .dispatch(
+                "presets.save",
+                json!({"clipId":"trim-clip","name":"Sound","kind":"effect"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sound["target"], "audio");
+        assert_eq!(sound["patch"]["fadeIn"], 0.5);
+        assert_eq!(sound["patch"]["fadeOut"], 1.0);
+        assert!(sound["patch"].get("audioFadeIn").is_none());
+        // A transition in the same patch sets the length, as it does beside fadeIn.
+        let both = json!({"audioFadeIn":0.5,"transitionIn":{"type":"fade","duration":1.5}});
+        let p = e
+            .dispatch("edit.update", json!({"id":"trim-clip","patch":both}))
+            .await
+            .unwrap();
+        assert_eq!(p["clips"][0]["fadeIn"], 1.5);
+        assert_eq!(p["clips"][0]["transitionIn"]["duration"], 1.5);
+        assert!(p["clips"][0].get("audioFadeIn").is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
@@ -8134,6 +8283,318 @@ mod tests {
         assert!(e.project_file(&travel).is_file());
         assert!(e.empty_unnamed_projects().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Values of every JSON type, for a place that expects another one.
+    fn wrong_values() -> Vec<Value> {
+        vec![
+            Value::Null,
+            json!(true),
+            json!(0),
+            json!(-1),
+            json!(0.5),
+            json!(1e308),
+            json!(-1e308),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(""),
+            json!("x"),
+            json!("1.5"),
+            json!("한글"),
+            json!("fade"),
+            json!([]),
+            json!([0]),
+            json!(["a", 1, null]),
+            json!([[0, 0], [1, 1]]),
+            json!([{}]),
+            json!({}),
+            json!({"x":1}),
+            json!({"type":"fade","duration":"1"}),
+            json!({"type":5,"duration":-1}),
+            json!({"enabled":"yes"}),
+            json!([{"property":"scale","time":"1","value":[]}]),
+            json!([{"property":5,"time":0.5}, 7]),
+            json!({"content":5,"fontSize":"big"}),
+        ]
+    }
+
+    /// The commands of `apply`, each as the editor would accept it on `fuzz_project`.
+    fn fuzz_commands() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"speed":2.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"duration":2.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"speed":0.5,"duration":8.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"fadeIn":1.0,"fadeOut":0.5,"audioFadeIn":0.2,"audioFadeOut":null}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"transitionIn":{"type":"wipeLeft","duration":0.5},"transitionOut":null}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"keyframes":[{"property":"scale","time":0.0,"value":1.0}],"start":3.0}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"filter":"warm","trackId":"video-1","reverse":true}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"text":{"fontFamily":"serif","content":"글"},"name":"이름"}}),
+            ),
+            (
+                "edit.update",
+                json!({"id":"trim-clip","patch":{"transform":{"x":3.0},"color":{"hsl":{"red":{"hue":3.0}}},"crop":{"x":0.1},"mask":{"type":"circle"},"chromaKey":{"enabled":true},"audio":{"eq":{"bass":1.0}},"stabilize":{"enabled":true},"blendMode":"screen","groupId":"g","volume":0.5,"sourceIn":1.0}}),
+            ),
+            (
+                "edit.add",
+                json!({"mediaId":"trim-media","start":20.0,"duration":1.0,"sourceIn":1.0,"name":"n","transform":{"x":1.0}}),
+            ),
+            (
+                "edit.add",
+                json!({"text":{"content":"추가"},"start":11.0,"duration":1.0,"newTrack":"새 트랙"}),
+            ),
+            ("edit.add", json!({"text":"글","trackId":"text-1"})),
+            ("edit.split", json!({"id":"trim-clip","time":12.0})),
+            (
+                "edit.trim",
+                json!({"id":"trim-clip","start":10.5,"end":13.0}),
+            ),
+            ("edit.trim", json!({"id":"trim-clip","start":9.0})),
+            ("edit.delete", json!({"ids":["trim-clip"],"ripple":true})),
+            ("edit.duplicate", json!({"ids":["trim-clip"]})),
+            ("edit.duplicate", json!({"id":"trim-clip"})),
+            ("edit.group", json!({"ids":["trim-clip","other"]})),
+            ("edit.ungroup", json!({"ids":["trim-clip"]})),
+            (
+                "edit.track",
+                json!({"id":"video-1","patch":{"name":"층","muted":true}}),
+            ),
+            (
+                "edit.track",
+                json!({"kind":"video","name":"새 층","clipIds":["trim-clip"]}),
+            ),
+            ("edit.trackDelete", json!({"id":"video-1"})),
+            ("edit.trackMove", json!({"id":"video-1","index":1})),
+            ("edit.marker", json!({"time":1.0,"label":"표시"})),
+            (
+                "edit.markerUpdate",
+                json!({"id":"marker","time":2.0,"label":"바뀜"}),
+            ),
+            ("edit.markerDelete", json!({"id":"marker"})),
+            (
+                "edit.shift",
+                json!({"trackId":"video-1","from":0.0,"delta":1.0}),
+            ),
+        ]
+    }
+
+    /// `trim_project` with a second clip beside the first, a marker and keyframes.
+    fn fuzz_project(kind: &str) -> Value {
+        let mut p = trim_project(kind, false, 1.0);
+        let mut other = p["clips"][0].clone();
+        other["id"] = json!("other");
+        other["start"] = json!(14.5);
+        other["duration"] = json!(1.0);
+        p["clips"].as_array_mut().unwrap().push(other);
+        p["clips"][0]["keyframes"] = json!([{"property":"scale","time":0.0,"value":1.0},
+            {"property":"scale","time":2.0,"value":1.5},{"property":"volume","time":1.0,"value":0.5}]);
+        p["markers"] = json!([{"id":"marker","time":1.0,"label":"표시"}]);
+        validate_project(&p).unwrap();
+        p
+    }
+
+    /// Runs commands on a copy of `p` as a batch does (nothing checked in between,
+    /// then the whole project). Returns what a panic said, if there was one.
+    fn panics(p: &Value, commands: &[(&str, &Value)]) -> Option<String> {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut p = p.clone();
+            for (method, args) in commands {
+                if apply(&mut p, method, args).is_err() {
+                    return;
+                }
+            }
+            let _ = validate_project(&p);
+        }));
+        run.err().map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|said| (*said).to_owned()))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Every place inside a value, as the keys that lead to it.
+    fn places(value: &Value, at: Vec<String>, found: &mut Vec<Vec<String>>) {
+        let children: Vec<(String, &Value)> = match value {
+            Value::Object(fields) => fields.iter().map(|(k, v)| (k.clone(), v)).collect(),
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v))
+                .collect(),
+            _ => vec![],
+        };
+        for (key, child) in children {
+            let mut here = at.clone();
+            here.push(key);
+            found.push(here.clone());
+            places(child, here, found);
+        }
+    }
+
+    fn place_mut<'a>(value: &'a mut Value, at: &[String]) -> &'a mut Value {
+        at.iter().fold(value, |value, key| match value {
+            Value::Array(items) => &mut items[key.parse::<usize>().unwrap()],
+            other => &mut other[key.as_str()],
+        })
+    }
+
+    /// A value of the wrong type is a validation error wherever it is met: as an
+    /// argument of a command, and as what an earlier command of the same batch
+    /// left in a clip (a batch checks the project only after its last command).
+    /// No command may panic on it. Every clip field is given every wrong value
+    /// before every command, and every argument of every command is replaced by
+    /// every wrong value.
+    #[test]
+    fn no_command_panics_on_a_value_of_the_wrong_type() {
+        let wrong = wrong_values();
+        let commands = fuzz_commands();
+        let mut failures = vec![];
+        let mut ran = 0usize;
+        for kind in ["video", "audio"] {
+            let p = fuzz_project(kind);
+            // 1. One argument of a command replaced.
+            for (method, args) in &commands {
+                let mut found = vec![];
+                places(args, vec![], &mut found);
+                for place in &found {
+                    for value in &wrong {
+                        let mut args = args.clone();
+                        *place_mut(&mut args, place) = value.clone();
+                        ran += 1;
+                        if let Some(said) = panics(&p, &[(method, &args)]) {
+                            failures.push(format!("{method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 2. A clip field left with the wrong type, then each command.
+            for field in CLIP_FIELDS {
+                for value in &wrong {
+                    let poison = json!({"id":"trim-clip","patch":{*field:value}});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.update", &poison), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("{poison} then {method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 3. The same through a pasted clip, which every later command walks past.
+            for field in CLIP_FIELDS {
+                for value in &wrong {
+                    let mut clip = p["clips"][0].clone();
+                    clip[*field] = value.clone();
+                    let paste = json!({"clips":[clip],"at":20.0});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.paste", &paste), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("paste {field}={value} then {method}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 4. The same one level down: one value inside a field's object or list.
+            let nested = json!({"transform":{"x":10.0,"y":-10.0,"scale":1.2,"rotation":15.0,"opacity":0.8,"flipX":true},
+                "color":{"brightness":0.1,"hue":10.0,"hsl":{"red":{"hue":10.0}},
+                    "curves":{"preset":"none","master":[[0.0,0.0],[1.0,1.0]]},"lut":{"enabled":false}},
+                "keyframes":[{"property":"scale","time":0.0,"value":1.0,"easing":"easeInOut"},
+                    {"property":"volume","time":0.5,"value":0.5}],
+                "text":{"content":"글","fontSize":48,"fontFamily":"sans-serif","fontId":"f","fontPath":"/f.ttf",
+                    "outline":{"color":"#000000","width":2},"shadow":{"x":2,"blur":4}},
+                "crop":{"x":0.1,"width":0.5},"mask":{"type":"circle","feather":0.1},
+                "chromaKey":{"enabled":true,"similarity":0.2},"audio":{"normalize":true,"eq":{"bass":1.0}},
+                "stabilize":{"enabled":true,"strength":2},
+                "transitionIn":{"type":"wipeLeft","duration":0.3},"transitionOut":{"type":"fade","duration":0.2}});
+            let mut found = vec![];
+            places(&nested, vec![], &mut found);
+            for place in found.iter().filter(|place| place.len() > 1) {
+                for value in &wrong {
+                    let mut patch = json!({place[0].as_str():nested[place[0].as_str()]});
+                    *place_mut(&mut patch, place) = value.clone();
+                    let poison = json!({"id":"trim-clip","patch":patch});
+                    for (method, args) in &commands {
+                        ran += 1;
+                        let batch = [("edit.update", &poison), (*method, args)];
+                        if let Some(said) = panics(&p, &batch) {
+                            failures.push(format!("{poison} then {method} {args}: {said}"));
+                        }
+                    }
+                }
+            }
+            // 5. A track or a marker left with the wrong type.
+            let mut poisons = vec![];
+            for value in &wrong {
+                for key in ["name", "muted", "hidden", "locked"] {
+                    for track in ["video-1", "audio-1", "text-1"] {
+                        poisons.push(("edit.track", json!({"id":track,"patch":{key:value}})));
+                    }
+                }
+                for key in ["time", "label"] {
+                    poisons.push(("edit.markerUpdate", json!({"id":"marker",key:value})));
+                }
+            }
+            for (poison, poisoned) in &poisons {
+                for (method, args) in &commands {
+                    ran += 1;
+                    if let Some(said) = panics(&p, &[(*poison, poisoned), (*method, args)]) {
+                        failures.push(format!("{poison} {poisoned} then {method} {args}: {said}"));
+                    }
+                }
+            }
+            // 6. Two fields at once (a seeded sequence), then each command.
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = |below: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % below as u64) as usize
+            };
+            for _ in 0..600 {
+                let mut patch = json!({});
+                for _ in 0..2 {
+                    patch[CLIP_FIELDS[next(CLIP_FIELDS.len())]] = wrong[next(wrong.len())].clone();
+                }
+                let poison = json!({"id":"trim-clip","patch":patch});
+                for (method, args) in &commands {
+                    ran += 1;
+                    let batch = [("edit.update", &poison), (*method, args)];
+                    if let Some(said) = panics(&p, &batch) {
+                        failures.push(format!("{poison} then {method} {args}: {said}"));
+                    }
+                }
+            }
+        }
+        // The check itself notices a panic: a project that is not one has no clips.
+        assert!(panics(&json!(5), &[("edit.split", &json!({"id":"a","time":1.0}))]).is_some());
+        assert!(ran > 150_000, "{ran}");
+        failures.truncate(20);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]

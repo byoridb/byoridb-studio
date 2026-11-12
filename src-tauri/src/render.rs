@@ -1185,6 +1185,18 @@ async fn run_process(
                 // clip on a 1080p timeline, or thirty small layers, took twice as long
                 // to export. A crop (exact to the pixel only in RGBA) and
                 // stabilisation keep the conversion in front, as before.
+                //
+                // Every layer does become RGBA, also a plain clip nothing is done to.
+                // Leaving such a clip in the decoder's YUV saves 6-13% of a 4K software
+                // export, and was measured and not taken (FFmpeg 9.0.2, 3840x2160, ten
+                // frames, the two graphs compared with psnr/ssim): the YUV path is the
+                // source bit for bit, the RGBA path is not, so the same clip would
+                // change its levels on the frames where an effect, a fade or a blend
+                // needs RGBA. Between the two paths: smptehdbars 34.2 dB (YUV outside
+                // the RGB gamut is clipped), smptebars 49.7 dB, testsrc2 50.6 dB,
+                // gradients 54.5 dB, the demo photos as BT.709 video 55.1-56.8 dB; a
+                // resized clip 44.9-46.2 dB and a 10-bit source 45.1 dB. One path for
+                // every frame keeps a clip's colours the same with and without effects.
                 let crop = &clip["crop"];
                 let cropped = ["x", "y"].iter().any(|key| number(crop, key, 0.0) != 0.0)
                     || ["width", "height"]

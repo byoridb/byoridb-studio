@@ -80,3 +80,26 @@ it("covers the new surface when it was replaced while the drawer stayed open", (
   view.unmount();
   expect(inert(after)).toEqual([false]);
 });
+
+it("measures again when an edit moved a control without adding, scrolling or resizing anything", () => {
+  const drawer = place(document.createElement("aside"), rect(700, 326, 0, 600));
+  const surface = document.createElement("div");
+  document.body.append(surface, drawer);
+  const clip = control(surface, "button", 300);
+  const view = renderHook(
+    ({ revision }) => useCoveredInert({ current: surface }, () => drawer, true, "true:false", revision),
+    { initialProps: { revision: 1 } },
+  );
+  expect(inert(clip)).toEqual([false]);
+  // The edit moved the clip under the drawer: only its position changed.
+  place(clip, rect(800, 40));
+  view.rerender({ revision: 1 });
+  expect(inert(clip)).toEqual([false]);
+  view.rerender({ revision: 2 });
+  expect(inert(clip)).toEqual([true]);
+  // And back out from under it with the next edit.
+  place(clip, rect(300, 40));
+  view.rerender({ revision: 3 });
+  expect(inert(clip)).toEqual([false]);
+  view.unmount();
+});

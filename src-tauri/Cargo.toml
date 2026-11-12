@@ -1,11 +1,11 @@
 [package]
 name = "byori-studio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Byori Studio - Video editing with creative memory and CLI agents"
 authors = ["Byori Team"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 default-run = "byori-studio"
 
 [build-dependencies]

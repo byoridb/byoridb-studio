@@ -44,6 +44,14 @@ class ToolBoundaryTests(unittest.TestCase):
         for term in ['codec', 'hevc', 'hardware', 'bitrate']:
             self.assertIn(term, export['description'])
 
+    def test_project_shape_an_agent_receives_is_described(self):
+        project = next(t for t in mcp.TOOLS if t['name'] == 'studio_project')
+        for term in ['waveformPeaks', 'waveformId', 'media.reprobe']:
+            self.assertIn(term, project['description'])
+        assets = next(t for t in mcp.TOOLS if t['name'] == 'studio_assets')
+        for term in ['audioFadeIn', 'audioFadeOut']:
+            self.assertIn(term, assets['description'])
+
     def test_release_version_is_declared_once(self):
         root = Path(__file__).resolve().parent.parent
         check = subprocess.run(['node', str(root / 'scripts/check-version.mjs')], capture_output=True, text=True)

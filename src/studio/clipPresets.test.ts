@@ -372,22 +372,54 @@ describe("panel styles", () => {
 
 describe("shell styles", () => {
   const css = readFileSync("src/styles/studio.css", "utf8") as string;
-  const own = /^:root \{([^}]*)\}/m.exec(css)![1];
-  const rules = css.replace(/^:root \{[^}]*\}/m, "");
+  const rules = css;
+  const index = readFileSync("src/styles/index.css", "utf8") as string;
   const names = (text: string) =>
     Array.from(text.matchAll(/^\s*(--[a-z-]+):/gm), (match) => match[1]);
 
-  it("keeps colour literals in named tokens, out of the rules", () => {
-    expect(rules.match(/#[0-9a-fA-F]{3,8}\b|\b(rgba?|hsla?|color-mix)\(/g)).toBeNull();
-    const tokens = new Set([
-      ...names(readFileSync("src/styles/index.css", "utf8") as string),
-      ...names(own),
-    ]);
+  it("keeps colour literals in the tokens of index.css, out of the shell", () => {
+    expect(css.match(/#[0-9a-fA-F]{3,8}\b|\b(rgba?|hsla?|color-mix)\(/g)).toBeNull();
+    // The shell declares no token of its own any more.
+    expect(css).not.toMatch(/^:root\b/m);
+    expect(names(css)).toEqual([]);
+    const tokens = new Set(names(index));
     // A variable with a fallback is a width the app sets on the element, not a token.
     const used = new Set(Array.from(rules.matchAll(/var\((--[a-z-]+)\)/g), (match) => match[1]));
     expect([...used].filter((name) => !tokens.has(name))).toEqual([]);
-    // A token of the shell that nothing paints with is a leftover.
-    expect(names(own).filter((name) => !used.has(name))).toEqual([]);
+  });
+
+  it("declares each token once and lists every colour token in DESIGN.md", () => {
+    const declared = names(index);
+    expect(declared.filter((name, at) => declared.indexOf(name) !== at)).toEqual([]);
+    const design = readFileSync("DESIGN.md", "utf8") as string;
+    const table = /^colors:\n((?:  .*\n)+)/m.exec(design)![1];
+    const listed = new Map(
+      Array.from(table.matchAll(/^  ([a-z-]+): "(#[0-9a-f]{6,8})"$/gm), (match) => [`--${match[1]}`, match[2]]),
+    );
+    const colours = Array.from(index.matchAll(/^\s*(--[a-z-]+): (#[0-9a-f]{6,8});/gm), (match) => [match[1], match[2]]);
+    expect(colours.length).toBeGreaterThan(60);
+    // Same name, same value: the table is the stylesheet's, not a second palette.
+    expect(colours.filter(([name, value]) => listed.get(name) !== value)).toEqual([]);
+  });
+
+  it("asks for no more page height than its rows need, and fits a 600px window", () => {
+    const rule = (selector: string) =>
+      new RegExp(`^${selector.replace(/[.]/g, "\\.")} \\{([^}]*)\\}`, "m").exec(css)![1];
+    const px = (text: string, property: string) =>
+      Number(new RegExp(`${property}:[^;]*?(\\d+)px`).exec(text)![1]);
+    const rows = /grid-template-rows: minmax\((\d+)px, 1fr\) (\d+)px/.exec(rule(".editing-surface"))!;
+    const app = readFileSync("src/App.tsx", "utf8") as string;
+    const constant = (name: string) => Number(new RegExp(`const ${name} = (\\d+);`).exec(app)![1]);
+    // The stylesheet's default rows and the rows App sets are the same minimums.
+    expect([Number(rows[1]), Number(rows[2])]).toEqual([constant("UPPER_MIN_HEIGHT"), constant("TIMELINE_SEPARATOR")]);
+    const needed =
+      px(rule(".studio-topbar"), "flex") +
+      constant("UPPER_MIN_HEIGHT") + constant("TIMELINE_SEPARATOR") + constant("TIMELINE_MIN_HEIGHT") +
+      Number(/padding: 0 6px (\d+)px/.exec(rule(".editor-workspace"))![1]) +
+      px(rule(".studio-statusbar"), "flex");
+    expect(px(rule(".studio-app"), "min-height")).toBe(needed);
+    // A 600px window on macOS 27 leaves 568px of page; a banner with a button is 46px more.
+    expect(needed + 46).toBeLessThanOrEqual(600 - 32);
   });
 
   it("has no rule for markup that is gone", () => {

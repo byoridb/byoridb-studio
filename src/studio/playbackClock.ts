@@ -72,6 +72,20 @@ export interface PlaybackRun {
   onEnd: () => void;
 }
 
+/** The running playback's way to move its clock ahead without a seek. */
+let skipAhead: ((seconds: number) => void) | null = null;
+
+/**
+ * Puts the playing clock this much ahead, from its next step on. For sound that is
+ * found to be ahead of the clock: unlike a seek it restarts no media element.
+ * Returns whether a playback took it.
+ */
+export function skipPlaybackAhead(seconds: number) {
+  if (!skipAhead || !Number.isFinite(seconds) || seconds <= 0) return false;
+  skipAhead(seconds);
+  return true;
+}
+
 /**
  * Moves the playback clock on until stopped (the function it returns) or the end.
  *
@@ -101,7 +115,12 @@ export function runPlayback({ total, loop, waiting, onEnd }: PlaybackRun): () =>
     cancelAnimationFrame(frame);
     clearInterval(timer);
     document.removeEventListener("visibilitychange", background);
+    if (skipAhead === skip) skipAhead = null;
   };
+  const skip = (seconds: number) => {
+    anchor = { ...anchor, time: anchor.time + seconds };
+  };
+  skipAhead = skip;
   const step = (now: number) => {
     if (stopped || now < last) return;
     last = now;

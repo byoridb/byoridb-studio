@@ -692,6 +692,12 @@ async fn tend_proxies(editor: &Arc<Mutex<Editor>>, root: &FsPath, work: &mut Med
 /// when those alone exceed the limit; a limit of 0 removes nothing. Returns the
 /// proxies removed.
 ///
+/// The limit is on what is kept for projects that are not open. The open project
+/// always gets its proxies, over the limit too: without one a 4K source plays and
+/// scrubs several times slower, and refusing it would make the project being
+/// edited the one that pays for the others. `storage.usage` says when the folder
+/// is over the limit (`proxyOverLimit`) so that the settings can tell the user.
+///
 /// When a proxy was last used is the modification time of its ".source" note: the
 /// last time its project was open here. The proxy itself is not touched, a player
 /// may be reading it. A removed proxy is made again when its project is opened.
@@ -744,6 +750,32 @@ fn limit_proxies(root: &FsPath, limit: u64, in_use: impl Fn(&str) -> bool) -> Ve
         }
     }
     removed
+}
+/// What the finished proxies in `proxies/` take, counted as `limit_proxies` counts
+/// them (each with its ".source" note, unfinished ones left out): all of them, and
+/// those of the open project (`in_use` by media id), which are never removed.
+fn proxy_bytes(root: &FsPath, in_use: impl Fn(&str) -> bool) -> (u64, u64) {
+    let size = |path: &FsPath| std::fs::metadata(path).map_or(0, |info| info.len());
+    let (mut total, mut open) = (0, 0);
+    for proxy in listed(&root.join("proxies")) {
+        let name = proxy
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let Some(id) = name.strip_suffix(".mp4") else {
+            continue;
+        };
+        if name.ends_with(".partial.mp4") {
+            continue;
+        }
+        let bytes = size(&proxy) + size(&media::proxy_source_note(&proxy));
+        total += bytes;
+        if in_use(id) {
+            open += bytes;
+        }
+    }
+    (total, open)
 }
 /// Removes proxies in `proxies/` that no project mentions any more. Runs once at
 /// startup, when the saved projects are the only references (there is no undo
@@ -931,7 +963,7 @@ async fn storage(state: &ServiceState, params: &Value, clean: bool) -> Result<Va
         .previews
         .while_idle(async |cached: Vec<PathBuf>| {
             let mut in_use: HashSet<PathBuf> = cached.into_iter().collect();
-            let (open_project, empty) = {
+            let (open_project, empty, open_media) = {
                 let mut editor = state.editor.lock().await;
                 // Never the open project, and only ones that were never edited.
                 let removed =
@@ -957,9 +989,16 @@ async fn storage(state: &ServiceState, params: &Value, clean: bool) -> Result<Va
                 }
                 let open = editor
                     .dispatch("project.get", json!({"omitWaveforms":true}))
-                    .await?
-                    .to_string();
-                (open, empty)
+                    .await?;
+                let media: HashSet<String> = open["media"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["id"].as_str())
+                    .filter(|id| editor.proxy_path(id).is_some())
+                    .map(str::to_owned)
+                    .collect();
+                (open.to_string(), empty, media)
             };
             let building = state
                 .proxy_in_progress
@@ -1016,8 +1055,13 @@ async fn storage(state: &ServiceState, params: &Value, clean: bool) -> Result<Va
                 } else {
                     "reclaimableBytes"
                 };
+                // After any cleaning: what the limit is compared with, and how much
+                // of it the open project holds (never removed, whatever the limit).
+                let (proxies, open_proxies) = proxy_bytes(&root, |id| open_media.contains(id));
                 json!({"folders":folders,"bytes":total,key:freeable,
-                    "emptyProjects":empty,"proxyLimitBytes":limit})
+                    "emptyProjects":empty,"proxyLimitBytes":limit,
+                    "proxyBytes":proxies,"proxyOpenProjectBytes":open_proxies,
+                    "proxyOverLimit":limit > 0 && proxies > limit})
             })
             .await
             .map_err(|error| error.to_string())
@@ -1375,12 +1419,17 @@ async fn upload(
         )
             .into_response();
     };
+    // `omitWaveforms=true` (or `1`): the reply names the waveforms (`waveformId`)
+    // instead of carrying them, as with the same parameter of an RPC.
+    let slim = query
+        .get("omitWaveforms")
+        .is_some_and(|value| matches!(value.as_str(), "true" | "1"));
     // Do not hold the editor lock while receiving a potentially large upload.
     let original = match state
         .editor
         .lock()
         .await
-        .dispatch("project.get", json!({}))
+        .dispatch("project.get", json!({"omitWaveforms":true}))
         .await
     {
         Ok(project) if project["id"].as_str() == Some(project_id) => project,
@@ -1417,14 +1466,14 @@ async fn upload(
         file.flush().await.map_err(upload_error)?;
         drop(file);
         let mut editor = state.editor.lock().await;
-        let current = editor.dispatch("project.get", json!({})).await.map_err(upload_error)?;
+        let current = editor.dispatch("project.get", json!({"omitWaveforms":true})).await.map_err(upload_error)?;
         if current["id"] != original["id"] || current["revision"] != original["revision"] {
             return Err((StatusCode::CONFLICT,"파일 업로드 중 프로젝트가 변경되어 가져오지 않았습니다. 현재 프로젝트에서 다시 시도해주세요.".into()));
         }
         if name.to_ascii_lowercase().ends_with(".srt") {
-            editor.dispatch("captions.import", json!({"path":path,"expectedRevision":original["revision"]})).await.map_err(upload_error)
+            editor.dispatch("captions.import", json!({"path":path,"expectedRevision":original["revision"],"omitWaveforms":slim})).await.map_err(upload_error)
         } else {
-            editor.dispatch("media.import", json!({"paths":[path],"expectedRevision":original["revision"]})).await.map_err(upload_error)
+            editor.dispatch("media.import", json!({"paths":[path],"expectedRevision":original["revision"],"omitWaveforms":slim})).await.map_err(upload_error)
         }
     }.await;
     match result {
@@ -2938,6 +2987,32 @@ mod tests {
         tend_proxies(&editor, &root, &mut work).await;
         assert!(!stray.exists() && !newer.exists());
         assert!(open.iter().all(|path| path.is_file()) && partial.is_file());
+        // The open project keeps (and gets) its proxies over the limit; the usage
+        // report says so, and how much of the folder is the open project's.
+        let kept = 8000 + note_bytes("media-open") + note_bytes("media-open-old");
+        for (limit, over) in [(1, true), (kept - 1, true), (kept, false), (0, false)] {
+            state.proxy_limit.store(limit, Ordering::Relaxed);
+            let (_, usage) = call(&state, "test", json!({"method":"storage.usage"})).await;
+            let usage = &usage["result"];
+            assert_eq!(usage["proxyOverLimit"], over, "{limit}: {usage}");
+            assert_eq!(
+                usage["proxyBytes"], kept,
+                "the unfinished one is not counted"
+            );
+            assert_eq!(usage["proxyOpenProjectBytes"], kept);
+        }
+        let other = proxy("media-other", 1000, 1);
+        let (_, usage) = call(&state, "test", json!({"method":"storage.usage"})).await;
+        assert_eq!(
+            usage["result"]["proxyBytes"],
+            kept + 1000 + note_bytes("media-other")
+        );
+        assert_eq!(usage["result"]["proxyOpenProjectBytes"], kept);
+        std::fs::remove_file(media::proxy_source_note(&other)).unwrap();
+        std::fs::remove_file(&other).unwrap();
+        state
+            .proxy_limit
+            .store(DEFAULT_PROXY_LIMIT, Ordering::Relaxed);
 
         // Another project is opened: the proxies of the one left may go now.
         call(
@@ -3283,6 +3358,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated["clips"][0]["text"]["content"], "Upload test");
+        std::fs::remove_dir_all(&state.root).unwrap();
+    }
+    /// An upload answers with the project like an RPC does: with `omitWaveforms` the
+    /// media name their waveforms instead of carrying them.
+    #[tokio::test]
+    async fn uploads_leave_the_waveforms_out_when_asked() {
+        let state = upload_fixture();
+        let (_, project) = call(&state, "test", json!({"method":"project.get"})).await;
+        let mut project = project["result"].clone();
+        project["media"] = json!([{"id":"media-tone","name":"tone.wav","path":"/nonexistent/tone.wav","kind":"audio","duration":1.0,"width":0,"height":0,"hasAudio":true,"waveform":[0.5,0.25]}]);
+        let file = state.root.join("exports/with-waveform.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, project.to_string()).unwrap();
+        let (_, opened) = call(
+            &state,
+            "test",
+            json!({"method":"project.open","params":{"path":file}}),
+        )
+        .await;
+        let id = opened["result"]["id"].as_str().unwrap().to_owned();
+        let srt = "1\n00:00:00,000 --> 00:00:01,000\nUpload test\n";
+        let mut replies = vec![];
+        for slim in [None, Some("true"), Some("1"), Some("false")] {
+            let mut query = HashMap::from([
+                ("name".to_owned(), "captions.srt".to_owned()),
+                ("projectId".to_owned(), id.clone()),
+            ]);
+            if let Some(slim) = slim {
+                query.insert("omitWaveforms".into(), slim.into());
+            }
+            let response = upload(
+                State(state.clone()),
+                upload_headers(),
+                Query(query),
+                Body::from(srt),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            replies.push(reply["result"]["media"][0].clone());
+        }
+        for full in [&replies[0], &replies[3]] {
+            assert_eq!(full["waveform"], json!([0.5, 0.25]));
+            assert!(full.get("waveformId").is_none(), "{full}");
+        }
+        for slim in [&replies[1], &replies[2]] {
+            assert!(slim.get("waveform").is_none(), "{slim}");
+            assert_eq!(slim["waveformPeaks"], 2);
+            assert!(slim["waveformId"].is_string());
+        }
         std::fs::remove_dir_all(&state.root).unwrap();
     }
     #[tokio::test]

@@ -71,6 +71,23 @@ it("stays quiet when a frame is cancelled, in the old form (400) and the new one
   errors.mockRestore();
 });
 
+it("takes no picture from a reply marked cancelled, even one that names a frame, and does not keep it", async () => {
+  const replies: unknown[] = [
+    { cancelled: true, reason: "stale", assetId: "half-drawn", revision: 3, projectId: "p" },
+    { assetId: "frame-1", revision: 3, projectId: "p" },
+  ];
+  vi.mocked(rpc).mockImplementation(() => Promise.resolve(replies.shift()));
+  const view = renderHook(({ time }) => usePreviewFrame(project, time, 640, true), { initialProps: { time: 1 } });
+  await act(() => vi.advanceTimersByTimeAsync(150));
+  expect(view.result.current).toBeNull();
+  // Away and back to the same frame: it was not cached, so it is asked for again.
+  view.rerender({ time: 2 });
+  view.rerender({ time: 1 });
+  await act(() => vi.advanceTimersByTimeAsync(150));
+  expect(view.result.current).toMatchObject({ url: "asset:frame-1" });
+  expect(vi.mocked(rpc).mock.calls.filter(([method]) => method === "preview.frame")).toHaveLength(2);
+});
+
 it("ignores a service that has no preview.cancel", async () => {
   const unhandled = vi.fn();
   window.addEventListener("unhandledrejection", unhandled);

@@ -15,6 +15,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { rpc } from "./api";
 import { BACKGROUND_TICK_MS, playbackClock } from "./playbackClock";
+import { playbackCalibration, playbackDiagnostics, resetPlaybackCalibration } from "./mediaPlayback";
 import type { Project } from "./types";
 
 type Json = Record<string, unknown>;
@@ -508,6 +509,329 @@ function visual(): Json {
   };
 }
 
+const round3 = (value: number) => Math.round(value * 1000) / 1000;
+/** How long the playing timeline is compared with its media elements, and how often. */
+const SYNC_SAMPLE_MS = 250;
+const SYNC_SAMPLES = 12;
+/**
+ * The timeline is started this often. Before the first the transport is made to forget
+ * the engine's start delay, as on the very first start after installing: that one is
+ * reported as `cold` and not judged, the others must stay within the tolerance.
+ */
+const SYNC_STARTS = 4;
+/**
+ * Readings before this are the start itself, not steady playback: WKWebView reports a
+ * position that runs on for about 0.4 s and then stands still until the sound has caught
+ * up (about 0.7 s after the start), so an earlier reading says nothing about the sound.
+ * Every reading is listed under `samples` all the same.
+ */
+const SYNC_SETTLED_MS = 750;
+/** The clock may wait this long in a second of playing for the sound to start. */
+const CLOCK_WAIT_LIMIT_MS = 600;
+/** How long the start is traced finely. */
+const SYNC_TRACE_MS = 1600;
+/** Sound this far from the picture is noticed. */
+const SYNC_TOLERANCE = 0.08;
+const MEDIA_EVENTS = ["play", "playing", "pause", "waiting", "stalled", "seeking", "seeked", "canplay", "ratechange", "ended"];
+
+/**
+ * How the engine itself starts, resumes, seeks and re-times one element, outside the
+ * player's transport: these delays are what the transport has to absorb.
+ */
+async function engineLatency(source: HTMLMediaElement): Promise<Json> {
+  // A copy the player does not drive: its transport pauses whatever it did not start.
+  const media = document.createElement(source.tagName.toLowerCase() === "video" ? "video" : "audio");
+  media.preload = "auto";
+  media.src = source.currentSrc || source.src;
+  const loaded = await until(() => media.readyState >= 3, 5000, 20);
+  if (!loaded) return { ok: false, reason: "미디어 사본을 불러오지 못했습니다", readyState: media.readyState };
+  /**
+   * What one operation costs: over the 1.5 s after it, how much less the position moved
+   * than the wall clock (at the rate then in force), when it first moved, and the longest
+   * time it stood still while playing.
+   */
+  const cost = async (operate: () => number | void | Promise<number | void>, rate = 1) => {
+    const before = media.currentTime;
+    const began = performance.now();
+    let refused: string | null = null;
+    let from = before;
+    try {
+      // A seek reports where it went: the loss is counted from there.
+      const moved = await operate();
+      if (typeof moved === "number") from = moved;
+    } catch (error) {
+      refused = message(error);
+    }
+    const settledMs = Math.round(performance.now() - began);
+    let firstProgressMs: number | null = null;
+    let last = media.currentTime;
+    let lastMoved = performance.now();
+    let freeze = { atMs: 0, forMs: 0 };
+    while (performance.now() - began < 1500) {
+      await sleep(4);
+      const now = performance.now();
+      const at = media.currentTime;
+      if (at !== last) {
+        if (firstProgressMs === null && at - from > 0.001) firstProgressMs = Math.round(now - began);
+        // Only a stop after it had begun to move: the wait for the first movement is reported above.
+        if (firstProgressMs !== null && now - lastMoved > freeze.forMs)
+          freeze = { atMs: Math.round(lastMoved - began), forMs: Math.round(now - lastMoved) };
+        last = at;
+        lastMoved = now;
+      }
+    }
+    const wall = (performance.now() - began) / 1000;
+    return {
+      settledMs,
+      firstProgressMs,
+      longestFreeze: freeze.forMs >= 40 ? freeze : null,
+      lostSeconds: round3(wall * rate - (media.currentTime - from)),
+      refused,
+    };
+  };
+  try {
+    media.volume = 0;
+    const start = await cost(() => media.play());
+    media.pause();
+    await sleep(200);
+    const resume = await cost(() => media.play());
+    const seek = await cost(() => {
+      const target = media.currentTime + 1;
+      const seeked = new Promise<void>((resolve) => {
+        media.addEventListener("seeked", () => resolve(), { once: true });
+        setTimeout(resolve, 1400);
+      });
+      media.currentTime = target;
+      return seeked.then(() => target);
+    });
+    const faster = await cost(() => { media.playbackRate = 1.05; }, 1.05);
+    const steadyFaster = await cost(() => {}, 1.05);
+    const normal = await cost(() => { media.playbackRate = 1; });
+    const steady = await cost(() => {});
+    return {
+      ok: true,
+      tag: media.tagName.toLowerCase(),
+      preservesPitch: (media as { preservesPitch?: boolean }).preservesPitch ?? null,
+      start,
+      resume,
+      seekWhilePlaying: seek,
+      rateTo105: faster,
+      steadyAt105: steadyFaster,
+      rateTo100: normal,
+      steady,
+    };
+  } catch (error) {
+    return { ok: false, error: message(error) };
+  } finally {
+    media.pause();
+    media.removeAttribute("src");
+    media.load();
+  }
+}
+
+/**
+ * The playing timeline against each media element, every quarter second for three
+ * seconds: where the clock is, where each element is, and how far apart.
+ */
+async function playbackSync(): Promise<Json> {
+  const button = document.querySelector<HTMLButtonElement>(".play-button");
+  if (!button || button.disabled) return { ok: false, reason: "재생 버튼을 쓸 수 없습니다" };
+  const project = await rpc<Project>("project.get", { omitWaveforms: true });
+  const clipOf = (media: HTMLMediaElement) =>
+    project.clips.find((candidate) => candidate.id === media.dataset.clipId);
+  const all = () => Array.from(document.querySelectorAll<HTMLMediaElement>("video, audio"));
+  playbackClock.seek(0);
+  await sleep(300);
+  const first = all().find((media) => {
+    const clip = clipOf(media);
+    return !!clip && clip.start <= 0 && clip.start + clip.duration > 0;
+  });
+  const engine = first ? await engineLatency(first) : { ok: false, reason: "시작 위치에 미디어가 없습니다" };
+  playbackClock.seek(0);
+  await sleep(500);
+  // What the transport had already learned about this engine from earlier starts.
+  const calibrationBefore = playbackCalibration();
+  resetPlaybackCalibration();
+  const starts: Json[] = [];
+  for (let index = 0; index < SYNC_STARTS; index++) {
+    starts.push({ cold: index === 0, ...(await syncedStart(button, clipOf, all)) });
+    await sleep(300);
+    playbackClock.seek(0);
+    await sleep(500);
+  }
+  // Without animation frames the clock moves on a slow timer and its reading lags by up to a tick.
+  const slow = starts.some((start) => start.clockOnSlowTimer === true);
+  const judged = starts.filter((start) => start.cold !== true);
+  const worst = Math.max(...judged.map((start) => (start.all as { maxAbs: number } | null)?.maxAbs ?? 0));
+  const measured = judged.some((start) => start.all !== null);
+  const stillPlaying = starts.every((start) => start.stillPlaying === true);
+  return {
+    ok: slow || !measured || !stillPlaying || worst <= SYNC_TOLERANCE,
+    tolerance: SYNC_TOLERANCE,
+    settledAfterMs: SYNC_SETTLED_MS,
+    clockOnSlowTimer: slow,
+    // The latest start stands for the step; every start is listed under `starts`.
+    ...starts[starts.length - 1],
+    all: measured ? { maxAbs: worst } : null,
+    cold: starts[0].all,
+    starts,
+    engine,
+    calibration: { before: calibrationBefore, after: playbackCalibration() },
+    playbackError: document.querySelector(".preview-playback-error")?.textContent ?? null,
+  };
+}
+
+/** One start of the timeline from its beginning, watched for three seconds. */
+async function syncedStart(
+  button: HTMLButtonElement,
+  clipOf: (media: HTMLMediaElement) => Project["clips"][number] | undefined,
+  all: () => HTMLMediaElement[],
+): Promise<Json> {
+  playbackDiagnostics(true);
+  const calibration = playbackCalibration();
+  let origin = performance.now();
+  const since = () => Math.round(performance.now() - origin);
+  const events: Json[] = [];
+  const note = (media: HTMLMediaElement, type: string) => {
+    if (events.length >= 200) return;
+    events.push({
+      atMs: since(),
+      type,
+      clipId: media.dataset.clipId ?? null,
+      currentTime: round3(media.currentTime),
+      clock: round3(playbackClock.get()),
+      readyState: media.readyState,
+      rate: media.playbackRate,
+    });
+  };
+  const watched = new Map<HTMLMediaElement, { from: number; firstProgressMs: number | null }>();
+  /** Every 20 ms of the start: [ms, clock, each watched element's position]. */
+  const trace: number[][] = [];
+  const listener = (event: Event) => note(event.target as HTMLMediaElement, event.type);
+  const watch = () => {
+    for (const media of all()) {
+      if (watched.has(media)) continue;
+      watched.set(media, { from: -1, firstProgressMs: null });
+      for (const name of MEDIA_EVENTS) media.addEventListener(name, listener);
+    }
+  };
+  // `play()` itself: when it was called and when its promise settled.
+  const proto = HTMLMediaElement.prototype;
+  const nativePlay = proto.play;
+  proto.play = function (this: HTMLMediaElement) {
+    note(this, "play()");
+    const promise = nativePlay.call(this);
+    void Promise.resolve(promise).then(
+      () => note(this, "play() resolved"),
+      (error: unknown) => note(this, `play() rejected: ${(error as { name?: string } | null)?.name ?? "?"}`),
+    );
+    return promise;
+  };
+  let clockFirstMovedMs: number | null = null;
+  let frames = 0;
+  const clockBefore = playbackClock.get();
+  const poll = setInterval(() => {
+    watch();
+    if (clockFirstMovedMs === null && playbackClock.get() !== clockBefore) clockFirstMovedMs = since();
+    for (const [media, state] of watched) {
+      if (state.firstProgressMs !== null || media.paused || media.seeking) continue;
+      // From where it stood once it was playing and any seek was over.
+      if (state.from < 0) state.from = media.currentTime;
+      else if (media.currentTime - state.from > 0.001) state.firstProgressMs = since();
+    }
+    const at = since();
+    if (at <= SYNC_TRACE_MS && (!trace.length || at - trace[trace.length - 1][0] >= 20))
+      trace.push([at, round3(playbackClock.get()), ...Array.from(watched.keys(), (media) => round3(media.currentTime))]);
+  }, 4);
+  let counting = true;
+  const frame = () => {
+    frames++;
+    if (counting) requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+  const samples: Json[] = [];
+  try {
+    watch();
+    origin = performance.now();
+    button.click();
+    for (let index = 1; index <= SYNC_SAMPLES; index++) {
+      await sleep(Math.max(0, index * SYNC_SAMPLE_MS - since()));
+      const clock = playbackClock.get();
+      samples.push({
+        atMs: since(),
+        clock: round3(clock),
+        playing: /일시정지/.test(button.title),
+        media: all().flatMap((media) => {
+          const clip = clipOf(media);
+          if (!clip || clock < clip.start || clock >= clip.start + clip.duration) return [];
+          const local = clock - clip.start;
+          const expected = clip.sourceIn + (clip.reverse ? clip.duration - local : local) * clip.speed;
+          return [{
+            clipId: clip.id,
+            kind: clip.kind,
+            tag: media.tagName.toLowerCase(),
+            currentTime: round3(media.currentTime),
+            expected: round3(expected),
+            // Timeline seconds the element is behind (positive) or ahead of (negative) the clock.
+            behindClock: round3((expected - media.currentTime) / (clip.speed || 1)),
+            rate: round3(media.playbackRate),
+            clipSpeed: clip.speed,
+            paused: media.paused,
+            seeking: media.seeking,
+            readyState: media.readyState,
+          }];
+        }),
+      });
+    }
+  } finally {
+    clearInterval(poll);
+    counting = false;
+    proto.play = nativePlay;
+    for (const media of watched.keys())
+      for (const name of MEDIA_EVENTS) media.removeEventListener(name, listener);
+    if (/일시정지|취소/.test(button.title)) button.click();
+  }
+  const settled = samples.filter((sample) => (sample.atMs as number) >= SYNC_SETTLED_MS);
+  const offsets = (kind: (item: Json) => boolean) =>
+    settled.flatMap((sample) =>
+      (sample.media as Json[]).filter((item) => !item.paused && kind(item)).map((item) => item.behindClock as number));
+  const span = (values: number[]) =>
+    values.length
+      ? {
+          count: values.length,
+          min: Math.min(...values),
+          max: Math.max(...values),
+          maxAbs: Math.max(...values.map(Math.abs)),
+          mean: round3(values.reduce((sum, value) => sum + value, 0) / values.length),
+        }
+      : null;
+  const audio = span(offsets((item) => item.tag === "audio"));
+  const video = span(offsets((item) => item.tag === "video"));
+  const everything = span(offsets(() => true));
+  const last = samples[samples.length - 1];
+  return {
+    clockOnSlowTimer: document.visibilityState !== "visible" || frames < 30,
+    stillPlaying: !!last && last.playing === true,
+    calibrationBefore: calibration,
+    animationFrames: frames,
+    clockFirstMovedMs,
+    firstProgress: Array.from(watched, ([media, state]) => ({
+      clipId: media.dataset.clipId ?? null,
+      tag: media.tagName.toLowerCase(),
+      firstProgressMs: state.firstProgressMs,
+    })),
+    audio,
+    video,
+    all: everything,
+    samples,
+    trace,
+    events,
+    // What the transport decided, at `performance.now()` milliseconds; the click was at `clickedAtMs`.
+    clickedAtMs: Math.round(origin),
+    transport: playbackDiagnostics(false),
+  };
+}
+
 /** One state per media element the fast preview is driving. */
 function mediaElements(): Record<string, unknown>[] {
   return Array.from(document.querySelectorAll<HTMLMediaElement>("video, audio")).map((media) => ({
@@ -756,6 +1080,12 @@ function problems(report: Json): string[] {
       found.push(`${name}: 문서가 창보다 큽니다`);
   }
   if (get("playback.ok") !== true) found.push(`재생: ${get("playback.note") ?? get("playback.reason")}`);
+  if (get("playbackSync.ok") === false)
+    found.push(
+      get("playbackSync.reason")
+        ? `재생 동기: ${get("playbackSync.reason")}`
+        : `재생 동기: 미디어가 재생 시계와 최대 ${get("playbackSync.all.maxAbs")}초 어긋났습니다`,
+    );
   if (get("preciseFrame.ok") !== true) found.push("정밀 프레임 이미지를 불러오지 못했습니다");
   for (const name of ["homeScreen.images", "workspaceImages", "stickers"])
     if (count(`${name}.broken`)) found.push(`${name}: 깨진 이미지 ${count(`${name}.broken`)}개`);
@@ -960,7 +1290,20 @@ export async function runSelfTest() {
       if (counting) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
+    playbackDiagnostics(true);
     const began = performance.now();
+    // The clock waits for the sound to start: that time is not played, and is bounded.
+    let waitedMs = 0;
+    let seen = before;
+    let seenAt = began;
+    const watchClock = setInterval(() => {
+      const now = performance.now();
+      const clock = playbackClock.get();
+      if (clock === seen) return;
+      if (now - seenAt >= 40) waitedMs += now - seenAt;
+      seen = clock;
+      seenAt = now;
+    }, 4);
     button.click();
     await sleep(700);
     // The elements the fast preview drives, while they play, and where each should be.
@@ -970,19 +1313,24 @@ export async function runSelfTest() {
     const after = playbackClock.get();
     const mediaAtEnd = mediaElements();
     const elapsed = performance.now() - began;
+    clearInterval(watchClock);
+    if (elapsed + began - seenAt >= 40) waitedMs += elapsed + began - seenAt;
     counting = false;
     const title = button.title;
     // Whatever state it reached, leave the player stopped.
     if (/일시정지|취소/.test(button.title)) button.click();
     await sleep(300);
     const mediaAfterStop = mediaElements();
+    const transport = playbackDiagnostics(false);
     playbackClock.seek(0);
     const advanced = after - before;
     // A second of playing may lose a little to the first buffered frame, not more. Without
     // animation frames (a hidden or covered window) the clock moves on a slow timer, so the
     // reading lags by up to a tick.
     const slow = document.visibilityState !== "visible" || frames < 5;
-    const kept = advanced >= (slow ? elapsed / 1000 - 2 * (BACKGROUND_TICK_MS / 1000) : 0.9 * (elapsed / 1000) - 0.01);
+    const kept = slow
+      ? advanced >= elapsed / 1000 - 2 * (BACKGROUND_TICK_MS / 1000)
+      : waitedMs <= CLOCK_WAIT_LIMIT_MS && advanced >= 0.9 * ((elapsed - waitedMs) / 1000) - 0.01;
     try {
       const project = await rpc<Project>("project.get", { omitWaveforms: true });
       for (const [items, clock] of [[media, clockAtSample], [mediaAtEnd, after]] as const)
@@ -1010,6 +1358,9 @@ export async function runSelfTest() {
       visibilityState: document.visibilityState,
       clockOnSlowTimer: slow,
       clockAtMediaSample: Math.round(clockAtSample * 1000) / 1000,
+      clockWaitedMs: Math.round(waitedMs),
+      clickedAtMs: Math.round(began),
+      transport,
       buttonTitleWhilePlaying: title,
       playbackError: document.querySelector(".preview-playback-error")?.textContent ?? null,
       media,
@@ -1021,12 +1372,13 @@ export async function runSelfTest() {
       note: kept
         ? "재생 시계가 진행했습니다"
         : advanced > 0
-          ? `재생 시계가 ${Math.round(elapsed)}ms 동안 ${Math.round(advanced * 1000)}ms 만 진행했습니다`
+          ? `재생 시계가 ${Math.round(elapsed)}ms 동안 ${Math.round(advanced * 1000)}ms 만 진행했습니다(소리를 기다린 시간 ${Math.round(waitedMs)}ms)`
           : frames < 5
             ? "애니메이션 프레임이 멈춘 환경에서 재생 시계가 진행하지 않았습니다"
             : "애니메이션 프레임은 돌았지만 재생 시계가 진행하지 않았습니다",
     };
   });
+  await step("playbackSync", playbackSync);
   await step("preciseFrame", async () => {
     const began = performance.now();
     const img = await until(() => {

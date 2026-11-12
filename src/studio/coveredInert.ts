@@ -1,4 +1,4 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 const CONTROLS = 'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])';
 
@@ -56,11 +56,19 @@ export function useCoveredInert(
    * mounted again with the drawer still open): the new one is covered then.
    */
   mounted: unknown = null,
+  /**
+   * Changes whenever controls may have moved with no element added or removed and
+   * nothing scrolled or resized: the project revision, since an edit moves a clip
+   * by its style alone. Measured again in the same commit.
+   */
+  moved: unknown = null,
 ) {
+  const measure = useRef<(() => void) | null>(null);
   useEffect(() => {
     const root = surface.current, over = active ? cover() : null;
     if (!root || !over) return;
     const { update, release } = coverControls(root, over);
+    measure.current = update;
     let frame = 0;
     const schedule = () => {
       frame ||= requestAnimationFrame(() => {
@@ -74,6 +82,7 @@ export function useCoveredInert(
     window.addEventListener("resize", schedule);
     root.addEventListener("scroll", schedule, true);
     return () => {
+      measure.current = null;
       cancelAnimationFrame(frame);
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
@@ -81,4 +90,5 @@ export function useCoveredInert(
       release();
     };
   }, [active, mounted]);
+  useEffect(() => measure.current?.(), [moved]);
 }

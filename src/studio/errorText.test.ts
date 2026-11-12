@@ -49,6 +49,26 @@ describe("errorText", () => {
     expect(errorText(new Error("잠긴 트랙입니다."))).toEqual({ message: "잠긴 트랙입니다." });
   });
 
+  it("drops the code of a request refused for another project, in both wordings the service uses", () => {
+    // The two sentences of `service.rs` for PROJECT_CHANGED, as the UI and an agent get them.
+    const ui = "다른 프로젝트가 열려 있어 요청을 처리하지 않았습니다. (PROJECT_CHANGED)";
+    expect(errorText(new Error(ui))).toEqual({
+      message: "다른 프로젝트가 열려 있어 요청을 처리하지 않았습니다.",
+      detail: ui,
+    });
+    const agent =
+      "이 작업을 시작한 프로젝트가 더 이상 열려 있지 않아 요청을 처리하지 않았습니다. 새 작업을 시작해주세요. (PROJECT_CHANGED)";
+    expect(errorText(agent)).toEqual({
+      message: "이 작업을 시작한 프로젝트가 더 이상 열려 있지 않아 요청을 처리하지 않았습니다. 새 작업을 시작해주세요.",
+      detail: agent,
+    });
+    // Only a code at the very end is one: the same word inside a sentence stays.
+    expect(errorText("PROJECT_CHANGED 응답을 받았습니다.").message).toBe("PROJECT_CHANGED 응답을 받았습니다.");
+    // A code with details after it (a revision pair) is not rewritten.
+    const conflict = "프로젝트가 변경되었습니다. (REVISION_CONFLICT: 1 != 2)";
+    expect(errorText(conflict)).toEqual({ message: conflict });
+  });
+
   it("explains an unreachable service and an empty error", () => {
     expect(errorText(new TypeError("Failed to fetch")).message).toBe(
       "편집 서비스에 연결할 수 없습니다. 잠시 뒤 다시 시도해 주세요.",

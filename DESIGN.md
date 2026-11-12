@@ -21,6 +21,51 @@ colors:
   image-track: "#345764"
   audio-track: "#294736"
   text-track: "#71572f"
+  disabled: "#6b7380"
+  accent-soft: "#263b3a"
+  marker: "#e0a84a"
+  danger-text: "#ffccd2"
+  danger-bg: "#442b31"
+  danger-border: "#82505c"
+  warning-ink: "#d8c8a9"
+  success-ink: "#b2e8d7"
+  scrim: "#111214b3"
+  mark-bg: "#293935"
+  mark-border: "#4b5c5a"
+  mark-ink: "#a8f4d9"
+  accent-border: "#3c7773"
+  accent-border-hover: "#5c8c89"
+  notice-bg: "#293c37"
+  notice-border: "#4a6b5e"
+  notice-ink: "#d1f1e0"
+  backdrop: "#090d12bf"
+  video-clip-border: "#62898a"
+  video-clip-ink: "#dceff2"
+  video-clip-label: "#223f47e6"
+  image-clip-border: "#6e9aab"
+  audio-clip-border: "#5f9874"
+  audio-clip-ink: "#c4ecd5"
+  audio-clip-label: "#244031e6"
+  audio-waveform: "#98cfa8"
+  text-clip-border: "#a1895a"
+  text-clip-ink: "#fae7bf"
+  state-idle: "#a08e6c"
+  state-online: "#6acfab"
+  online-bg: "#294b42"
+  online-border: "#4b7765"
+  online-ink: "#b3e6d1"
+  done-ink: "#a2d8bd"
+  job-ink: "#cce9e1"
+  chip-bg: "#344b4b"
+  chip-ink: "#b9d9d6"
+  provider-dot: "#dcad85"
+  stop-bg: "#6a4b31"
+  stop-ink: "#f2d7b6"
+  run-ink: "#a4d9d1"
+  subtle-bg: "#2a3d40"
+  subtle-ink: "#b7d7d3"
+  note-icon: "#d4b97f"
+  search-action: "#a6dbd4"
 typography:
   title:
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif'
@@ -203,11 +248,11 @@ Work panels use tonal layering and fine borders. Floating menus, notifications a
 
 ### Shadow Vocabulary
 
-- **Menu:** `0 9px 28px #0007` for the application menu.
-- **Notification:** `0 8px 24px #0005` for transient notices.
-- **Dialog:** `0 20px 65px #0008` for settings, export and recent projects.
+- **Menu** (`overlay-shadow`): `0 9px 28px #0007` for the application menu.
+- **Notification** (`notice-shadow`): `0 8px 24px #0005` for transient notices.
+- **Dialog** (`dialog-shadow`): `0 20px 65px #0008` for settings, export and recent projects.
 - **Assistant overlay:** `-10px 0 30px #0006` in the overlay breakpoint.
-- **Composition:** `0 4px 16px #0003` around the preview canvas.
+- **Composition** (`composition-shadow`): `0 4px 16px #0003` around the preview canvas.
 
 ### Named Rules
 

@@ -1,9 +1,9 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tools": [
     {
       "name": "studio_project",
-      "description": "Read the open video project, its media/tracks/clips/concept, list saved projects, save the current project, or inspect undo history. project.get {ifProjectId?,ifRevision?} returns {unchanged:true,id,revision} when both still match. Media items carry waveformPeaks (the number of audio peaks; 0 means the audio could not be read, absent means not computed yet) instead of the waveform itself. project.save {} saves the project where it already lives; it takes no path. project.notice {} returns a startup notice such as a recovered project. Projects cannot be created, opened, switched or deleted from here. All times are seconds. Read project.get before editing.",
+      "description": "Read the open video project, its media/tracks/clips/concept, list saved projects, save the current project, or inspect undo history. project.get {ifProjectId?,ifRevision?} returns {unchanged:true,id,revision} when both still match. Media items carry waveformPeaks (the number of audio peaks; 0 means the audio could not be read, absent means not computed yet) and waveformId (a name for the content of those peaks: it changes when the file's audio changed, for example after media.reprobe of a replaced file) instead of the waveform itself; both are absent until the waveform has been computed, and the peaks themselves cannot be read from here. project.save {} saves the project where it already lives; it takes no path. project.notice {} returns a startup notice such as a recovered project. Projects cannot be created, opened, switched or deleted from here. All times are seconds. Read project.get before editing.",
       "methods": [
         "project.get",
         "project.list",
@@ -78,7 +78,7 @@
     },
     {
       "name": "studio_assets",
-      "description": "Manage reusable local fonts and filter/effect presets. assets.list {}; fonts.import {path,name?} accepts TTF/OTF; fonts.apply {id,clipId,expectedRevision}; presets.save {clipId,name,kind:filter|effect}; presets.import/export {path,id?} uses Studio JSON (export writes only a new file in the allowed output folders); presets.apply {id,clipId,expectedRevision}. fonts.remove/presets.remove {id} remove catalog entries. Applying uses the same validated undoable editor commands. Never describe arbitrary executable plugins as supported.",
+      "description": "Manage reusable local fonts and filter/effect presets. assets.list {}; fonts.import {path,name?} accepts TTF/OTF; fonts.apply {id,clipId,expectedRevision}; presets.save {clipId,name,kind:filter|effect} (an effect preset of a video clip also holds its sound fade audioFadeIn/audioFadeOut, or that the sound follows the picture fade; applied to an image or text clip that part is skipped); presets.import/export {path,id?} uses Studio JSON (export writes only a new file in the allowed output folders); presets.apply {id,clipId,expectedRevision}. fonts.remove/presets.remove {id} remove catalog entries. Applying uses the same validated undoable editor commands. Never describe arbitrary executable plugins as supported.",
       "methods": [
         "assets.list",
         "fonts.import",

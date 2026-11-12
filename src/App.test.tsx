@@ -916,6 +916,45 @@ describe("Studio application", () => {
       await waitFor(() => expect(screen.getByRole("button", { name: "풍경.jpg, 2.0초, 5.0초" })).toHaveAttribute("aria-pressed", "true"));
     });
 
+    it("copies right after a split the half the split selects, and pastes that", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      // Split, copy and paste before the split has answered: on screen the clip is still whole.
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      fireEvent.keyDown(document.body, { key: "c", metaKey: true });
+      fireEvent.keyDown(document.body, { key: "v", metaKey: true });
+      expect(editor.sent.map(({ method }) => method)).toEqual(["edit.batch"]);
+      await editor.answer();
+      await editor.answer();
+      await editor.quiet();
+      expect(editor.sent.map(({ method, params }) => [method, params.expectedRevision])).toEqual([["edit.batch", 1], ["edit.paste", 2]]);
+      // What a copy made after the answer would hold: the new half, 2 s to 5 s.
+      expect((editor.sent[1].params.clips as Project["clips"]).map(({ id, start, duration }) => [id, start, duration]))
+        .toEqual([["clip-1-tail", 2, 3]]);
+      expect(editor.sent[1].params.at).toBe(2);
+      expect(editor.refused).toEqual([]);
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(await screen.findByText(/클립 1개를 복사했습니다/)).toBeInTheDocument();
+    });
+
+    it("cuts right after a split the half the split selects", async () => {
+      const editor = await open(initial);
+      twoSecondsIn();
+      fireEvent.keyDown(document.body, { key: "b", metaKey: true });
+      fireEvent.keyDown(document.body, { key: "x", metaKey: true });
+      await editor.answer();
+      await editor.answer();
+      await editor.quiet();
+      expect(editor.sent[1]).toEqual({ method: "edit.delete", params: { ids: ["clip-1-tail"], expectedRevision: 2 } });
+      expect(editor.refused).toEqual([]);
+      expect(editor.project().clips.map(({ id, duration }) => [id, duration])).toEqual([["clip-1", 2]]);
+      // The cut half can be pasted back.
+      fireEvent.keyDown(document.body, { key: "v", metaKey: true });
+      await editor.answer();
+      await editor.quiet();
+      expect((editor.sent[2].params.clips as Project["clips"]).map(({ id, duration }) => [id, duration])).toEqual([["clip-1-tail", 3]]);
+    });
+
     it("quietly drops a split, a duplicate and a second delete of a clip whose delete is on its way", async () => {
       const editor = await open(initial);
       twoSecondsIn();

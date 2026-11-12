@@ -33,6 +33,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # Keep the compiled dependencies when a test fails, so the next push to the
+          # same pull request does not rebuild them from nothing.
+          cache-on-failure: true
       # The renderer and the integration tests run the real ffmpeg/ffprobe.
       - name: Install FFmpeg
         run: |

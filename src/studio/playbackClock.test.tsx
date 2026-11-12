@@ -1,6 +1,6 @@
 import { act, render, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BACKGROUND_TICK_MS, playbackClock, runPlayback, useClockTime, useClockValue, useIdleClockTime } from "./playbackClock";
+import { BACKGROUND_TICK_MS, playbackClock, runPlayback, skipPlaybackAhead, useClockTime, useClockValue, useIdleClockTime } from "./playbackClock";
 
 beforeEach(() => playbackClock.seek(0));
 
@@ -209,6 +209,23 @@ describe("playback run", () => {
     expect(playbackClock.get()).toBeGreaterThan(7.4);
     expect(playbackClock.get()).toBeLessThanOrEqual(7.5);
     stop();
+  });
+
+  it("moves ahead to sound that is ahead of it without a seek, only while it runs", () => {
+    expect(skipPlaybackAhead(0.2)).toBe(false);
+    const { stop } = run();
+    vi.advanceTimersByTime(1000);
+    const epoch = playbackClock.epoch();
+    expect(skipPlaybackAhead(0.2)).toBe(true);
+    expect(skipPlaybackAhead(0)).toBe(false);
+    expect(skipPlaybackAhead(Number.NaN)).toBe(false);
+    vi.advanceTimersByTime(500);
+    expect(playbackClock.get()).toBeGreaterThan(1.65);
+    expect(playbackClock.get()).toBeLessThanOrEqual(1.7);
+    // Not a seek: no media element starts again.
+    expect(playbackClock.epoch()).toBe(epoch);
+    stop();
+    expect(skipPlaybackAhead(0.2)).toBe(false);
   });
 
   it("stops for good when told to", () => {

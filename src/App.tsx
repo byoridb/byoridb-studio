@@ -142,6 +142,15 @@ const PANEL_LIMITS = { library: [220, 560], inspector: [240, 520] } as const;
 const DRAWER_WIDTH = 320 + 6;
 /** The player keeps at least this width while the assistant drawer is open. */
 const PLAYER_ROOM = 420;
+/**
+ * The least height of the row above the timeline (library, player, inspector) and of
+ * the timeline, with the 8px separator between them. With the top bar (54), the
+ * workspace's bottom padding (6) and the status bar (23) the editor needs
+ * 54 + 220 + 8 + 200 + 6 + 23 = 511px of page: `.studio-app` in studio.css says the same.
+ */
+const UPPER_MIN_HEIGHT = 220;
+const TIMELINE_MIN_HEIGHT = 200;
+const TIMELINE_SEPARATOR = 8;
 /** Two separators and the narrowest player. */
 const PLAYER_RESERVE = 6 + 250 + 6;
 
@@ -271,7 +280,14 @@ export default function App() {
   const [notice, setNotice] = useState("");
   // Selection belongs to one project and is validated while rendering, so a
   // project change can never race a selection made in the same tick.
-  const [selection, setSelection] = useState<Selection>(noSelection);
+  const [selection, showSelection] = useState<Selection>(noSelection);
+  // The selection as it was last set, readable before the render that shows it:
+  // a copy made right after an edit takes what that edit selected.
+  const selectionNow = useRef(selection);
+  const setSelection = useCallback((update: (previous: Selection) => Selection) => {
+    selectionNow.current = update(selectionNow.current);
+    showSelection(selectionNow.current);
+  }, []);
   const selectedIds = useMemo(() => {
     if (!project || selection.projectId !== project.id) return noIds;
     const valid = selection.ids.filter((id) =>
@@ -375,14 +391,16 @@ export default function App() {
     assistant && drawer.overlay,
     // The surface is another element after a visit to the home screen.
     `${!!project}:${home}`,
+    // An edit moves clips (and their handles) without adding or removing one.
+    project ? `${project.id}:${project.revision}` : "",
   );
   // The project comes without waveforms; the timeline's are fetched once per media item.
   const waveforms = useWaveforms(project);
-  const maxTimelineHeight = Math.max(200, surfaceHeight - 248);
+  const maxTimelineHeight = Math.max(TIMELINE_MIN_HEIGHT, surfaceHeight - UPPER_MIN_HEIGHT - TIMELINE_SEPARATOR);
   // The stored height is kept as chosen and only clamped to what fits right now.
-  const timelineHeight = Math.max(200, Math.min(maxTimelineHeight, layout.timeline));
+  const timelineHeight = Math.max(TIMELINE_MIN_HEIGHT, Math.min(maxTimelineHeight, layout.timeline));
   const resizeTimeline = (height: number) =>
-    setLayout((value) => ({ ...value, timeline: Math.round(Math.max(200, Math.min(maxTimelineHeight, height))) }));
+    setLayout((value) => ({ ...value, timeline: Math.round(Math.max(TIMELINE_MIN_HEIGHT, Math.min(maxTimelineHeight, height))) }));
   useEffect(() => {
     const surface = editingSurface.current;
     if (!surface) return;
@@ -538,7 +556,7 @@ export default function App() {
    * Runs one service command. `quiet` is for the library and the inspector, which
    * show a failure in place: the same failure is not also raised as a toast.
    */
-  const execute = useCallback(async (
+  const run = useCallback(async (
     method: string,
     /** The parameters, or for an edit a function that makes them from the project as it is when the edit is sent. */
     given: Record<string, unknown> | CommandBuilder = {},
@@ -647,6 +665,22 @@ export default function App() {
       setPending((count) => count - 1);
     }
   }, []);
+  /** Edits that have not finished: sent or waiting their turn, answer and history not yet taken. */
+  const unsettledEdits = useRef(new Set<Promise<unknown>>());
+  const execute = useCallback((
+    method: string,
+    given: Record<string, unknown> | CommandBuilder = {},
+    quiet = false,
+  ) => {
+    const answer = run(method, given, quiet);
+    if (isEdit(method)) {
+      const pending = unsettledEdits.current;
+      const done = () => { pending.delete(answer); };
+      pending.add(answer);
+      answer.then(done, done);
+    }
+    return answer;
+  }, [run]);
   const command: EditCommand = useCallback((method, params) => execute(method, params), [execute]);
   const panelCommand: EditCommand = useCallback((method, params) => execute(method, params, true), [execute]);
   const safeCommand: EditCommand = useCallback(
@@ -836,41 +870,65 @@ export default function App() {
   // so a key pressed right after a state change never sees stale values.
   const live = useRef({ selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save, history, pending });
   live.current = { selectedIds, total, playing, preparing, settings, exportOpen, recent, home, requestPlayback, save, history, pending };
+  /** A copy waiting for the edits made before it; a paste made meanwhile follows it. */
+  const copying = useRef<Promise<void> | null>(null);
   const copySelection = useCallback(
     (cut: boolean) => {
       const active = current.current;
-      const ids = live.current.selectedIds;
-      if (!active || !ids.length) return;
-      if (cut && !canEditSelection(active, ids)) return;
-      const clips = structuredClone(selectedClips(active, ids));
-      clipboard.current = { projectId: active.id, clips };
-      setClipboardProject(active.id);
-      if (!cut) setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
-      else
-        void safeCommand("edit.delete", (latest) => {
-          const remaining = present(latest, ids);
-          return canEditSelection(latest, remaining) ? { ids: remaining } : null;
-        }).then((result) => {
-          if (result) selectMany([], null);
+      if (!active || !live.current.selectedIds.length) return;
+      const take = () => {
+        const latest = current.current;
+        const chosen = selectionNow.current;
+        if (!latest || latest.id !== active.id || chosen.projectId !== latest.id) return;
+        const ids = present(latest, chosen.ids);
+        if (!ids.length) return;
+        if (cut && !canEditSelection(latest, ids)) return;
+        const clips = structuredClone(selectedClips(latest, ids));
+        clipboard.current = { projectId: latest.id, clips };
+        setClipboardProject(latest.id);
+        if (!cut) setNotice(`클립 ${clips.length}개를 복사했습니다 · ⌘V로 재생 헤드에 붙여넣기`);
+        else
+          void safeCommand("edit.delete", (project) => {
+            const remaining = present(project, ids);
+            return canEditSelection(project, remaining) ? { ids: remaining } : null;
+          }).then((result) => {
+            if (result) selectMany([], null);
+          });
+      };
+      const before = [...unsettledEdits.current, ...(copying.current ? [copying.current] : [])];
+      if (!before.length) return take();
+      // An edit made before this copy is still on its way (a split, a trim): the clips
+      // are read once it has answered and selected what it made, not as they look now.
+      const turn: Promise<void> = Promise.allSettled(before)
+        // A task later, so what those edits do with their answers (select the new half) is done.
+        .then(() => new Promise<void>((resolve) => setTimeout(resolve)))
+        .then(take)
+        .finally(() => {
+          if (copying.current === turn) copying.current = null;
         });
+      copying.current = turn;
     },
     [safeCommand, selectMany],
   );
   const pasteAt = useCallback(
     (at: number) => {
-      const active = current.current;
-      if (!active || clipboard.current?.projectId !== active.id) return;
-      const clips = clipboard.current.clips;
-      // What the paste added is told apart from the project it was sent on, not the
-      // one on screen now: an edit still on its way may add clips of its own.
-      let basis = active;
-      void safeCommand("edit.paste", (latest) => {
-        basis = latest;
-        return { clips, at };
-      }).then((result) => {
-        const ids = newClipIds(basis, result);
-        if (ids.length) selectMany(ids);
-      });
+      const paste = () => {
+        const active = current.current;
+        if (!active || clipboard.current?.projectId !== active.id) return;
+        const clips = clipboard.current.clips;
+        // What the paste added is told apart from the project it was sent on, not the
+        // one on screen now: an edit still on its way may add clips of its own.
+        let basis = active;
+        void safeCommand("edit.paste", (latest) => {
+          basis = latest;
+          return { clips, at };
+        }).then((result) => {
+          const ids = newClipIds(basis, result);
+          if (ids.length) selectMany(ids);
+        });
+      };
+      if (copying.current) void copying.current.then(paste);
+      else paste();
     },
     [safeCommand, selectMany],
   );
@@ -957,7 +1015,7 @@ export default function App() {
       ) {
         event.preventDefault();
         copySelection(key === "x");
-      } else if (cmd && !event.shiftKey && !event.altKey && key === "v" && clipboard.current?.projectId === active.id) {
+      } else if (cmd && !event.shiftKey && !event.altKey && key === "v" && (clipboard.current?.projectId === active.id || copying.current)) {
         event.preventDefault();
         if (event.repeat) return;
         pasteAt(time);
@@ -1437,7 +1495,7 @@ export default function App() {
             className="editing-surface"
             ref={editingSurface}
             style={{
-              gridTemplateRows: `minmax(240px, 1fr) 8px ${timelineHeight}px`,
+              gridTemplateRows: `minmax(${UPPER_MIN_HEIGHT}px, 1fr) ${TIMELINE_SEPARATOR}px ${timelineHeight}px`,
             }}
           >
             <div
@@ -1505,7 +1563,7 @@ export default function App() {
               role="separator"
               aria-label="타임라인 높이 조절"
               aria-orientation="horizontal"
-              aria-valuemin={200}
+              aria-valuemin={TIMELINE_MIN_HEIGHT}
               aria-valuemax={Math.round(maxTimelineHeight)}
               aria-valuenow={Math.round(timelineHeight)}
               aria-valuetext={`${Math.round(timelineHeight)}픽셀`}
@@ -1539,7 +1597,7 @@ export default function App() {
                 event.stopPropagation();
                 resizeTimeline(
                   event.key === "Home"
-                    ? 200
+                    ? TIMELINE_MIN_HEIGHT
                     : event.key === "End"
                       ? maxTimelineHeight
                       : timelineHeight + (event.key === "ArrowUp" ? 20 : -20),

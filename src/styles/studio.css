@@ -1,56 +1,15 @@
-/* The shell's own colours, named by what they paint so that no rule below carries
-   a literal. The shared palette (DESIGN.md) is in index.css. */
-:root {
-  --mark-bg: #293935;
-  --mark-border: #4b5c5a;
-  --mark-ink: #a8f4d9;
-  --accent-border: #3c7773;
-  --accent-border-hover: #5c8c89;
-  --notice-bg: #293c37;
-  --notice-border: #4a6b5e;
-  --notice-ink: #d1f1e0;
-  --notice-shadow: 0 8px 24px #0005;
-  --composition-shadow: 0 4px 16px #0003;
-  --dialog-shadow: 0 20px 65px #0008;
-  --backdrop: #090d12bf;
-  /* Timeline clips: the outline, label band and ink of each track colour. */
-  --video-clip-border: #62898a;
-  --video-clip-ink: #dceff2;
-  --video-clip-label: #223f47e6;
-  --image-clip-border: #6e9aab;
-  --audio-clip-border: #5f9874;
-  --audio-clip-ink: #c4ecd5;
-  --audio-clip-label: #244031e6;
-  --audio-waveform: #98cfa8;
-  --text-clip-border: #a1895a;
-  --text-clip-ink: #fae7bf;
-  /* Service state: dots and badges. */
-  --state-idle: #a08e6c;
-  --state-online: #6acfab;
-  --online-bg: #294b42;
-  --online-border: #4b7765;
-  --online-ink: #b3e6d1;
-  --done-ink: #a2d8bd;
-  --job-ink: #cce9e1;
-  /* Assistant drawer. */
-  --chip-bg: #344b4b;
-  --chip-ink: #b9d9d6;
-  --provider-dot: #dcad85;
-  --stop-bg: #6a4b31;
-  --stop-ink: #f2d7b6;
-  --run-ink: #a4d9d1;
-  --subtle-bg: #2a3d40;
-  --subtle-ink: #b7d7d3;
-  --note-icon: #d4b97f;
-  --search-action: #a6dbd4;
-}
+/* Every colour and shadow here is a token of index.css (listed in DESIGN.md):
+   no rule below carries a literal. */
 .studio-app {
   display: flex;
   flex-direction: column;
   width: 100%;
   height: 100%;
   min-width: 920px;
-  min-height: 580px;
+  /* Top bar 54 + upper row 220 + separator 8 + timeline 200 + padding 6 + status bar 23:
+     what the rows below need, and no more, so a 600px window (568px of page under
+     the macOS title bar) keeps the status bar inside. */
+  min-height: 511px;
   background: var(--bg);
 }
 .studio-app button {
@@ -307,7 +266,7 @@
   container-type: inline-size;
   display: grid;
   flex: 1;
-  grid-template-rows: minmax(240px, 1fr) 8px 300px;
+  grid-template-rows: minmax(220px, 1fr) 8px 300px;
   min-width: 0;
   min-height: 0;
   gap: 0;

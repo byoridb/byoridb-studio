@@ -27,8 +27,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # A fixed Rust, the same one release-macos.yml uses. With "latest stable" a new
+      # compiler's lints failed the v0.2.0 release on code that had passed the day before.
+      # Raise both together, in a pull request, so CI shows what the new compiler reports.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:

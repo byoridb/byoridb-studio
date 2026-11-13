@@ -78,7 +78,7 @@ npm run build
 npm run tauri build -- --bundles app
 ```
 
-macOS 앱 출력 경로는 `src-tauri/target/release/bundle/macos/Byori Studio.app`입니다. 앱에는 프런트엔드, Rust 편집 서비스, MCP/CLI 브리지와 데모 소재가 포함됩니다(FFmpeg 는 포함하지 않습니다). 번들은 ad-hoc 서명이며, 앱도 `BYORI_STUDIO_HOME`·`BYORI_STUDIO_PORT` 를 따르므로 실행 파일을 임시 폴더와 다른 포트로 직접 띄워 시험할 수 있습니다. 같은 데이터 폴더와 포트로 개발 서비스(`npm run service`)가 이미 실행 중이면 앱은 그 서비스에 연결합니다. 앱이 이미 실행 중이면 두 번째 앱이나 개발 서비스는 시작되지 않습니다. 외부 배포용 Developer ID 서명·공증은 `.github/workflows/release-macos.yml`(`v*` 태그 또는 수동 dry run)이 맡도록 준비했지만 아직 실행해 보지 않았습니다.
+macOS 앱 출력 경로는 `src-tauri/target/release/bundle/macos/Byori Studio.app`입니다. 앱에는 프런트엔드, Rust 편집 서비스, MCP/CLI 브리지와 데모 소재가 포함됩니다(FFmpeg 는 포함하지 않습니다). 번들은 ad-hoc 서명이며, 앱도 `BYORI_STUDIO_HOME`·`BYORI_STUDIO_PORT` 를 따르므로 실행 파일을 임시 폴더와 다른 포트로 직접 띄워 시험할 수 있습니다. 같은 데이터 폴더와 포트로 개발 서비스(`npm run service`)가 이미 실행 중이면 앱은 그 서비스에 연결합니다. 앱이 이미 실행 중이면 두 번째 앱이나 개발 서비스는 시작되지 않습니다. 외부 배포용 Developer ID 서명·공증은 `.github/workflows/release-macos.yml`이 맡습니다: `v*` 태그를 밀면 서명·공증된 universal DMG를 GitHub 릴리스로 게시하고, 수동 실행은 릴리스 없이 같은 경로만 검증합니다(v0.2.0을 이 경로로 게시했습니다). CI와 릴리스는 같은 고정된 Rust 버전을 씁니다.
 
 브라우저에서는 파일 선택·드롭 시 소재가 Studio 가져오기 폴더로 복사됩니다. 네이티브 앱에서는 파일 대화상자로 원본 경로를 가져옵니다. 내보내기 위치는 파일시스템 경로이며 네이티브 앱에서는 저장 대화상자도 사용할 수 있습니다.
 

@@ -106,6 +106,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          # ci.yml 과 같은 버전으로 고정한다. "최신 stable" 이면 러너의 Rust 가 올라간 날
+          # 새 린트 때문에 릴리스만 실패한다(v0.2.0 첫 실행이 그랬다). 올릴 때는 두 파일을
+          # 함께, PR 로 올려 CI 에서 먼저 확인한다.
+          toolchain: 1.100.0
           components: rustfmt, clippy
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 

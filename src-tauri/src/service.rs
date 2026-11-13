@@ -1553,7 +1553,8 @@ async fn project_thumbnail(
     match path {
         Some(path) => match ServeFile::new(path).oneshot(request).await {
             Ok(r) => r.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            // ServeFile cannot fail: its error type is Infallible.
+            Err(never) => match never {},
         },
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -1588,7 +1589,8 @@ async fn serve_asset(
     match path {
         Some(path) => match ServeFile::new(path).oneshot(request).await {
             Ok(r) => r.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            // ServeFile cannot fail: its error type is Infallible.
+            Err(never) => match never {},
         },
         None => StatusCode::NOT_FOUND.into_response(),
     }

@@ -1,7 +1,7 @@
 name: Release (macOS)
 
 # 두 가지 모드로 동작한다.
-#   tag    — v* 태그를 밀면 그 버전으로 서명·공증된 DMG 를 릴리스한다.
+#   tag    — 문서 외 변경이 있는 v* 태그를 밀면 그 버전으로 서명·공증된 DMG 를 릴리스한다.
 #            태그는 package.json 의 버전과 같아야 한다(v0.2.0 ↔ 0.2.0).
 #   dryrun — workflow_dispatch. 릴리스를 만들지 않고 빌드·서명·공증 경로만
 #            검증한다. 어느 ref 에서 실행해도(태그 포함) 릴리스는 만들지 않는다.
@@ -27,10 +27,49 @@ jobs:
   preflight:
     name: Preflight (secrets + version)
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
     steps:
-      # checkout 이나 툴체인보다 먼저. 시크릿만 읽으므로 가장 싸다.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes since the previous release
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 실패했거나 문서 변경으로 건너뛴 태그는 배포 기준으로 쓰지 않는다.
+          released_tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          base=$(git hash-object -t tree /dev/null)
+          while IFS= read -r tag; do
+            [[ "$tag" == v* && "$tag" != "$GITHUB_REF_NAME" ]] || continue
+            if git merge-base --is-ancestor "refs/tags/$tag" HEAD; then
+              base="refs/tags/$tag"
+              break
+            fi
+          done <<< "$released_tags"
+
+          if git diff --quiet "$base" HEAD -- . ':(exclude,icase)*.md' ':(exclude)docs/**'; then
+            echo 'Only documentation changed, or the trees are identical. Skipping release.'
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            [[ $status == 1 ]] || exit "$status"
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      # 릴리스 또는 수동 빌드를 진행할 때만 서명 정보를 확인한다.
       # 값의 유효성은 인증서를 실제로 import 할 때 검증된다.
       - name: Check macOS signing credentials are present
+        if: steps.changes.outputs.build == 'true'
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -54,10 +93,9 @@ jobs:
           fi
           echo "all six signing secrets are present"
 
-      - uses: actions/checkout@v7
-
       # 버전은 package.json 이 정하고 scripts/check-version.mjs 가 나머지를 대조한다.
       - name: Check version consistency
+        if: steps.changes.outputs.build == 'true'
         run: |
           set -euo pipefail
           node scripts/check-version.mjs
@@ -75,6 +113,7 @@ jobs:
   build:
     name: Build signed universal DMG
     needs: preflight
+    if: needs.preflight.outputs.build == 'true'
     runs-on: macos-latest
     timeout-minutes: 120
     # Release 를 만들고 DMG 를 올리기 위해 필요하다.
